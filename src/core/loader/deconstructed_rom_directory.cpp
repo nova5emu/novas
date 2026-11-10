@@ -30,6 +30,7 @@
 
 #ifdef HAS_NCE
 #include "core/arm/nce/patcher.h"
+#include "core/device_memory.h"
 #endif
 
 #ifndef HAS_NCE
@@ -447,7 +448,12 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
     const bool is_39bit =
         metadata.GetAddressSpaceType() == FileSys::ProgramAddressSpaceType::Is39Bit;
     const bool is_application = metadata.GetPoolPartition() == FileSys::PoolPartition::Application;
-    Settings::SetNceEnabled(is_39bit);
+#ifdef HAS_NCE
+    const bool has_fastmem_arena = system.DeviceMemory().buffer.VirtualBasePointer() != nullptr;
+#else
+    constexpr bool has_fastmem_arena = true;
+#endif
+    Settings::SetNceEnabled(is_39bit, has_fastmem_arena);
 
     const std::array static_modules = {"rtld",    "main",    "subsdk0", "subsdk1", "subsdk2",
                                        "subsdk3", "subsdk4", "subsdk5", "subsdk6", "subsdk7",

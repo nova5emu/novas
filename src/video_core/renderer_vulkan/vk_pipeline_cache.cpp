@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -604,6 +605,14 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .support_byte_addressed_r16 = true,
     };
     host_info.ApplyDescriptorLimitPolicy();
+    // EDEN_NX2_AMD_NO_DEMOTE_REORDER=1 (diagnostic, AMD only): keep demotes where the game put them, to tell
+    // whether the reordering above causes the black foliage AMD players report. Off by default.
+    if (host_info.needs_demote_reorder) {
+        if (const char* value = std::getenv("EDEN_NX2_AMD_NO_DEMOTE_REORDER"); value && value[0] == '1') {
+            host_info.needs_demote_reorder = false;
+            LOG_INFO(Render_Vulkan, "AMD diagnostic: demote reordering disabled");
+        }
+    }
 
     if (device.GetMaxVertexInputAttributes() < Maxwell::NumVertexAttributes) {
         LOG_WARNING(Render_Vulkan, "maxVertexInputAttributes is too low: {} < {}",

@@ -26,6 +26,11 @@ EDEN_NX2_FENCE_BATCH=1
 #EDEN_NX2_FRAMES_AHEAD=2
 
 # --- Workarounds / Debug ---
+# Black foliage on AMD (RX 6000/7000): try ONE of these at a time, restart NovaS, and tell us which one fixes it.
+#EDEN_NX2_AMD_NO_DEMOTE_REORDER=1
+#EDEN_NX2_ASTC_BC1=0
+#EDEN_NX2_FORCE_LOD0=1
+
 # Terrain/indirect drawing fix for Donkey Kong Bananza: enabled by default. Set to 0 only to leave to GPU.
 #EDEN_NX2_RESETFIX=0
 

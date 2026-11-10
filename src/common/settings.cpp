@@ -198,8 +198,22 @@ bool IsFastmemEnabled() {
 
 static bool is_nce_enabled = false;
 
-void SetNceEnabled(bool is_39bit) {
+void SetNceEnabled(bool is_39bit, bool has_fastmem_arena) {
     const bool is_nce_selected = values.cpu_backend.GetValue() == CpuBackend::Nce;
+#if defined(__linux__) && defined(ARCHITECTURE_arm64)
+    if (is_nce_selected && getpagesize() != 4096) {
+        is_nce_enabled = false;
+        LOG_WARNING(Common, "NCE requires 4096-byte host pages, falling back to Dynarmic");
+        return;
+    }
+#endif
+
+    if (is_nce_selected && !has_fastmem_arena) {
+        is_nce_enabled = false;
+        LOG_WARNING(Common, "NCE requires a fastmem arena, falling back to Dynarmic");
+        return;
+    }
+
     if (is_nce_selected && !IsFastmemEnabled()) {
         LOG_WARNING(Common, "Fastmem is required to natively execute code in a performant manner, "
                             "falling back to Dynarmic");

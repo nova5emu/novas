@@ -33,6 +33,7 @@
 
 #ifdef HAS_NCE
 #include "core/arm/nce/patcher.h"
+#include "core/device_memory.h"
 #endif
 
 namespace Loader {
@@ -242,7 +243,8 @@ static bool LoadNroImpl(Core::System& system, Kernel::KProcess& process,
     const auto& code = codeset.CodeSegment();
 
     // NROs always have a 39-bit address space.
-    Settings::SetNceEnabled(true);
+    Settings::SetNceEnabled(true,
+                           system.DeviceMemory().buffer.VirtualBasePointer() != nullptr);
 
     // Create NCE patcher
     Core::NCE::Patcher patch{};

@@ -277,15 +277,27 @@ Result KPageTableBase::InitializeForProcess(Svc::CreateProcessFlag as_type, bool
     m_resource_limit = resource_limit;
 
     // Determine the region we can place our undetermineds in.
+    KProcessAddress placement_end = end;
+#ifdef HAS_NCE
+    if (m_address_space_width == 39) {
+        placement_end = m_code_region_end;
+        R_UNLESS(m_code_region_start < placement_end && placement_end <= end &&
+                     m_code_region_start <= process_code_start &&
+                     process_code_start < process_code_end &&
+                     process_code_end <= placement_end,
+                 ResultOutOfMemory);
+    }
+#endif
+
     KProcessAddress alloc_start;
     size_t alloc_size;
     if ((GetInteger(process_code_start) - GetInteger(m_code_region_start)) >=
-        (GetInteger(end) - GetInteger(process_code_end))) {
+        (GetInteger(placement_end) - GetInteger(process_code_end))) {
         alloc_start = m_code_region_start;
         alloc_size = GetInteger(process_code_start) - GetInteger(m_code_region_start);
     } else {
         alloc_start = process_code_end;
-        alloc_size = GetInteger(end) - GetInteger(process_code_end);
+        alloc_size = GetInteger(placement_end) - GetInteger(process_code_end);
     }
 
     // FW 18+: Apply extra region size calculations for already available region size

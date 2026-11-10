@@ -1031,7 +1031,7 @@ bool IsGPUFenceBehaviorBalanced();
 bool IsGPUFenceBehaviorAccurate();
 
 bool IsFastmemEnabled();
-void SetNceEnabled(bool is_64bit);
+void SetNceEnabled(bool is_39bit, bool has_fastmem_arena);
 bool IsNceEnabled();
 
 void SetCurrentProgramID(u64 program_id);
