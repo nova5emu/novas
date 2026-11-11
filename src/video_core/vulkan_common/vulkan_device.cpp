@@ -45,6 +45,8 @@
 namespace Vulkan {
 using namespace Common::Literals;
 namespace {
+// NovaS diagnostics: the device that presents (the renderer's), for the Android memory line.
+std::atomic<const Device*> g_presenting_device{nullptr};
 namespace Alternatives {
 constexpr std::array STENCIL8_UINT{
     VK_FORMAT_D16_UNORM_S8_UINT,
@@ -849,9 +851,42 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
 
     // Initialize GPU logging if enabled
     InitializeGPULogging();
+    if (owns_static_pipeline_cache) {
+        g_presenting_device.store(this, std::memory_order_release);
+    }
+}
+
+u64 PresentingDeviceMemoryUsage() {
+    const Device* device = g_presenting_device.load(std::memory_order_acquire);
+    return device != nullptr ? device->GetDeviceMemoryUsage() : 0;
+}
+
+std::string PresentingDeviceMemoryBreakdown() {
+    const Device* device = g_presenting_device.load(std::memory_order_acquire);
+    return device != nullptr ? device->DescribeMemoryUse() : std::string{};
+}
+
+std::string Device::DescribeMemoryUse() const {
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+    budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+    physical.GetMemoryProperties(extensions.memory_budget ? &budget : nullptr);
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> heap_budgets{};
+    if (allocator != nullptr) {
+        vmaGetHeapBudgets(allocator, heap_budgets.data());
+    }
+    std::string text;
+    for (const size_t heap : valid_heap_memory) {
+        const VmaStatistics& s = heap_budgets[heap].statistics;
+        text += fmt::format("heap {}: driver {} MiB, VMA blocks {} MiB in {}, allocations {} MiB in {}; ",
+                            heap, budget.heapUsage[heap] >> 20, s.blockBytes >> 20, s.blockCount,
+                            s.allocationBytes >> 20, s.allocationCount);
+    }
+    return text;
 }
 
 Device::~Device() {
+    const Device* self = this;
+    g_presenting_device.compare_exchange_strong(self, nullptr, std::memory_order_acq_rel);
 #ifdef EGLANTINE_STREAMLINE
     if (streamline_attached) {
         Streamline::Stop();

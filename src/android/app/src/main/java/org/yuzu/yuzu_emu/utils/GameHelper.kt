@@ -8,6 +8,7 @@ package org.yuzu.yuzu_emu.utils
 
 import android.content.SharedPreferences
 import android.net.Uri
+import android.os.Environment
 import android.provider.DocumentsContract
 import androidx.preference.PreferenceManager
 import kotlinx.serialization.encodeToString
@@ -53,6 +54,7 @@ object GameHelper {
         NativeLibrary.clearFilesystemProvider()
 
         val mountedContainerUris = mutableSetOf<String>()
+        looseGamesNeedAllFilesAccess = false
         mountExternalContentDirectories(mountedContainerUris)
 
         val badDirs = mutableListOf<Int>()
@@ -60,7 +62,8 @@ object GameHelper {
             val gameDirUri = gameDir.uriString.toUri()
             val isValid = FileUtil.isTreeUriValid(gameDirUri)
             if (isValid) {
-                val scanDepth = if (gameDir.deepScan) 3 else 1
+                // NovaS: deep enough for a loose dump's base/exefs under a game folder (as on PC).
+                val scanDepth = if (gameDir.deepScan) 5 else 1
 
                 addGamesRecursive(
                     games,
@@ -149,10 +152,31 @@ object GameHelper {
 
         files.forEach {
             if (it.isDirectory) {
+                val dirName = it.filename.lowercase()
+                // NovaS: an extracted game (exefs with main and main.npdm), or a loose dump's base
+                // (base/exefs, next to updates/ and dlc/) as on PC. Its update's and DLC's exefs are
+                // not games of their own, and romfs holds only the game's data.
+                if (dirName in LOOSE_DUMP_SKIPPED) {
+                    return@forEach
+                }
+                val children = FileUtil.listFiles(it.uri)
+                if (dirName == "exefs") {
+                    addLooseGame(games, gamesByProgramId, children, null)
+                    return@forEach
+                }
+                children.firstOrNull { child -> child.isDirectory && child.filename.equals("base", true) }
+                    ?.let { base ->
+                        FileUtil.listFiles(base.uri)
+                            .firstOrNull { child -> child.isDirectory && child.filename.equals("exefs", true) }
+                            ?.let { exefs ->
+                                addLooseGame(games, gamesByProgramId, FileUtil.listFiles(exefs.uri), it.filename)
+                            }
+                        return@forEach
+                    }
                 addGamesRecursive(
                     games,
                     gamesByProgramId,
-                    FileUtil.listFiles(it.uri),
+                    children,
                     depth - 1,
                     mountedContainerUris
                 )
@@ -188,6 +212,82 @@ object GameHelper {
                 }
             }
         }
+    }
+
+    // NovaS: folders a game scan does not enter: a loose dump's update and DLC contents and every
+    // game's data (romfs holds thousands of files).
+    private val LOOSE_DUMP_SKIPPED = setOf("updates", "update", "dlc", "romfs")
+
+    /**
+     * True when the last scan found an extracted game it could not open because NovaS lacks
+     * access to all files (an extracted game is a folder the engine walks by path).
+     */
+    var looseGamesNeedAllFilesAccess = false
+        private set
+
+    // NovaS: an extracted game's ExeFS (main and main.npdm), booted by its main as on PC. The engine
+    // walks the folders around it (romfs next to exefs, updates/ next to base/), which a content
+    // URI cannot do, so it gets the file's real path.
+    private fun addLooseGame(
+        games: MutableList<Game>,
+        gamesByProgramId: MutableMap<String, Game>,
+        exefsFiles: Array<MinimalDocumentFile>,
+        folderName: String?
+    ) {
+        val main = exefsFiles.firstOrNull { !it.isDirectory && it.filename == "main" } ?: return
+        if (exefsFiles.none { !it.isDirectory && it.filename == "main.npdm" }) {
+            return
+        }
+        val path = realPathOf(main.uri) ?: return
+        val file = File(path)
+        if (!file.canRead()) {
+            looseGamesNeedAllFilesAccess = true
+            Log.warning("[GameHelper] extracted game at $path needs access to all files")
+            return
+        }
+        val exefsDir = file.parentFile
+        val gameDir = exefsDir?.parentFile
+        val name = folderName ?: if (gameDir?.name.equals("base", true)) {
+            gameDir?.parentFile?.name
+        } else {
+            gameDir?.name
+        }
+        val game = getGame(Uri.fromFile(file), true, false, name?.let { NovaSCovers.tidyName(it) })
+            ?: return
+        if (games.none { it.path == game.path }) {
+            games.add(game)
+            if (game.programId != "0") {
+                gamesByProgramId[game.programId] = game
+            }
+        }
+    }
+
+    // NovaS: the real path of a document from the phone's own storage or an SD card
+    // ("primary:Games/x" -> /storage/emulated/0/Games/x), or null for other providers.
+    private fun realPathOf(uri: Uri): String? {
+        if (uri.scheme == "file") {
+            return uri.path
+        }
+        val id = try {
+            DocumentsContract.getDocumentId(uri)
+        } catch (_: Exception) {
+            return null
+        }
+        if (uri.authority != "com.android.externalstorage.documents") {
+            return null
+        }
+        val colon = id.indexOf(':')
+        if (colon < 0) {
+            return null
+        }
+        val volume = id.substring(0, colon)
+        val relative = id.substring(colon + 1)
+        val root = if (volume.equals("primary", true)) {
+            Environment.getExternalStorageDirectory().path
+        } else {
+            "/storage/$volume"
+        }
+        return if (relative.isEmpty()) root else "$root/$relative"
     }
 
     private fun mountExternalContentDirectories(mountedContainerUris: MutableSet<String>) {
@@ -258,9 +358,11 @@ object GameHelper {
     fun getGame(
         uri: Uri,
         addedToLibrary: Boolean,
-        registerFilesystemProvider: Boolean = true
+        registerFilesystemProvider: Boolean = true,
+        fallbackName: String? = null
     ): Game? {
-        val filePath = uri.toString()
+        // NovaS: an extracted game goes to the engine as a plain path (it has no content URI form).
+        val filePath = if (uri.scheme == "file") (uri.path ?: return null) else uri.toString()
         if (!GameMetadata.getIsValid(filePath)) {
             return null
         }
@@ -272,15 +374,15 @@ object GameHelper {
 
         var name = GameMetadata.getTitle(filePath)
 
-        // If the game's title field is empty, use the filename.
+        // If the game's title field is empty, use the filename (a loose dump: its folder's name).
         if (name.isEmpty()) {
-            name = FileUtil.getFilename(uri)
+            name = fallbackName ?: FileUtil.getFilename(uri)
         }
         var programId = GameMetadata.getProgramId(filePath)
 
         // If the game's ID field is empty, use the filename without extension.
         if (programId.isEmpty()) {
-            programId = name.substring(0, name.lastIndexOf("."))
+            programId = name.substringBeforeLast(".")
         }
 
         // NovaS: the known Switch 2 game's name, else the file name without its tags (as on PC).

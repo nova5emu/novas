@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <mutex>
 #include <thread>
+#include <type_traits>
 #include "common/common_types.h"
 #include "common/polyfill_thread.h"
 
@@ -107,6 +108,16 @@ enum class ThreadPlacement : u32 {
 
 void SetCurrentThreadPriority(ThreadPriority new_priority);
 void SetCurrentThreadName(const char* name);
+
+/// NovaS: Android gives new threads a 1 MiB stack and Turnip's shader compiler recursed past it on a big
+/// Zelda compute shader (SIGSEGV, stack overflow). On Android this runs func on a thread with a large
+/// stack and waits for it; elsewhere it calls func in place.
+void RunWithLargeStack(void (*func)(void*), void* arg);
+template <typename F>
+void RunWithLargeStack(F&& func) {
+    RunWithLargeStack([](void* f) { (*static_cast<std::remove_reference_t<F>*>(f))(); },
+                      static_cast<void*>(&func));
+}
 void SetCurrentThreadToPerformanceCores();
 void SetCurrentThreadToEfficiencyCores();
 void SetCurrentThreadToBackgroundWork();

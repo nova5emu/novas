@@ -58,6 +58,7 @@
 #include <mutex>
 #include <random>
 #include <utility>
+#include <vector>
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -1114,6 +1115,41 @@ void HostMemory::ForgetContents() {
             granules[index].fetch_or(GranuleDirty, std::memory_order_release);
         }
     }
+}
+
+size_t HostMemory::UsedBackingBytes() const {
+    size_t used = 0;
+    for (size_t index = 0; index < num_granules; ++index) {
+        if ((granules[index].load(std::memory_order_relaxed) & GranuleDirty) != 0) {
+            ++used;
+        }
+    }
+    return used << GranuleShift;
+}
+
+size_t HostMemory::ResidentBackingBytes() const {
+#if defined(__linux__)
+    if (backing_base == nullptr || backing_size == 0) {
+        return 0;
+    }
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    constexpr size_t Chunk = size_t{256} << 20;
+    std::vector<unsigned char> vec(Chunk / page);
+    size_t resident = 0;
+    for (size_t offset = 0; offset < backing_size; offset += Chunk) {
+        const size_t length = (std::min)(Chunk, backing_size - offset);
+        if (mincore(backing_base + offset, length, vec.data()) != 0) {
+            continue;
+        }
+        const size_t pages = (length + page - 1) / page;
+        for (size_t i = 0; i < pages; ++i) {
+            resident += vec[i] & 1;
+        }
+    }
+    return resident * page;
+#else
+    return 0;
+#endif
 }
 
 void HostMemory::EnableDirectMappedAddress() {

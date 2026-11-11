@@ -227,10 +227,13 @@ class GameAdapter(private val activity: AppCompatActivity) :
         }
 
         fun onClick(game: Game) {
-            val gameExists = DocumentFile.fromSingleUri(
-                YuzuApplication.appContext,
-                game.path.toUri()
-            )?.exists() == true
+            val gameUri = game.path.toUri()
+            // NovaS: an extracted game's path is a plain file path, not a content URI.
+            val gameExists = if (gameUri.scheme == null || gameUri.scheme == "file") {
+                java.io.File(gameUri.path ?: game.path).exists()
+            } else {
+                DocumentFile.fromSingleUri(YuzuApplication.appContext, gameUri)?.exists() == true
+            }
 
             if (!gameExists) {
                 Toast.makeText(

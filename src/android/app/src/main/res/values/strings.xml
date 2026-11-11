@@ -1895,4 +1895,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
     <string name="novas_footer">Switch 2 games</string>
     <string name="novas_preparing_shaders">Preparing shaders… %1$d %%</string>
     <string name="novas_preparing_shaders_hint">NovaS is preparing the game\'s shaders. The first time, or after an update, it can take several minutes: don\'t close it. Afterwards it starts much faster.</string>
+    <string name="novas_loose_games_access_title">Allow access to your games</string>
+    <string name="novas_loose_games_access">NovaS found a game in folders (base, updates, dlc). To open it, NovaS needs permission to access all files. Turn it on and come back: the game will appear in the list.</string>
+    <string name="novas_loose_games_access_open">Open settings</string>
 </resources>

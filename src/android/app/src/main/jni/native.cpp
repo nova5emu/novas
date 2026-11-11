@@ -9,6 +9,7 @@
 
 #include <codecvt>
 #include <cstdio>
+#include <initializer_list>
 #include <cstring>
 #include <locale>
 #include <map>
@@ -58,6 +59,9 @@ extern "C" {
 #include "frontend_common/play_time_manager.h"
 #include "core/constants.h"
 #include "core/core.h"
+#include "core/device_memory.h"
+#include "video_core/cache_memory_stats.h"
+#include "video_core/vulkan_common/vulkan_device.h"
 #include "core/cpu_manager.h"
 #include "core/crypto/key_manager.h"
 #include "core/file_sys/card_image.h"
@@ -121,6 +125,71 @@ std::atomic<bool> g_has_battery = {true};
 
 // playtime
 std::unique_ptr<PlayTime::PlayTimeManager> play_time_manager;
+
+namespace {
+// NovaS: reads "Key:   1234 kB" lines of a /proc file into MiB.
+void ReadProcKb(const char* path, std::initializer_list<std::pair<std::string_view, long*>> keys) {
+    std::FILE* file = std::fopen(path, "r");
+    if (!file) {
+        return;
+    }
+    char line[256];
+    while (std::fgets(line, sizeof(line), file)) {
+        const std::string_view text{line};
+        for (const auto& [key, out] : keys) {
+            if (text.starts_with(key) && text.size() > key.size() && text[key.size()] == ':') {
+                *out = std::strtol(line + key.size() + 1, nullptr, 10) / 1024;
+            }
+        }
+    }
+    std::fclose(file);
+}
+
+long ReadSysfsMiB(const std::string& path) {
+    long value = -1;
+    if (std::FILE* file = std::fopen(path.c_str(), "r")) {
+        long long bytes = 0;
+        if (std::fscanf(file, "%lld", &bytes) == 1) {
+            value = static_cast<long>(bytes >> 20);
+        }
+        std::fclose(file);
+    }
+    return value;
+}
+
+// NovaS: one line with the process and system memory, to see what grows before Android kills the app.
+void LogNovaSMemory() {
+    long rss = -1, anon = -1, file = -1, shmem = -1, swap = -1;
+    ReadProcKb("/proc/self/status", {{"VmRSS", &rss}, {"RssAnon", &anon}, {"RssFile", &file},
+                                     {"RssShmem", &shmem}, {"VmSwap", &swap}});
+    long available = -1, swap_free = -1, swap_total = -1;
+    ReadProcKb("/proc/meminfo",
+               {{"MemAvailable", &available}, {"SwapFree", &swap_free}, {"SwapTotal", &swap_total}});
+    const std::string kgsl = fmt::format("/sys/class/kgsl/kgsl/proc/{}/", getpid());
+    const long gpu_mapped = ReadSysfsMiB(kgsl + "gpumem_mapped");
+    const long gpu_unmapped = ReadSysfsMiB(kgsl + "gpumem_unmapped");
+    const auto& backing = s_instance.System().DeviceMemory().buffer;
+    const size_t guest_used = backing.UsedBackingBytes() >> 20;
+    const size_t guest_resident = backing.ResidentBackingBytes() >> 20;
+    const u64 vulkan = Vulkan::PresentingDeviceMemoryUsage() >> 20;
+    LOG_INFO(Frontend,
+             "NovaS memory: rss {} MiB (anon {}, file {}, shmem {}, swapped {}) | guest RAM written {} MiB, "
+             "resident {} MiB | Vulkan {} MiB | kgsl mapped {} unmapped {} | phone available {} MiB, "
+             "swap free {}/{} MiB",
+             rss, anon, file, shmem, swap, guest_used, guest_resident, vulkan, gpu_mapped, gpu_unmapped,
+             available, swap_free, swap_total);
+    namespace Stats = VideoCommon::CacheMemoryStats;
+    const u64 created = Stats::texture_created.load(std::memory_order_relaxed);
+    const u64 deleted = Stats::texture_deleted.load(std::memory_order_relaxed);
+    LOG_INFO(Frontend,
+             "NovaS Vulkan memory: {}textures {} MiB ({} created, {} deleted), buffers {} MiB, "
+             "staging {} MiB",
+             Vulkan::PresentingDeviceMemoryBreakdown(),
+             Stats::texture_bytes.load(std::memory_order_relaxed) >> 20, created, deleted,
+             Stats::buffer_bytes.load(std::memory_order_relaxed) >> 20,
+             Stats::staging_bytes.load(std::memory_order_relaxed) >> 20);
+}
+} // namespace
 
 EmulationSession::EmulationSession() {
     m_vfs = std::make_shared<FileSys::RealVfsFilesystem>();
@@ -433,6 +502,7 @@ void EmulationSession::RunEmulation() {
         if (std::FILE* file = std::fopen(Common::FS::PathToUTF8String(marker).c_str(), "w")) {
             std::fclose(file);
         }
+        LogNovaSMemory();
         LoadDiskCacheProgress(VideoCore::LoadCallbackStage::Prepare, 0, 0);
         m_system.Renderer().ReadRasterizer()->LoadDiskResources(
             program_id, std::stop_token{}, LoadDiskCacheProgress);
@@ -446,7 +516,14 @@ void EmulationSession::RunEmulation() {
         m_system.InitializeDebugger();
     }
 
+    auto last_memory_log = std::chrono::steady_clock::now() - std::chrono::seconds(10);
     while (true) {
+        // NovaS: Android kills the app when the phone runs out of memory and the log just stops;
+        // a memory line every 5 s shows what grew before it.
+        if (std::chrono::steady_clock::now() - last_memory_log >= std::chrono::seconds(5)) {
+            last_memory_log = std::chrono::steady_clock::now();
+            LogNovaSMemory();
+        }
         std::optional<u64> reload_title;
         {
             [[maybe_unused]] std::unique_lock lock(m_mutex);

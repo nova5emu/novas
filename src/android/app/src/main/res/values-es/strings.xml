@@ -1208,4 +1208,7 @@
     <string name="novas_footer">Juegos de Switch 2</string>
     <string name="novas_preparing_shaders">Preparando shaders… %1$d %%</string>
     <string name="novas_preparing_shaders_hint">NovaS está preparando los shaders del juego. La primera vez, o después de una actualización, puede tardar varios minutos: no lo cierres. Después arranca mucho más rápido.</string>
+    <string name="novas_loose_games_access_title">Permite el acceso a tus juegos</string>
+    <string name="novas_loose_games_access">NovaS encontró un juego en carpetas (base, updates, dlc). Para abrirlo necesita permiso para acceder a todos los archivos. Actívalo y vuelve: el juego aparecerá en la lista.</string>
+    <string name="novas_loose_games_access_open">Abrir ajustes</string>
 </resources>

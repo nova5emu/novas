@@ -89,6 +89,11 @@ public:
         return virtual_size;
     }
 
+    /// NovaS diagnostics: bytes of the backing (guest RAM) resident in host RAM, and in use by the
+    /// guest kernel at least once. Linux/Android only (0 elsewhere); walks mincore, so not per frame.
+    [[nodiscard]] size_t ResidentBackingBytes() const;
+    [[nodiscard]] size_t UsedBackingBytes() const;
+
     bool IsInVirtualRange(void* address) const noexcept {
         return address >= virtual_base && address < virtual_base + virtual_size;
     }

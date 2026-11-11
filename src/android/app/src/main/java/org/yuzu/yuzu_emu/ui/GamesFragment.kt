@@ -181,6 +181,30 @@ class GamesFragment : Fragment() {
             }
         }
 
+        // NovaS: an extracted game (a base/exefs folder) is opened by path, which needs access to
+        // all files: say so and open the setting.
+        gamesViewModel.needsAllFilesAccess.collect(viewLifecycleOwner) { needed ->
+            if (needed) {
+                gamesViewModel.setNeedsAllFilesAccess(false)
+                com.google.android.material.dialog.MaterialAlertDialogBuilder(requireContext())
+                    .setTitle(R.string.novas_loose_games_access_title)
+                    .setMessage(R.string.novas_loose_games_access)
+                    .setPositiveButton(R.string.novas_loose_games_access_open) { _, _ ->
+                        try {
+                            startActivity(
+                                Intent(
+                                    android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                                    android.net.Uri.parse("package:${requireContext().packageName}")
+                                )
+                            )
+                        } catch (_: Exception) {
+                        }
+                    }
+                    .setNegativeButton(android.R.string.cancel, null)
+                    .show()
+            }
+        }
+
         setupTopView()
 
         updateButtonsVisibility()

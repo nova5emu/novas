@@ -23,6 +23,7 @@ import org.yuzu.yuzu_emu.utils.DirectoryInitialization
 import org.yuzu.yuzu_emu.utils.DocumentsTree
 import org.yuzu.yuzu_emu.utils.GpuDriverHelper
 import org.yuzu.yuzu_emu.utils.Log
+import org.yuzu.yuzu_emu.utils.NovaSExitReport
 import org.yuzu.yuzu_emu.utils.PowerStateUpdater
 import org.yuzu.yuzu_emu.utils.ControllerNavigationGlobalHook
 import java.util.Locale
@@ -60,6 +61,14 @@ class YuzuApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         application = this
+        // NovaS test builds (four-part version, e.g. 0.1.1.3): GPU-thread time per zone in the log
+        // every 10 s, to see why 3D scenes crawl on phones. Public builds leave it off.
+        if (BuildConfig.VERSION_NAME.count { it == '.' } >= 3) {
+            try {
+                android.system.Os.setenv("EDEN_NX2_GPU_PROFILE", "1", false)
+            } catch (e: Exception) {
+            }
+        }
         documentsTree = DocumentsTree()
         DirectoryInitialization.start()
 
@@ -73,6 +82,7 @@ class YuzuApplication : Application() {
         NativeLibrary.logDeviceInfo()
         PowerStateUpdater.start()
         Log.logDeviceInfo()
+        NovaSExitReport.log(this)
         ControllerNavigationGlobalHook.install(this)
 
         createNotificationChannels()

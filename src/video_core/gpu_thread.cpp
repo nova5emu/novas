@@ -57,7 +57,8 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
     rasterizer = renderer.ReadRasterizer();
     // Before the GPU thread and the split's back thread start: they read it without a lock.
     Nx2Profile::ReadSetting();
-    thread = std::jthread([&](std::stop_token stop_token) {
+    // The GPU thread builds pipelines with the driver's shader compiler: a large stack on Android.
+    thread = std::jthread([&](std::stop_token stop_token) { Common::RunWithLargeStack([&] {
         const Common::DkbCpuTrace::Registration cpu_trace{Common::DkbCpuTrace::Role::GpuCommand};
         Common::SetCurrentThreadName("GPU");
         VideoCommon::GpuSplit::MarkGpuThread();
@@ -172,7 +173,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             }
             SignalCommand(state, next.fence, next.block);
         }
-    });
+    }); });
 }
 
 void ThreadManager::SubmitList(s32 channel, Tegra::CommandList&& entries, bool is_async) {

@@ -594,6 +594,34 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
 #endif
 }
 
+void RunWithLargeStack(void (*func)(void*), void* arg) {
+#if defined(__ANDROID__)
+    struct Call {
+        void (*func)(void*);
+        void* arg;
+    } call{func, arg};
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 16u << 20);
+    pthread_t thread;
+    const int error = pthread_create(
+        &thread, &attr,
+        [](void* p) -> void* {
+            auto* c = static_cast<Call*>(p);
+            c->func(c->arg);
+            return nullptr;
+        },
+        &call);
+    pthread_attr_destroy(&attr);
+    if (error == 0) {
+        pthread_join(thread, nullptr);
+        return;
+    }
+    LOG_WARNING(Common, "Could not start a large-stack thread ({}), running in place", error);
+#endif
+    func(arg);
+}
+
 void SetCurrentThreadName(const char* name) {
 #ifdef _MSC_VER
     // Sets the debugger-visible name of the current thread.

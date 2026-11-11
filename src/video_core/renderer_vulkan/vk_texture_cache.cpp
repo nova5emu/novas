@@ -7,7 +7,9 @@
 #include <algorithm>
 #include <limits>
 #include <array>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <optional>
 #include <set>
 #include <span>
@@ -361,8 +363,71 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
 // over 1 GiB as RGBA8 (title 1's 8192x8192x68 ASTC 8x8 virtual textures are 24 GB each) keeps only
 // its mip levels from `level_offset` on, so host mip 0 is guest mip `level_offset`. Normalized
 // coordinates and derivative LOD still address it correctly; explicit LODs sample one level lower.
-[[nodiscard]] ImageInfo TrimmedHostInfo(const Device& device, const ImageInfo& info, u32& level_offset) {
+// NovaS: a phone with under 14 GB of RAM shares it between the game's memory and the GPU's, and
+// Zelda's textures alone took 2.2-3.6 GB of it on a 12 GB S26 Ultra (the kernel then swapped the
+// game's memory: 2.5 fps). Large compressed textures with mips keep mip 1 down (a quarter of the
+// memory, slightly softer). Only compressed formats: the GPU never renders or stores into them, so
+// the trimmed image is only ever written by uploads. EDEN_NX2_PHONE_TEXTURES=full turns it off.
+// Elsewhere EDEN_NX2_PHONE_TEXTURES=half turns it on (to test it on a PC).
+[[nodiscard]] bool PhoneTrimsTextures() {
+    static const bool trim = [] {
+        const char* value = std::getenv("EDEN_NX2_PHONE_TEXTURES");
+        // Off by default for now, phones too: on a PC test Zelda's GPU was lost loading a save
+        // with these images (to find before it ships on).
+        constexpr bool ShipOnPhones = false;
+#ifndef __ANDROID__
+        (void)ShipOnPhones;
+        const bool forced = value != nullptr && std::strcmp(value, "half") == 0;
+        if (forced) {
+            LOG_WARNING(Render_Vulkan, "Large compressed textures keep mip 1 down (phone test)");
+        }
+        return forced;
+#else
+        if (value != nullptr && std::strcmp(value, "full") == 0) {
+            return false;
+        }
+        if (!ShipOnPhones && (value == nullptr || std::strcmp(value, "half") != 0)) {
+            return false;
+        }
+        u64 kib = 0;
+        if (std::FILE* file = std::fopen("/proc/meminfo", "r")) {
+            char line[128];
+            while (std::fgets(line, sizeof(line), file)) {
+                if (std::strncmp(line, "MemTotal:", 9) == 0) {
+                    kib = std::strtoull(line + 9, nullptr, 10);
+                    break;
+                }
+            }
+            std::fclose(file);
+        }
+        const bool low = kib != 0 && (kib << 10) < (u64{14} << 30);
+        LOG_INFO(Render_Vulkan, "Phone RAM {} MiB: large compressed textures {}", kib >> 10,
+                 low ? "keep mip 1 down" : "at full size");
+        return low;
+#endif
+    }();
+    return trim;
+}
+
+[[nodiscard]] ImageInfo TrimmedHostInfo(const Device& device, const ImageInfo& info, u32& level_offset,
+                                        std::optional<GPUVAddr> phone_gpu_addr = std::nullopt) {
     level_offset = 0;
+    if (phone_gpu_addr && PhoneTrimsTextures() && info.type == ImageType::e2D &&
+        info.num_samples == 1 && info.resources.levels > 1 &&
+        (info.size.width >= 1024 || info.size.height >= 1024) &&
+        (VideoCore::Surface::IsPixelFormatBCn(info.format) ||
+         VideoCore::Surface::IsPixelFormatASTC(info.format)) &&
+        !WillUseAcceleratedAstcDecode(device, info) && !IsHugeAstcArray(device, info) &&
+        !UsesSparseLayers(device, info, *phone_gpu_addr) &&
+        !UsesSparseTiles(device, info, *phone_gpu_addr) &&
+        !IsUnwrittenSparse(device, info, *phone_gpu_addr)) {
+        level_offset = 1;
+        ImageInfo host = info;
+        host.size.width = (std::max)(info.size.width >> 1, 1U);
+        host.size.height = (std::max)(info.size.height >> 1, 1U);
+        host.resources.levels -= 1;
+        return host;
+    }
     if (!WillUseAcceleratedAstcDecode(device, info) || info.type != ImageType::e2D) {
         return info;
     }
@@ -2493,6 +2558,26 @@ void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
     if (ENABLE_MSAA_RESOLVE_CONSUME) {
         InvalidateResolveShadow(dst.Handle());
     }
+    // An image with trimmed levels (phones, huge ASTC arrays; see TrimmedHostInfo) holds guest
+    // level L at host level L - offset: copies move down to it, and levels it lacks are skipped.
+    boost::container::small_vector<VideoCommon::ImageCopy, 16> remapped;
+    if (dst.host_level_offset != 0 || src.host_level_offset != 0) {
+        if (BytesPerBlock(src.info.format) != BytesPerBlock(dst.info.format)) {
+            return;
+        }
+        for (VideoCommon::ImageCopy copy : copies) {
+            copy.src_subresource.base_level -= static_cast<s32>(src.host_level_offset);
+            copy.dst_subresource.base_level -= static_cast<s32>(dst.host_level_offset);
+            if (copy.src_subresource.base_level < 0 || copy.dst_subresource.base_level < 0) {
+                continue;
+            }
+            remapped.push_back(copy);
+        }
+        if (remapped.empty()) {
+            return;
+        }
+        copies = std::span<const VideoCommon::ImageCopy>(remapped.data(), remapped.size());
+    }
     // As per the size-compatible formats section of vulkan, copy manually via ReinterpretImage
     // these images that aren't size-compatible
     if (BytesPerBlock(src.info.format) != BytesPerBlock(dst.info.format)) {
@@ -2915,7 +3000,7 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
     : VideoCommon::ImageBase(info_, gpu_addr_, cpu_addr_), scheduler{&runtime_.scheduler},
       runtime{&runtime_},
       original_image(MakeImage(runtime_.device, runtime_.memory_allocator,
-                               TrimmedHostInfo(runtime_.device, info, host_level_offset),
+                               TrimmedHostInfo(runtime_.device, info, host_level_offset, gpu_addr_),
                                IsHugeAstcArray(runtime_.device, info)
                                    ? std::span<const VkFormat>{HugeAstcViewFormats}
                                : IsOpaqueBc1Astc(runtime_.device, info)
@@ -2930,7 +3015,8 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
       aspect_mask(ImageAspectMask(info.format)) {
     if (original_image.IsUnbacked()) {
         flags |= VideoCommon::ImageFlagBits::Unbacked;
-        const ImageInfo host_info = TrimmedHostInfo(runtime_.device, info, host_level_offset);
+        const ImageInfo host_info =
+            TrimmedHostInfo(runtime_.device, info, host_level_offset, gpu_addr_);
         const u64 texels = u64{host_info.size.width} * host_info.size.height *
                            host_info.size.depth * static_cast<u64>(host_info.resources.layers);
         if (UsesSparseLayers(runtime_.device, info, gpu_addr_) && InitSparseLayers()) {

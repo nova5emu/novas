@@ -89,7 +89,10 @@ public:
         };
         threads.reserve(num_workers);
         for (size_t i = 0; i < num_workers; ++i) {
-            threads.emplace_back(lambda);
+            // Pipeline builders run the driver's shader compiler: a large stack on Android.
+            threads.emplace_back([lambda](std::stop_token stop_token) {
+                Common::RunWithLargeStack([&] { lambda(stop_token); });
+            });
         }
     }
 

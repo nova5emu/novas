@@ -221,6 +221,11 @@ enum class FormatType { Linear, Optimal, Buffer };
 /// Subgroup size of the guest emulated hardware (Nvidia has 32 threads per subgroup).
 const u32 GuestWarpSize = 32;
 
+/// NovaS diagnostics: device memory the renderer's device uses (0 when none is up).
+u64 PresentingDeviceMemoryUsage();
+/// NovaS diagnostics: per heap, the driver's usage against what the allocator holds and hands out.
+std::string PresentingDeviceMemoryBreakdown();
+
 enum class NvidiaArchitecture {
     Arch_KeplerOrOlder,
     Arch_Maxwell,
@@ -1047,6 +1052,8 @@ FN_MAX_LIMIT_LIST
     }
 
     u64 GetDeviceMemoryUsage() const;
+    /// NovaS diagnostics, see PresentingDeviceMemoryBreakdown().
+    std::string DescribeMemoryUse() const;
 
     /// The driver's current memory budget for this process (VK_EXT_memory_budget), in
     /// GetDeviceMemoryUsage() terms: the usage at which the main device-local heap reaches its

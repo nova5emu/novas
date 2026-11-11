@@ -8,7 +8,9 @@
 
 #include <algorithm>
 #include <numeric>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <vector>
@@ -21,6 +23,7 @@
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/slot_vector.h"
+#include "video_core/cache_memory_stats.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/kepler_compute.h"
@@ -477,6 +480,33 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
         (std::min)(expected_memory, critical_memory - (std::min)(critical_memory, u64{768_MiB}));
     minimum_memory =
         (std::min)(minimum_memory, expected_memory - (std::min)(expected_memory, u64{1_GiB}));
+#ifdef __ANDROID__
+    // NovaS: a phone's GPU shares its RAM with the guest's. On a 12 GB S26 Ultra Zelda's textures
+    // grew to 2.2-2.9 GB of Vulkan memory, which the kernel cannot swap, so it swapped the game's
+    // own memory instead and the first 3D scene ran at 2.5 fps. Under 14 GB of RAM the textures
+    // are collected from 640 MiB on and kept under 1 GiB.
+    {
+        static const u64 total_ram = [] {
+            u64 kib = 0;
+            if (std::FILE* file = std::fopen("/proc/meminfo", "r")) {
+                char line[128];
+                while (std::fgets(line, sizeof(line), file)) {
+                    if (std::strncmp(line, "MemTotal:", 9) == 0) {
+                        kib = std::strtoull(line + 9, nullptr, 10);
+                        break;
+                    }
+                }
+                std::fclose(file);
+            }
+            return kib << 10;
+        }();
+        if (total_ram != 0 && total_ram < 14_GiB) {
+            critical_memory = (std::min)(critical_memory, u64{1_GiB});
+            expected_memory = (std::min)(expected_memory, u64{640_MiB});
+            minimum_memory = (std::min)(minimum_memory, expected_memory / 2);
+        }
+    }
+#endif
     // EDEN_NX2_TC_EXPECTED_MIB / EDEN_NX2_TC_CRITICAL_MIB override the collector's thresholds.
     for (const auto& [name, target] : {std::pair{"EDEN_NX2_TC_EXPECTED_MIB", &expected_memory},
                                        std::pair{"EDEN_NX2_TC_CRITICAL_MIB", &critical_memory}}) {
@@ -499,6 +529,9 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
 
 template <class P>
 void TextureCache<P>::TickFrame() {
+    CacheMemoryStats::texture_bytes.store(total_used_memory, std::memory_order_relaxed);
+    CacheMemoryStats::texture_created.store(images_created, std::memory_order_relaxed);
+    CacheMemoryStats::texture_deleted.store(images_deleted, std::memory_order_relaxed);
     // Upload buffers grown for one huge image (title 1's 341 MiB terrain layer pools) are freed
     // rather than kept for the rest of the session.
     for (auto* const scratch : {&swizzle_data_buffer, &unswizzle_data_buffer}) {
@@ -1850,6 +1883,10 @@ ImageId TextureCache<P>::DmaImageId(const Tegra::DMA::ImageOperand& operand, boo
         // Don't accelerate 3D images.
         return NULL_IMAGE_ID;
     }
+    if (True(image.flags & ImageFlagBits::TrimmedLevels)) {
+        // Its host levels are not the guest's: go through guest memory.
+        return NULL_IMAGE_ID;
+    }
     if (!is_upload && !image.info.dma_downloaded) {
         // Force a full sync.
         image.info.dma_downloaded = true;
@@ -2287,6 +2324,12 @@ void TextureCache<P>::UploadLayers(Image& image, std::span<const u32> layers) {
                     UnswizzleImage(*gpu_memory, layer_addr, layer_info, swizzle_data,
                                    staging.mapped_span.subspan(i * layer_size, layer_size));
                 for (BufferImageCopy copy : layer_copies) {
+                    // Levels a trimmed host image does not keep (phones, see TrimmedHostInfo).
+                    const s32 skip = static_cast<s32>(image.host_level_offset);
+                    if (copy.image_subresource.base_level < skip) {
+                        continue;
+                    }
+                    copy.image_subresource.base_level -= skip;
                     copy.buffer_offset += i * layer_size;
                     copy.image_subresource.base_layer = static_cast<s32>(layers[i]);
                     copies.push_back(copy);
@@ -2354,15 +2397,33 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) 
 
     Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead> swizzle_data(
         *gpu_memory, gpu_addr, image.guest_size_bytes, &swizzle_data_buffer);
+    // A host image with its first levels trimmed (phones, see TrimmedHostInfo): upload only the
+    // levels it keeps, each to its host level.
+    const auto keep_host_levels = [&image](auto& copies) {
+        if (image.host_level_offset == 0) {
+            return;
+        }
+        const s32 skip = static_cast<s32>(image.host_level_offset);
+        copies.erase(std::remove_if(copies.begin(), copies.end(),
+                                    [skip](const BufferImageCopy& copy) {
+                                        return copy.image_subresource.base_level < skip;
+                                    }),
+                     copies.end());
+        for (auto& copy : copies) {
+            copy.image_subresource.base_level -= skip;
+        }
+    };
     if (True(image.flags & ImageFlagBits::Converted)) {
         unswizzle_data_buffer.resize_destructive(image.unswizzled_size_bytes);
         auto copies = UnswizzleImage(*gpu_memory, gpu_addr, image.info, swizzle_data,
                                     unswizzle_data_buffer, &unswizzle_worker);
         ConvertImage(unswizzle_data_buffer, image.info, mapped_span, copies);
+        keep_host_levels(copies);
         image.UploadMemory(staging, copies);
     } else {
-        const auto copies = UnswizzleImage(*gpu_memory, gpu_addr, image.info, swizzle_data,
-                                          mapped_span, &unswizzle_worker);
+        auto copies = UnswizzleImage(*gpu_memory, gpu_addr, image.info, swizzle_data,
+                                    mapped_span, &unswizzle_worker);
+        keep_host_levels(copies);
         image.UploadMemory(staging, copies);
     }
 }

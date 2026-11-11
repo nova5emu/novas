@@ -131,7 +131,10 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     system = &system_;
     check_owner = std::getenv("EDEN_NX2_SPLIT_CHECK") != nullptr;
     ring = std::make_unique<u64[]>(RingWords);
-    back_thread = std::jthread([this](std::stop_token stop_token) { BackLoop(stop_token); });
+    // The back thread runs draws and dispatches, and so builds pipelines: a large stack on Android.
+    back_thread = std::jthread([this](std::stop_token stop_token) {
+        Common::RunWithLargeStack([&] { BackLoop(stop_token); });
+    });
     active = true;
     const char* jit = std::getenv("EDEN_NX2_MME_JIT");
     front_macros = mode == '2' && (jit == nullptr || jit[0] != '0');

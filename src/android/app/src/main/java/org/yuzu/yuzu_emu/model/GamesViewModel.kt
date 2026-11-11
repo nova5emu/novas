@@ -45,6 +45,13 @@ class GamesViewModel : ViewModel() {
     val shouldScrollAfterReload: StateFlow<Boolean> get() = _shouldScrollAfterReload
     private val _shouldScrollAfterReload = MutableStateFlow(false)
 
+    // NovaS: an extracted game (base/exefs folder) was found but needs access to all files.
+    val needsAllFilesAccess: StateFlow<Boolean> get() = _needsAllFilesAccess
+    private val _needsAllFilesAccess = MutableStateFlow(false)
+    fun setNeedsAllFilesAccess(value: Boolean) {
+        _needsAllFilesAccess.value = value
+    }
+
     private val _folders = MutableStateFlow(mutableListOf<GameDir>())
     val folders = _folders.asStateFlow()
 
@@ -117,11 +124,16 @@ class GamesViewModel : ViewModel() {
                                     return@forEach
                                 }
 
-                                val gameExists =
+                                val gameUri = Uri.parse(game.path)
+                                // NovaS: extracted games are listed by their main's real path.
+                                val gameExists = if (gameUri.scheme == null || gameUri.scheme == "file") {
+                                    java.io.File(gameUri.path ?: "").exists()
+                                } else {
                                     DocumentFile.fromSingleUri(
                                         YuzuApplication.appContext,
-                                        Uri.parse(game.path)
+                                        gameUri
                                     )?.exists()
+                                }
                                 if (gameExists == true) {
                                     deserializedGames.add(game)
                                 }
@@ -131,6 +143,9 @@ class GamesViewModel : ViewModel() {
                     }
 
                     setGames(GameHelper.getGames())
+                    if (GameHelper.looseGamesNeedAllFilesAccess) {
+                        _needsAllFilesAccess.value = true
+                    }
                     _shouldScrollAfterReload.value = true
 
                     if (directoriesChanged) {
