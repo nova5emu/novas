@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <numeric>
 #include <bit>
 #include "common/cpu_features.h"
@@ -25,6 +26,36 @@ using NativeExecutionParameters = Kernel::KThread::NativeExecutionParameters;
 
 constexpr size_t MaxRelativeBranch = 128_MiB;
 constexpr u32 ModuleCodeIndex = 0x24 / sizeof(u32);
+
+namespace {
+/// What a pointer authentication instruction does with the keys off (as on the console, and as
+/// Dynarmic runs it on PC); any other instruction comes back unchanged. PACGA is left alone: it uses
+/// the generic key, works the same on the host and never traps.
+u32 PacReplacement(u32 inst) {
+    constexpr u32 Nop = 0xD503201F;
+    // HINT space: XPACLRI, PACIA1716, PACIB1716, AUTIA1716, AUTIB1716, PACIAZ/SP, PACIBZ/SP, AUTIAZ/SP, AUTIBZ/SP.
+    if ((inst & 0xFFFFF01F) == 0xD503201F) {
+        const u32 imm = (inst >> 5) & 0x7F;
+        if (imm == 7 || imm == 8 || imm == 10 || imm == 12 || imm == 14 || (imm >= 24 && imm <= 31)) {
+            return Nop;
+        }
+        return inst;
+    }
+    // PACIA/PACIB/PACDA/PACDB/AUTIA/AUTIB/AUTDA/AUTDB (and their Z forms), XPACI, XPACD.
+    if ((inst & 0xFFFF8000) == 0xDAC10000 && ((inst >> 10) & 0x1F) <= 0x11) {
+        return Nop;
+    }
+    // RETAA, RETAB -> RET.
+    if (inst == 0xD65F0BFF || inst == 0xD65F0FFF) {
+        return 0xD65F03C0;
+    }
+    // BRAA/BRAB/BLRAA/BLRAB and their Z forms -> BR/BLR on the same register.
+    if ((inst & 0xFEDFF800) == 0xD61F0800) {
+        return 0xD61F0000 | (inst & 0x00200000) | (inst & 0x000003E0);
+    }
+    return inst;
+}
+} // namespace
 
 Patcher::Patcher() : c(m_patch_instructions), c_pre(m_patch_instructions_pre) {
     // The first word of the patch section is always a branch to the first instruction of the
@@ -97,6 +128,14 @@ bool Patcher::PatchText(std::span<const u8> program_image, const Kernel::CodeSet
     const auto text = std::span{program_image}.subspan(code.offset, code.size);
     const auto text_words =
         std::span<const u32>{reinterpret_cast<const u32*>(text.data()), text.size() / sizeof(u32)};
+
+    // Switch 2 modules can start code before ModuleCodeIndex (Ocarina of Time's main has a function at
+    // +0x20 opening with PACIBSP): pointer authentication there too, or its RETAB returns signed.
+    for (u32 i = 0; i < (std::min)(ModuleCodeIndex, static_cast<u32>(text_words.size())); i++) {
+        if (PacReplacement(text_words[i]) != text_words[i]) {
+            curr_patch->m_pac.push_back(i);
+        }
+    }
 
     // Loop through instructions, patching as needed.
     for (u32 i = ModuleCodeIndex; i < static_cast<u32>(text_words.size()); i++) {
@@ -186,6 +225,13 @@ bool Patcher::PatchText(std::span<const u8> program_image, const Kernel::CodeSet
 
         if (auto exclusive = Exclusive{inst}; exclusive.Verify()) {
             curr_patch->m_exclusives.push_back(i);
+        }
+
+        // Pointer authentication: the game's code expects it to do nothing (as under Dynarmic on PC),
+        // but on a phone the host has its keys on, and an AUTIASP after the game moved its return
+        // address killed Zelda: Ocarina of Time with SIGILL. Rewritten in RelocateAndCopy.
+        if (PacReplacement(inst) != inst) {
+            curr_patch->m_pac.push_back(i);
         }
     }
 
@@ -372,6 +418,10 @@ bool Patcher::RelocateAndCopy(Common::ProcessAddress load_base, const Kernel::Co
     for (const ModuleTextAddress i : patch.m_exclusives) {
         auto exclusive = Exclusive{text_words[i]};
         text_words[i] = exclusive.AsOrdered();
+    }
+
+    for (const ModuleTextAddress i : patch.m_pac) {
+        text_words[i] = PacReplacement(text_words[i]);
     }
 
     // Remove the patched module size from the total. This is done so total_program_size

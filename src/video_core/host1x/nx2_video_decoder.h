@@ -41,7 +41,9 @@ bool IsH264Stream(std::span<const u8> data);
 class Nx2VideoDecoder {
 public:
     /// mime: the codec name nn::codec sends with Configure ("video/vp9", "video/vp8", ...).
-    explicit Nx2VideoDecoder(std::string_view mime);
+    /// width/height: the stream size from Configure, if known (0: unknown). On Android, codecs the
+    /// bundled FFmpeg lacks (AV1) are decoded with the platform's MediaCodec, which needs a size.
+    explicit Nx2VideoDecoder(std::string_view mime, u32 width = 0, u32 height = 0);
     ~Nx2VideoDecoder();
 
     bool IsOpen() const;
@@ -50,6 +52,12 @@ public:
 
     /// Decodes one compressed frame and appends the pictures it completes.
     void Decode(std::span<const u8> data, u64 pts, std::vector<Nx2Picture>& pictures);
+
+    /// True while an asynchronous decoder holds submitted frames it has not output yet.
+    bool HasPendingOutput() const;
+
+    /// Appends the pictures an asynchronous decoder finished since the last call, without input.
+    void Poll(std::vector<Nx2Picture>& pictures);
 
     /// End of stream: appends the pictures the decoder still holds, then starts over.
     void Drain(std::vector<Nx2Picture>& pictures);

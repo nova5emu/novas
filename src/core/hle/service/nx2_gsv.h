@@ -71,6 +71,7 @@
 #include "core/hle/service/nvdrv/nvdrv_interface.h"
 #include "core/hle/service/nx2_stub_interface.h"
 #include "core/hle/service/nx2_image_layout.h"
+#include "core/hle/service/nx2_movie_clock.h"
 #include "core/hle/service/nx2_video_input_queue.h"
 #include "core/hle/service/nx2_present_pacer.h"
 #include "core/hle/service/nx2_video_ready.h"
@@ -1505,6 +1506,8 @@ struct Nx2NativeObjects {
         bool decoder{}; // a video decoder output image (gsv 911)
         // A decoder image the client reads on the GPU (gsv 428/426): written block-linear.
         bool gpu_read{};
+        bool pitch_frame{}; // holds a frame written before gpu_read was set
+        std::shared_ptr<std::mutex> decoder_mutex;
         u32 gpu_maps{};     // outstanding 426 maps
         bool mapped_here{}; // 426 added its GPU mapping (no other mapping covered it)
     };
@@ -1514,6 +1517,12 @@ struct Nx2NativeObjects {
     std::optional<VideoTrace> last_video_write;
     u32 next_memory{1};
     u32 next_image{1};
+
+    std::shared_ptr<std::mutex> DecoderMutex(u32 id) {
+        std::scoped_lock lk{mutex};
+        const auto image = images.find(id);
+        return image != images.end() ? image->second.decoder_mutex : nullptr;
+    }
 };
 
 // GameChat's graphics side (nn::chat::gsv), handed out by gsv 1202. Read from the SDK's
@@ -1628,6 +1637,31 @@ inline Nx2DecoderImageLayout Nx2CalculateDecoderImageLayout(const u32* preferenc
     layout.size = layout.chroma_offset +
                   (nv12 ? layout.pitch * Common::AlignUp((u64{layout.height} + 1) / 2, BlockRows) : 0);
     return layout;
+}
+
+// Rewrites a decoder image holding a pitch-linear frame in the layout GPU reads use (RGBA,
+// native block-linear, 16-GOB blocks). For frames decoded before the client's first 428/426.
+inline void Nx2RelayoutDecoderImage(Core::System& system, u64 address,
+                                    const Nx2DecoderImageLayout& layout) {
+    if (layout.format == Tegra::Host1x::Nx2PictureFormat::Nv12 ||
+        system.ApplicationProcess() == nullptr) {
+        return;
+    }
+    auto& memory = system.ApplicationMemory();
+    std::vector<u8> linear(layout.size);
+    memory.ReadBlock(address, linear.data(), linear.size());
+    if (layout.format == Tegra::Host1x::Nx2PictureFormat::Bgra8) {
+        for (size_t i = 0; i + 3 < linear.size(); i += 4) {
+            std::swap(linear[i], linear[i + 2]);
+        }
+    }
+    std::vector<u8> tiled(layout.size);
+    Tegra::Texture::SwizzleTexture(tiled, linear, 4, static_cast<u32>(layout.pitch / 4),
+                                   layout.height, 1, 4, 0, 1, true);
+    memory.WriteBlock(address, tiled.data(), tiled.size());
+    if (const auto device = Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DeviceAddressOf(address)) {
+        system.GPU().InvalidateRegion(*device, tiled.size());
+    }
 }
 
 // Placeholder for the Switch 2 display session (nn::vi2::sdk), handed out by gsv 305. Reply
@@ -2616,11 +2650,7 @@ private:
     static constexpr u32 NoSyncpoint = ~0U;
     static constexpr size_t MaxDecodedAhead = 2; // decoded frames held while no image is free
     static constexpr u32 HostSyncpoints = 192;   // Tegra::Host1x::SyncpointManager
-    // Movie pacing (see DropOvertakenFrames): a longer gap between acquires is a pause, a longer
-    // lag a jump in the stream; both restart the clock instead of dropping frames.
-    static constexpr s64 PauseGap = 1'000'000;   // us
-    static constexpr s64 MaxCatchUp = 3'000'000; // us
-    static constexpr u32 MaxDroppedInARow = 30;
+    static constexpr u32 MaxDroppedInARow = 30; // see DropOvertakenFrames
 
     void Log(HLERequestContext& ctx, std::string_view what) {
         const auto* w = ctx.CommandBuffer();
@@ -2703,7 +2733,7 @@ private:
             m_codec = std::move(codec);
             m_width = w[5];
             m_height = w[6];
-            m_clock_offset.reset();
+            m_clock.Reset();
             m_stream_start.reset();
         }
         if (!m_worker.joinable()) {
@@ -2820,14 +2850,20 @@ private:
         const u64 pts = u64{w[words]} | (u64{w[words + 1]} << 32);
         const bool end = (w[words + 2] & 0xFF) != 0;
         Log(ctx, "submit");
-        // The SDK answers busy when the decoder cannot take a packet, and the client retries after
-        // the submission-ready event. Taking every packet let a player queue a whole movie: Ocarina
-        // of Time's title movie went in at ~330 packets a second (2,600 queued), and until the
-        // last was in, its pictures came at 20-28 fps, so the video started ~11 s behind its
-        // audio. End of stream is never refused.
-        if (!end) {
+        Input input{{}, pts, end};
+        if (!ctx.BufferDescriptorA().empty()) {
+            const auto data = ctx.ReadBufferA(0);
+            input.data.assign(data.begin(), data.end());
+        }
+        const auto input_size = input.data.size();
+        {
             std::scoped_lock lk{m_mutex};
-            if (m_inputs.Full()) {
+            // The SDK answers busy when the decoder cannot take a packet, and the client retries
+            // after the submission-ready event. Taking every packet let a player queue a whole
+            // movie: Ocarina of Time's title movie went in at ~330 packets a second (2,600
+            // queued), and until the last was in, its pictures came at 20-28 fps, so the video
+            // started ~11 s behind its audio. End of stream is never refused.
+            if (!m_inputs.Submit(std::move(input))) {
                 if (Nx2VideoTraceEnabled()) {
                     LOG_INFO(Service, "nx2:vdec trace refuse syncpoint={} pts={} queued={}",
                              m_syncpoint, pts, m_inputs.Size());
@@ -2838,16 +2874,6 @@ private:
                 rb.PushRaw<u32>(ResultDecoderBusy.raw);
                 return;
             }
-        }
-        Input input{{}, pts, end};
-        if (!ctx.BufferDescriptorA().empty()) {
-            const auto data = ctx.ReadBufferA(0);
-            input.data.assign(data.begin(), data.end());
-        }
-        const auto input_size = input.data.size();
-        {
-            std::scoped_lock lk{m_mutex};
-            m_inputs.Push(std::move(input));
             m_stream_ended = false;
             m_end_queued |= end;
             m_ready->room.store(!m_end_queued && m_inputs.BelowReadyWatermark(),
@@ -2885,7 +2911,7 @@ private:
             m_flush = true;
             m_stream_ended = false;
             m_end_queued = false;
-            m_clock_offset.reset();
+            m_clock.Reset();
             m_stream_start.reset();
             m_ready->room.store(true, std::memory_order_relaxed);
             // Only Stop: Bananza flushes (8) after its movies end and treats every completed
@@ -2911,7 +2937,7 @@ private:
                          m_decoded_frames, m_frames_out, m_stream_ended, m_end_queued);
             }
             CompleteHandedFences();
-            m_clock_offset.reset();
+            m_clock.Reset();
             m_stream_start.reset();
         }
         TipcReplyWords(ctx, {});
@@ -2921,38 +2947,9 @@ private:
         return system.CoreTiming().GetGlobalTimeUs().count();
     }
 
-    // Whether emulation was paused and resumed after host time `time_us`: the movie's audio
-    // stopped meanwhile, so the clock must restart from the next acquire.
-    bool ResumedSince(s64 time_us) const {
-        return system.CoreTiming().GetPauseEndTime().count() / 1000 > time_us;
-    }
-
-    // Starts or corrects the movie clock from a frame the client just acquired (m_mutex held).
-    // The clock never runs behind a frame the client already shows.
-    void AnchorClock(u64 pts) {
-        const s64 now = HostTimeUs();
-        const s64 offset = now - static_cast<s64>(pts);
-        if (!m_clock_offset || now - m_last_acquire > PauseGap || ResumedSince(m_last_acquire) ||
-            pts < m_last_acquired_pts || offset < *m_clock_offset ||
-            offset - *m_clock_offset > MaxCatchUp) {
-            m_clock_offset = offset;
-        }
-        m_last_acquire = now;
-        m_last_acquired_pts = pts;
-    }
-
-    // The pts the movie's audio has reached, if the client shows frames yet (m_mutex held).
-    std::optional<u64> DuePts() {
-        if (!m_clock_offset) {
-            return std::nullopt;
-        }
-        const s64 now = HostTimeUs();
-        const s64 due = now - *m_clock_offset;
-        // Nothing acquired for a while: paused; the next acquire restarts the clock.
-        if (due < 0 || now - m_last_acquire > PauseGap || ResumedSince(m_last_acquire)) {
-            return std::nullopt;
-        }
-        return static_cast<u64>(due);
+    // When emulation last resumed from a pause: the movie's audio stopped meanwhile.
+    s64 PauseEndUs() const {
+        return system.CoreTiming().GetPauseEndTime().count() / 1000;
     }
 
     // Games such as Ocarina of Time show one decoded frame per frame they draw and never skip
@@ -2964,7 +2961,7 @@ private:
         if (m_decoded.empty()) {
             return false;
         }
-        const auto due = DuePts();
+        const auto due = m_clock.Due(HostTimeUs(), PauseEndUs());
         if (!due) {
             m_dropped_in_a_row = 0;
             return false;
@@ -3010,8 +3007,9 @@ private:
             if (!m_outputs.empty()) {
                 output = m_outputs.front();
                 m_outputs.pop_front();
-                AnchorClock(output->pts);
+                m_clock.Acquired(HostTimeUs(), output->pts, PauseEndUs());
             }
+            m_ready->output_ready.store(!m_outputs.empty(), std::memory_order_relaxed);
         }
         if (!output) {
             if (Nx2VideoTraceEnabled()) {
@@ -3044,10 +3042,33 @@ private:
         std::vector<u8> bytes;
         std::unique_lock lk{m_mutex};
         while (true) {
-            m_cv.wait(lk, [&] {
+            const auto ready = [&] {
                 return m_quit || m_flush || (!m_decoded.empty() && !m_free.empty()) ||
                        (!m_inputs.Empty() && m_decoded.size() < MaxDecodedAhead);
-            });
+            };
+            if (decoder && decoder->HasPendingOutput()) {
+                // An asynchronous (hardware) decoder finishes frames on its own: collect them
+                // while idle, or a client waiting for the next frame before it submits more input
+                // never gets it.
+                if (!m_cv.wait_for(lk, std::chrono::milliseconds{4}, ready)) {
+                    if (m_decoded.size() < MaxDecodedAhead) {
+                        lk.unlock();
+                        pictures.clear();
+                        decoder->Poll(pictures);
+                        lk.lock();
+                        m_decoded_frames += pictures.size();
+                        if (!m_flush) {
+                            for (auto& picture : pictures) {
+                                const u64 pts = picture.pts;
+                                m_decoded.push_back({std::move(picture), pts, false});
+                            }
+                        }
+                    }
+                    continue;
+                }
+            } else {
+                m_cv.wait(lk, ready);
+            }
             if (m_quit) {
                 return;
             }
@@ -3088,6 +3109,7 @@ private:
                     m_ready->room.store(false, std::memory_order_relaxed);
                 }
                 system.Host1x().GetSyncpointManager().IncrementGuest(m_syncpoint);
+                m_ready->SignalOutput(system.Kernel());
                 m_last_output = m_outputs.back();
                 if (frame.end && m_inputs.Empty() && m_decoded.empty() &&
                     system.GetApplicationProcessProgramID() == Settings::MarioKartWorldProgramId) {
@@ -3136,7 +3158,8 @@ private:
                                               std::min(input.data.size(), size_t{16})),
                                           " "));
                 }
-                decoder = std::make_unique<Tegra::Host1x::Nx2VideoDecoder>(codec);
+                decoder =
+                    std::make_unique<Tegra::Host1x::Nx2VideoDecoder>(codec, m_width, m_height);
             }
             pictures.clear();
             decoder->Decode(input.data, input.pts, pictures);
@@ -3212,6 +3235,11 @@ private:
     // Writes a decoded frame into an output image; returns the size the frame reports.
     std::pair<u32, u32> WriteImage(Tegra::Host1x::Nx2VideoDecoder* decoder, u32 image_id,
                                    const Decoded& frame, std::vector<u8>& bytes) {
+        const auto image_mutex = m_objects->DecoderMutex(image_id);
+        std::unique_lock<std::mutex> image_lock;
+        if (image_mutex) {
+            image_lock = std::unique_lock{*image_mutex};
+        }
         u64 address{};
         u32 parent{};
         u64 parent_offset{};
@@ -3220,7 +3248,7 @@ private:
         {
             std::scoped_lock lk{m_objects->mutex};
             const auto image = m_objects->images.find(image_id);
-            if (image == m_objects->images.end()) {
+            if (image == m_objects->images.end() || image->second.decoder_mutex != image_mutex) {
                 if (Nx2VideoTraceEnabled()) {
                     LOG_INFO(Service, "nx2:vdec trace write skipped syncpoint={} image={} destroyed",
                              m_syncpoint, image_id);
@@ -3304,6 +3332,19 @@ private:
             system.GPU().InvalidateRegion(*device, layout.size);
         }
         trace_write();
+        // A 428/426 that came in while this frame was written didn't see it: relayout it here.
+        bool relayout = false;
+        if (layout.format != Tegra::Host1x::Nx2PictureFormat::Nv12) {
+            std::scoped_lock lk{m_objects->mutex};
+            if (const auto image = m_objects->images.find(image_id);
+                image != m_objects->images.end()) {
+                relayout = image->second.gpu_read;
+                image->second.pitch_frame = !relayout;
+            }
+        }
+        if (relayout) {
+            Nx2RelayoutDecoderImage(system, address, layout);
+        }
         return {width, height};
     }
 
@@ -3351,9 +3392,7 @@ private:
     u64 m_frames_out{};
     u64 m_decoded_frames{};
     u64 m_frames_dropped{};
-    std::optional<s64> m_clock_offset; ///< Host time minus pts (us) of the frames the client shows
-    s64 m_last_acquire{};              ///< Host time (us) of the client's last acquire
-    u64 m_last_acquired_pts{};
+    Nx2MovieClock m_clock;
     u64 m_frame_interval{16667}; ///< us, from consecutive decoded frames
     u64 m_last_decoded_pts{};
     u32 m_dropped_in_a_row{};
@@ -3960,16 +3999,23 @@ private:
     // (offset 0 once mapped). 426 maps the image at its own address for the GPU: decoder pool
     // memory is process memory (114) that no GPU mapping covers, and the blit read zeros.
     bool QueryDecoderImage(HLERequestContext& ctx, u32 handle) {
+        const auto image_mutex = m_objects->DecoderMutex(handle);
+        if (!image_mutex) {
+            return false;
+        }
+        std::scoped_lock image_lock{*image_mutex};
         const bool map = ctx.GetCommand() == 426;
         u64 address{};
         u64 size{};
         u64 offset{};
         u32 dimensions{};
         bool register_mapping = false;
+        u64 relayout_address{};
+        Nx2DecoderImageLayout relayout_layout{};
         {
             std::scoped_lock lk{m_objects->mutex};
             const auto image = m_objects->images.find(handle);
-            if (image == m_objects->images.end() || !image->second.decoder) {
+            if (image == m_objects->images.end() || image->second.decoder_mutex != image_mutex) {
                 return false;
             }
             const auto memory = m_objects->memories.find(image->second.memory);
@@ -3977,6 +4023,10 @@ private:
                 return false;
             }
             image->second.gpu_read = true;
+            if (std::exchange(image->second.pitch_frame, false)) {
+                relayout_address = memory->second.address + image->second.offset;
+                relayout_layout = Nx2CalculateDecoderImageLayout(image->second.preference.data());
+            }
             offset = image->second.offset;
             size = image->second.size;
             dimensions = image->second.preference[2];
@@ -3989,6 +4039,10 @@ private:
         }
         if (register_mapping) {
             Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Register(address, size);
+        }
+        // Frames decoded before the first 428/426 were written pitch-linear.
+        if (relayout_address != 0) {
+            Nx2RelayoutDecoderImage(system, relayout_address, relayout_layout);
         }
         LOG_INFO(Service, "nx2:gsv {} decoder image {} at {:#x}+{:#x}{}", ctx.GetCommand(), handle,
                  address, size, register_mapping ? ", mapped for the GPU" : "");
@@ -4020,6 +4074,11 @@ private:
     void UnmapNativeImage(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
         const u32 handle = w[2];
+        const auto image_mutex = m_objects->DecoderMutex(handle);
+        std::unique_lock<std::mutex> image_lock;
+        if (image_mutex) {
+            image_lock = std::unique_lock{*image_mutex};
+        }
         std::optional<std::pair<u64, u64>> unmap;
         {
             std::scoped_lock lk{m_objects->mutex};
@@ -4072,6 +4131,7 @@ private:
             image.size = layout.size;
             image.offset = layout.size * i;
             image.decoder = true;
+            image.decoder_mutex = std::make_shared<std::mutex>();
         }
         LOG_INFO(Service, "nx2:gsv 911 decoder images {}..{} code={} {}x{} in memory {}", first,
                  first + count - 1, layout.code, layout.width, layout.height, w[19]);
@@ -4115,6 +4175,11 @@ private:
         const u32 id = ctx.CommandBuffer()[2];
         if (Nx2VideoTraceEnabled()) {
             LOG_INFO(Service, "nx2:vdec trace destroy image={} command={}", id, ctx.GetCommand());
+        }
+        const auto image_mutex = m_objects->DecoderMutex(id);
+        std::unique_lock<std::mutex> image_lock;
+        if (image_mutex) {
+            image_lock = std::unique_lock{*image_mutex};
         }
         std::optional<std::pair<u64, u64>> unmap;
         {

@@ -164,7 +164,8 @@ class MainActivity : AppCompatActivity(), ThemeProvider {
         val firstTimeSetup = PreferenceManager.getDefaultSharedPreferences(applicationContext)
                 .getBoolean(Settings.PREF_FIRST_APP_LAUNCH, true)
 
-        if (!firstTimeSetup && NativeLibrary.isUpdateCheckerEnabled() && BooleanSetting.ENABLE_UPDATE_CHECKS.getBoolean()) {
+        // NovaS: every start looks for a newer NovaS for Android on GitHub (as the PC launcher does).
+        if (!firstTimeSetup && BooleanSetting.ENABLE_UPDATE_CHECKS.getBoolean()) {
              checkForUpdates()
         }
         setInsets()
@@ -173,7 +174,7 @@ class MainActivity : AppCompatActivity(), ThemeProvider {
 
     private fun checkForUpdates() {
         Thread {
-            val latestVersion = NativeLibrary.checkForUpdate()
+            val latestVersion = NovaSUpdate.check()
             if (latestVersion != null) {
                 runOnUiThread {
                     showUpdateDialog(latestVersion)

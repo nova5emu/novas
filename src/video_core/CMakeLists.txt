@@ -532,6 +532,11 @@ if (ANDROID AND ARCHITECTURE_arm64)
     target_link_libraries(video_core PRIVATE adrenotools)
 endif()
 
+if (ANDROID)
+    # MediaCodec decodes the Switch 2 AV1 movies the bundled Android FFmpeg has no decoder for.
+    target_link_libraries(video_core PRIVATE mediandk)
+endif()
+
 # NVIDIA DLSS through NVIDIA Streamline, in place of a game's DLSS (before FSR 3.1) when the
 # setting is on. Only Streamline's MIT-licensed headers are compiled in and nothing of NVIDIA's is
 # linked or copied: sl.interposer.dll and the DLSS plugins are loaded at run time from the user's PC.

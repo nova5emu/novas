@@ -109,6 +109,8 @@ class GamesFragment : Fragment() {
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
         homeViewModel.setStatusBarShadeVisibility(true)
+        // NovaS: also after the first-time setup of a fresh install (MainActivity only does it on later starts).
+        org.yuzu.yuzu_emu.utils.GpuDriverHelper.selectBundledTurnipOnce()
         mainActivity = requireActivity() as MainActivity
 
         if (savedInstanceState != null) {
