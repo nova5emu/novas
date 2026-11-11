@@ -51,6 +51,7 @@
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
+#include "video_core/renderer_vulkan/vk_hang_guard.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -1412,6 +1413,10 @@ void RasterizerVulkan::DispatchCompute() {
     ComputePipeline* const pipeline{pipeline_cache.CurrentComputePipeline()};
     if (!pipeline) {
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute pipeline unavailable");
+        return;
+    }
+    // Android: skip compute shaders that hung the phone's GPU in an earlier session.
+    if (!HangGuard::BeforeDispatch(pipeline->ShaderHash(), scheduler.CurrentTick())) {
         return;
     }
     std::scoped_lock lock{texture_cache.mutex, buffer_cache.mutex};

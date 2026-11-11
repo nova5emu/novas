@@ -218,6 +218,45 @@ object GpuDriverHelper {
         hookLibPath: String
     ): String?
 
+    /**
+     * NovaS: on Adreno phones, the Turnip driver bundled in the APK (Mesa, Adreno 8xx branch) is
+     * selected once, unless the player already chose a driver. Qualcomm's own driver hung the GPU on
+     * Pokopia's compute shaders on a Galaxy S26 Ultra. The driver manager can switch back to the
+     * system driver; it is not selected again after that.
+     */
+    fun selectBundledTurnipOnce() {
+        val context = YuzuApplication.appContext
+        val prefs = androidx.preference.PreferenceManager.getDefaultSharedPreferences(context)
+        val prefKey = "novas_bundled_turnip_v32"
+        if (prefs.getBoolean(prefKey, false)) {
+            return
+        }
+        try {
+            if (DirectoryInitialization.userDirectory == null || !isAdrenoGpu()) {
+                return
+            }
+            prefs.edit().putBoolean(prefKey, true).apply()
+            if (StringSetting.DRIVER_PATH.getString().isNotEmpty()) {
+                return
+            }
+            val storage = File(driverStoragePath)
+            storage.mkdirs()
+            val driver = File(storage, "novas-turnip-v32.zip")
+            context.assets.open("novas-drivers/mainline-turnip-V32.zip").use { input ->
+                driver.outputStream().use { input.copyTo(it) }
+            }
+            if (getMetadataFromZip(driver).name == null) {
+                driver.delete()
+                return
+            }
+            StringSetting.DRIVER_PATH.setString(driver.path)
+            org.yuzu.yuzu_emu.utils.NativeConfig.saveGlobalConfig()
+            Log.info("[GpuDriverHelper] NovaS: bundled Turnip selected")
+        } catch (e: Exception) {
+            Log.error("[GpuDriverHelper] NovaS: bundled Turnip not installed: ${e.message}")
+        }
+    }
+
     fun isAdrenoGpu(): Boolean {
         return try {
             supportsCustomDriverLoading()

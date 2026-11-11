@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- NovaS: the colours of the PC launcher (NovaSHome.cs). -->
+<resources>
+    <color name="novas_screen">#16171C</color>
+    <color name="novas_panel">#24262E</color>
+    <color name="novas_line">#3A3D48</color>
+    <color name="novas_accent">#2EC5F0</color>
+    <color name="novas_text">#F2F3F7</color>
+    <color name="novas_dim">#9A9EAD</color>
+</resources>

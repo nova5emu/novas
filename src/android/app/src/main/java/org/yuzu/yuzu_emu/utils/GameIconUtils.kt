@@ -50,6 +50,11 @@ class GameIconFetcher(
     }
 
     private fun decodeGameIcon(game: Game): Bitmap? {
+        // NovaS: the bundled cover of a known Switch 2 game, as on PC.
+        NovaSCovers.cover(game.title)?.let {
+            gameIconHashes[game.iconCacheKey()] = game.title.hashCode()
+            return it
+        }
         val data = GameMetadata.getIcon(game.path)
         gameIconHashes[game.iconCacheKey()] = data.contentHashCode()
         return BitmapFactory.decodeByteArray(
@@ -107,6 +112,9 @@ object GameIconUtils {
     }
 
     fun refreshGameIcon(game: Game) {
+        if (NovaSCovers.hasCover(game.title)) {
+            return // NovaS: a bundled cover does not change with the game's own icon.
+        }
         val targets = synchronized(gameIconTargets) {
             gameIconTargets
                 .filterValues { it.game.path == game.path && it.game.programId == game.programId }

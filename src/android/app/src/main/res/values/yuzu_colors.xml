@@ -224,10 +224,10 @@
     <!-- Eden Theme Colors -->
 
     <!-- Synthwave/Vaporwave Primary Colors -->
-    <color name="eden_primary">#FF0080</color> <!-- Neon magenta -->
-    <color name="eden_primary_variant">#E6006B</color> <!-- Darker magenta -->
-    <color name="eden_secondary">#60D1F6</color> <!-- Electric cyan -->
-    <color name="eden_secondary_variant">#00E6E6</color> <!-- Darker cyan -->
+    <color name="eden_primary">#FF4554</color> <!-- NovaS red -->
+    <color name="eden_primary_variant">#E63B49</color> <!-- NovaS darker red -->
+    <color name="eden_secondary">#00C3E3</color> <!-- NovaS blue -->
+    <color name="eden_secondary_variant">#00A8C4</color> <!-- NovaS darker blue -->
 
     <!-- Background Colors - White -->
     <color name="eden_background">#FFFFFF</color> <!-- Pure black background -->
@@ -241,12 +241,12 @@
     <color name="eden_on_secondary">#C0C0C0</color> <!-- Milky White on cyan -->
 
     <!-- Synthwave Accent Colors -->
-    <color name="eden_accent_purple">#9D00FF</color> <!-- Electric purple -->
+    <color name="eden_accent_purple">#2EC5F0</color> <!-- NovaS accent (was purple) -->
     <color name="eden_accent_blue">#0080FF</color> <!-- Electric blue -->
     <color name="eden_accent_orange">#FF8000</color> <!-- Neon orange -->
 
     <!-- Neon Glow Effects -->
-    <color name="eden_glow_pink">#80FF0080</color> <!-- Magenta glow -->
+    <color name="eden_glow_pink">#80FF4554</color> <!-- Magenta glow -->
     <color name="eden_glow_cyan">#8060D1F6</color> <!-- Cyan glow -->
     <color name="eden_glow_orange">#80FF8000</color> <!-- Orange glow -->
 
@@ -276,8 +276,8 @@
 
     <!-- Transparent versions for gradients -->
     <color name="eden_transparent">#00000000</color>
-    <color name="eden_primary_transparent">#05FF0080</color>
-    <color name="eden_secondary_transparent">#0500FFFF</color>
+    <color name="eden_primary_transparent">#05FF4554</color>
+    <color name="eden_secondary_transparent">#0500C3E3</color>
 
     <!-- Common Colors Across All Themes -->
     <color name="yuzu_outlineVariant">#C6C5D0</color>

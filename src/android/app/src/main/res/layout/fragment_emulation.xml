@@ -100,6 +100,17 @@
                             android:indeterminate="true"
                             app:trackCornerRadius="8dp" />
 
+                        <com.google.android.material.textview.MaterialTextView
+                            android:id="@+id/loading_hint"
+                            style="@style/TextAppearance.Material3.BodySmall"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="10dp"
+                            android:maxWidth="320dp"
+                            android:text="@string/novas_preparing_shaders_hint"
+                            android:textAlignment="viewStart"
+                            android:visibility="gone" />
+
                     </LinearLayout>
 
                 </androidx.constraintlayout.widget.ConstraintLayout>

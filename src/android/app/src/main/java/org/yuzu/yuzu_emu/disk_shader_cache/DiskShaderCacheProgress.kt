@@ -33,8 +33,12 @@ object DiskShaderCacheProgress {
         emulationActivity.runOnUiThread {
             when (LoadCallbackStage.values()[stage]) {
                 LoadCallbackStage.Prepare -> prepareViewModel()
+                // NovaS: "Preparando shaders… 42 %", as the PC launcher shows it.
                 LoadCallbackStage.Build -> emulationViewModel.updateProgress(
-                    emulationActivity.getString(R.string.building_shaders),
+                    emulationActivity.getString(
+                        R.string.novas_preparing_shaders,
+                        if (max > 0) (progress.toLong() * 100 / max).toInt() else 0
+                    ),
                     progress,
                     max
                 )

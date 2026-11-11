@@ -20,6 +20,7 @@
 #include <thread>
 #include <vector>
 #include <dlfcn.h>
+#include <signal.h>
 #include <unistd.h>
 
 #include <iostream>
@@ -34,6 +35,7 @@
 #include <core/file_sys/savedata_factory.h>
 #include <core/loader/nro.h>
 #include <frontend_common/content_manager.h>
+#include <cstdlib>
 #include <jni.h>
 
 extern "C" {
@@ -46,6 +48,7 @@ extern "C" {
 #include "common/dynamic_library.h"
 #include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
+#include "frontend_common/nx2_switches.h"
 #include "common/logging.h"
 #include "common/scm_rev.h"
 #include "common/scope_exit.h"
@@ -411,10 +414,30 @@ void EmulationSession::RunEmulation() {
 
     // Load the disk shader cache.
     if (Settings::values.use_disk_shader_cache.GetValue()) {
+        // NovaS: a saved shader the phone's driver cannot build kills the app while shaders are
+        // prepared, on every start, until the cache is cleared by hand (players would think the game
+        // is broken). A marker file stands while they are prepared: if the last start died there, the
+        // game's saved shaders are thrown away and rebuilt as it plays.
+        const u64 program_id = m_system.GetApplicationProcessProgramID();
+        const auto shader_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir) /
+                                fmt::format("{:016x}", program_id);
+        const auto marker = shader_dir / "preparing-shaders.lock";
+        std::error_code fs_error;
+        if (std::filesystem::exists(marker, fs_error)) {
+            LOG_WARNING(Frontend,
+                        "NovaS: the last start closed while preparing shaders; clearing {} so the game opens",
+                        Common::FS::PathToUTF8String(shader_dir));
+            std::filesystem::remove_all(shader_dir, fs_error);
+        }
+        std::filesystem::create_directories(shader_dir, fs_error);
+        if (std::FILE* file = std::fopen(Common::FS::PathToUTF8String(marker).c_str(), "w")) {
+            std::fclose(file);
+        }
         LoadDiskCacheProgress(VideoCore::LoadCallbackStage::Prepare, 0, 0);
         m_system.Renderer().ReadRasterizer()->LoadDiskResources(
-            m_system.GetApplicationProcessProgramID(), std::stop_token{}, LoadDiskCacheProgress);
+            program_id, std::stop_token{}, LoadDiskCacheProgress);
         LoadDiskCacheProgress(VideoCore::LoadCallbackStage::Complete, 0, 0);
+        std::filesystem::remove(marker, fs_error);
     }
 
     void(m_system.Run());
@@ -857,68 +880,80 @@ jboolean JNICALL Java_org_yuzu_yuzu_1emu_utils_GpuDriverHelper_supportsCustomDri
 
 jobjectArray Java_org_yuzu_yuzu_1emu_utils_GpuDriverHelper_getSystemDriverInfo(
     JNIEnv* env, jobject j_obj, jobject j_surf, jstring j_hook_lib_dir) {
+    // NovaS: describing the GPU must never close the app (see fix_vulkan_info).
+    try {
 #ifdef ARCHITECTURE_arm64
-    const char* file_redirect_dir_{};
-    int featureFlags{};
-    std::string hook_lib_dir = Common::Android::GetJString(env, j_hook_lib_dir);
-    auto handle = adrenotools_open_libvulkan(RTLD_NOW, featureFlags, nullptr, hook_lib_dir.c_str(),
-                                             nullptr, nullptr, file_redirect_dir_, nullptr);
-    auto driver_library = std::make_shared<Common::DynamicLibrary>(handle);
-    InputCommon::InputSubsystem input_subsystem;
-    auto window =
-        std::make_unique<EmuWindow_Android>(ANativeWindow_fromSurface(env, j_surf), driver_library);
+        const char* file_redirect_dir_{};
+        int featureFlags{};
+        std::string hook_lib_dir = Common::Android::GetJString(env, j_hook_lib_dir);
+        auto handle = adrenotools_open_libvulkan(RTLD_NOW, featureFlags, nullptr, hook_lib_dir.c_str(),
+                                                 nullptr, nullptr, file_redirect_dir_, nullptr);
+        auto driver_library = std::make_shared<Common::DynamicLibrary>(handle);
+        InputCommon::InputSubsystem input_subsystem;
+        auto window =
+            std::make_unique<EmuWindow_Android>(ANativeWindow_fromSurface(env, j_surf), driver_library);
 
-    Vulkan::vk::InstanceDispatch dld;
-    Vulkan::vk::Instance vk_instance = Vulkan::CreateInstance(
-        *driver_library, dld, VK_API_VERSION_1_1, Core::Frontend::WindowSystemType::Android);
+        Vulkan::vk::InstanceDispatch dld;
+        Vulkan::vk::Instance vk_instance = Vulkan::CreateInstance(
+            *driver_library, dld, VK_API_VERSION_1_1, Core::Frontend::WindowSystemType::Android);
 
-    auto surface = Vulkan::CreateSurface(vk_instance, window->GetWindowInfo());
+        auto surface = Vulkan::CreateSurface(vk_instance, window->GetWindowInfo());
 
-    auto device = Vulkan::CreateDevice(vk_instance, dld, *surface);
+        auto device = Vulkan::CreateDevice(vk_instance, dld, *surface);
 
-    auto driver_version = device.GetDriverVersion();
-    auto version_string =
-        fmt::format("{}.{}.{}", VK_API_VERSION_MAJOR(driver_version),
-                    VK_API_VERSION_MINOR(driver_version), VK_API_VERSION_PATCH(driver_version));
-    auto driver_name = device.GetDriverName();
+        auto driver_version = device.GetDriverVersion();
+        auto version_string =
+            fmt::format("{}.{}.{}", VK_API_VERSION_MAJOR(driver_version),
+                        VK_API_VERSION_MINOR(driver_version), VK_API_VERSION_PATCH(driver_version));
+        auto driver_name = device.GetDriverName();
 #else
-    auto driver_version = "1.0.0";
-    auto version_string = "1.1.0"; //Assume lowest Vulkan level
-    auto driver_name = "generic";
+        auto driver_version = "1.0.0";
+        auto version_string = "1.1.0"; //Assume lowest Vulkan level
+        auto driver_name = "generic";
 #endif
-    jobjectArray j_driver_info = env->NewObjectArray(2, Common::Android::GetStringClass(), Common::Android::ToJString(env, version_string));
-    env->SetObjectArrayElement(j_driver_info, 1, Common::Android::ToJString(env, driver_name));
-    return j_driver_info;
+        jobjectArray j_driver_info = env->NewObjectArray(2, Common::Android::GetStringClass(), Common::Android::ToJString(env, version_string));
+        env->SetObjectArrayElement(j_driver_info, 1, Common::Android::ToJString(env, driver_name));
+        return j_driver_info;
+    } catch (const std::exception& e) {
+        LOG_ERROR(Frontend, "Could not read the GPU driver: {}", e.what());
+        return nullptr;
+    }
 }
 
 jstring Java_org_yuzu_yuzu_1emu_utils_GpuDriverHelper_getGpuModel(JNIEnv *env, jobject j_obj, jobject j_surf, jstring j_hook_lib_dir) {
+    // NovaS: describing the GPU must never close the app (see fix_vulkan_info).
+    try {
 #ifdef ARCHITECTURE_arm64
-    const char* file_redirect_dir_{};
-    int featureFlags{};
-    std::string hook_lib_dir = Common::Android::GetJString(env, j_hook_lib_dir);
-    auto handle = adrenotools_open_libvulkan(RTLD_NOW, featureFlags, nullptr, hook_lib_dir.c_str(),
-                                             nullptr, nullptr, file_redirect_dir_, nullptr);
-    auto driver_library = std::make_shared<Common::DynamicLibrary>(handle);
-    InputCommon::InputSubsystem input_subsystem;
-    auto window =
-            std::make_unique<EmuWindow_Android>(ANativeWindow_fromSurface(env, j_surf), driver_library);
+        const char* file_redirect_dir_{};
+        int featureFlags{};
+        std::string hook_lib_dir = Common::Android::GetJString(env, j_hook_lib_dir);
+        auto handle = adrenotools_open_libvulkan(RTLD_NOW, featureFlags, nullptr, hook_lib_dir.c_str(),
+                                                 nullptr, nullptr, file_redirect_dir_, nullptr);
+        auto driver_library = std::make_shared<Common::DynamicLibrary>(handle);
+        InputCommon::InputSubsystem input_subsystem;
+        auto window =
+                std::make_unique<EmuWindow_Android>(ANativeWindow_fromSurface(env, j_surf), driver_library);
 
-    Vulkan::vk::InstanceDispatch dld;
-    Vulkan::vk::Instance vk_instance = Vulkan::CreateInstance(
-            *driver_library, dld, VK_API_VERSION_1_1, Core::Frontend::WindowSystemType::Android);
+        Vulkan::vk::InstanceDispatch dld;
+        Vulkan::vk::Instance vk_instance = Vulkan::CreateInstance(
+                *driver_library, dld, VK_API_VERSION_1_1, Core::Frontend::WindowSystemType::Android);
 
-    auto surface = Vulkan::CreateSurface(vk_instance, window->GetWindowInfo());
+        auto surface = Vulkan::CreateSurface(vk_instance, window->GetWindowInfo());
 
-    auto device = Vulkan::CreateDevice(vk_instance, dld, *surface);
+        auto device = Vulkan::CreateDevice(vk_instance, dld, *surface);
 
-    const std::string model_name{device.GetModelName()};
+        const std::string model_name{device.GetModelName()};
 
-    window.release();
+        window.release();
 
-    return Common::Android::ToJString(env, model_name);
+        return Common::Android::ToJString(env, model_name);
 #else
-    return Common::Android::ToJString(env, "no-info");
+        return Common::Android::ToJString(env, "no-info");
 #endif
+    } catch (const std::exception& e) {
+        LOG_ERROR(Frontend, "Could not read the GPU driver: {}", e.what());
+        return nullptr;
+    }
 }
 
 jboolean Java_org_yuzu_yuzu_1emu_NativeLibrary_reloadKeys(JNIEnv* env, jclass clazz) {
@@ -980,8 +1015,56 @@ jint Java_org_yuzu_yuzu_1emu_NativeLibrary_getAppletCaptureHeight(JNIEnv* env, j
     return static_cast<jint>(VideoCore::Capture::LinearHeight);
 }
 
+// NovaS: when the app aborts (assert, std::terminate, illegal instruction), write the signal to eden_log.txt
+// first (the default handlers only reach logcat, which players cannot easily send).
+namespace {
+struct sigaction g_novas_prev_actions[32];
+
+void NovaSCrashHandler(int sig, siginfo_t* info, void* context) {
+    LOG_CRITICAL(Frontend, "NovaS: native crash, signal {} code {} at address {:#x} (thread {})", sig,
+                 info ? info->si_code : 0, info ? reinterpret_cast<uintptr_t>(info->si_addr) : 0,
+                 static_cast<long>(gettid()));
+    Common::Log::Stop();
+    const struct sigaction& prev = g_novas_prev_actions[sig];
+    if ((prev.sa_flags & SA_SIGINFO) && prev.sa_sigaction) {
+        prev.sa_sigaction(sig, info, context);
+        return;
+    }
+    if (prev.sa_handler != SIG_DFL && prev.sa_handler != SIG_IGN && prev.sa_handler) {
+        prev.sa_handler(sig);
+        return;
+    }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+void InstallNovaSCrashHandler() {
+    static bool installed = false;
+    if (installed) {
+        return;
+    }
+    installed = true;
+    // Not SIGSEGV/SIGBUS: Dynarmic's fastmem handler (installed when the library loads) and NCE take
+    // those as part of normal running, and logging from inside them broke the boot (prueba-5).
+    for (const int sig : {SIGABRT, SIGILL, SIGFPE}) {
+        struct sigaction action {};
+        action.sa_sigaction = NovaSCrashHandler;
+        action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        sigemptyset(&action.sa_mask);
+        sigaction(sig, &action, &g_novas_prev_actions[sig]);
+    }
+}
+} // namespace
+
 void Java_org_yuzu_yuzu_1emu_NativeLibrary_initializeSystem(JNIEnv* env, jclass clazz,
                                                             jboolean reload) {
+    InstallNovaSCrashHandler();
+    // NovaS: the Switch 2 switches of nx2_switches.txt (as the Windows SDL frontend does), from the app's
+    // config folder; a value already in the environment wins. The engine's own defaults cover the rest
+    // (SPLIT=2, fence batching); the experiments read by static initializers stay off on Android.
+    if (!reload) {
+        FrontendCommon::LoadNx2Switches("", Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir));
+    }
     // Initialize the emulated system.
     if (!reload) {
         EmulationSession::GetInstance().System().Initialize();

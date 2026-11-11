@@ -29,6 +29,7 @@
 #include "common/settings_enums.h"
 #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
 #include "video_core/vulkan_common/vma.h"
+#include "video_core/renderer_vulkan/vk_hang_guard.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
@@ -428,6 +429,23 @@ u64 AllocatedUsage(VkDeviceSize driver_usage, const VmaBudget& vma_budget) {
     return driver_usage - (std::min)(driver_usage, unused);
 }
 
+#ifdef __ANDROID__
+// A /proc/meminfo field ("MemTotal", "MemAvailable") in bytes, 0 when it can't be read.
+u64 SystemMemoryInfo(std::string_view field) {
+    std::ifstream meminfo{"/proc/meminfo"};
+    std::string name;
+    u64 kib{};
+    std::string rest;
+    while (meminfo >> name >> kib) {
+        std::getline(meminfo, rest);
+        if (name.size() == field.size() + 1 && name.starts_with(field) && name.back() == ':') {
+            return kib << 10;
+        }
+    }
+    return 0;
+}
+#endif
+
 } // Anonymous namespace
 
 void Device::RemoveExtension(bool& extension, const std::string& extension_name) {
@@ -522,6 +540,10 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     is_optimal_astc_supported = ComputeIsOptimalAstcSupported();
     is_warp_potentially_bigger = !extensions.subgroup_size_control ||
                                  properties.subgroup_size_control.maxSubgroupSize > GuestWarpSize;
+
+    // The shaders that hung one driver need not hang another (Turnip, a driver update).
+    Vulkan::HangGuard::SetDriverKey(fmt::format("{:x}-{:x}", static_cast<u32>(properties.driver.driverID),
+                                                properties.properties.driverVersion));
 
     is_integrated = properties.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
     is_virtual = properties.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU;
@@ -1782,6 +1804,27 @@ u64 Device::GetDeviceMemoryBudget() const {
         // gives it (4 GiB, 6 GiB with aggressive VRAM use).
         result = (std::min)(result, device_access_memory);
     }
+#ifdef __ANDROID__
+    // The GPU shares the phone's RAM, and a driver's budget need not follow what is left of it:
+    // at most what the GPU uses now plus what Android can still hand out, less a reserve.
+    if (const u64 available = SystemMemoryInfo("MemAvailable"); available != 0) {
+        constexpr u64 Reserve = 768_MiB;
+        result = (std::min)(result, GetDeviceMemoryUsage() + available -
+                                        (std::min)(available, Reserve));
+    }
+    // Samsung's low-memory killer closes even the foreground game once less than 40% of swap is
+    // free and RAM runs short. Past half of it used, the GPU gives the difference back: RAM it
+    // frees keeps that much of the game's memory out of swap.
+    if (const u64 swap_total = SystemMemoryInfo("SwapTotal"); swap_total != 0) {
+        const u64 swap_free = SystemMemoryInfo("SwapFree");
+        if (swap_free < swap_total / 2) {
+            result -= (std::min)(result, swap_total / 2 - swap_free);
+        }
+    }
+    // The texture cache ignores budgets of 2 GiB or less (as bogus), which would keep its old,
+    // higher thresholds exactly when memory is shortest.
+    result = (std::max)(result, u64{2_GiB} + 256_MiB);
+#endif
     return result;
 }
 
@@ -1826,6 +1869,11 @@ void Device::CollectPhysicalMemoryInfo() {
             heap_size = limit(heap_size);
             local_memory += heap_size;
         }
+        LOG_INFO(Render_Vulkan, "Memory heap {}: {} MiB{}, budget {} MiB, in use {} MiB", element,
+                 mem_properties.memoryHeaps[element].size >> 20,
+                 is_heap_local ? " device-local" : "",
+                 extensions.memory_budget ? budget.heapBudget[element] >> 20 : 0,
+                 extensions.memory_budget ? budget.heapUsage[element] >> 20 : 0);
         if (extensions.memory_budget) {
             device_initial_usage += budget.heapUsage[element];
             device_access_memory += is_heap_local ? limit(budget.heapBudget[element])
@@ -1848,6 +1896,16 @@ void Device::CollectPhysicalMemoryInfo() {
             device_access_memory = std::min<u64>(device_access_memory, normal_memory + scaler_memory);
         }
     }
+#ifdef __ANDROID__
+    // Whatever heap sizes the driver reports, the game, Android and the GPU share the phone's
+    // RAM: give the GPU at most a third of it.
+    if (const u64 total = SystemMemoryInfo("MemTotal"); total != 0) {
+        LOG_INFO(Render_Vulkan, "RAM: {} MiB, {} MiB available; GPU type {}", total >> 20,
+                 SystemMemoryInfo("MemAvailable") >> 20,
+                 static_cast<u32>(properties.properties.deviceType));
+        device_access_memory = (std::min)(device_access_memory, total / 3);
+    }
+#endif
 }
 
 void Device::CollectToolingInfo() {

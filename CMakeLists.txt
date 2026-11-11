@@ -6,6 +6,17 @@ cmake_minimum_required(VERSION 3.31)
 set(CMAKE_OSX_DEPLOYMENT_TARGET "15.0" CACHE STRING "macOS deployment target")
 project(yuzu)
 
+if (ANDROID)
+    # NovaS: no folder of the PC that built it inside the published library (asserts and logs print __FILE__).
+    # In the language flags, not add_compile_options: dependencies fetched by CPM (cubeb) don't see the latter.
+    set(NOVAS_PREFIX_MAP "-ffile-prefix-map=${CMAKE_SOURCE_DIR}/=")
+    if (CMAKE_ANDROID_NDK)
+        string(APPEND NOVAS_PREFIX_MAP " -ffile-prefix-map=${CMAKE_ANDROID_NDK}/=ndk/")
+    endif()
+    string(APPEND CMAKE_C_FLAGS " ${NOVAS_PREFIX_MAP}")
+    string(APPEND CMAKE_CXX_FLAGS " ${NOVAS_PREFIX_MAP}")
+endif()
+
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/CMakeModules")
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/CMakeModules/find")
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/externals/cmake-modules")

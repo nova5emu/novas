@@ -943,6 +943,7 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
             if (it == emulationViewModel.totalShaders.value) {
                 binding.loadingText.setText(R.string.loading)
                 binding.loadingProgressIndicator.isIndeterminate = true
+                binding.loadingHint.visibility = View.GONE
             }
         }
         emulationViewModel.totalShaders.collect(viewLifecycleOwner) {
@@ -951,6 +952,10 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
         emulationViewModel.shaderMessage.collect(viewLifecycleOwner) {
             if (it.isNotEmpty()) {
                 binding.loadingText.text = it
+                // While shaders are prepared, say why it takes a while (as on PC).
+                if (emulationViewModel.shaderProgress.value != emulationViewModel.totalShaders.value) {
+                    binding.loadingHint.visibility = View.VISIBLE
+                }
             }
         }
 

@@ -30,6 +30,7 @@ import androidx.recyclerview.widget.GridLayoutManager
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 import org.yuzu.yuzu_emu.HomeNavigationDirections
+import org.yuzu.yuzu_emu.features.settings.ui.SettingsSubscreen
 import org.yuzu.yuzu_emu.NativeLibrary
 import org.yuzu.yuzu_emu.R
 import org.yuzu.yuzu_emu.YuzuApplication
@@ -329,6 +330,29 @@ class GamesFragment : Fragment() {
 
         // Setup settings button
         binding.settingsButton.setOnClickListener { navigateToSettings() }
+        setUpNovaSActions()
+    }
+
+    // NovaS: the row of round buttons of the landscape home, as on PC (only that layout has them).
+    private fun setUpNovaSActions() {
+        val root = binding.root
+        val main = requireActivity() as MainActivity
+        root.findViewById<View>(R.id.novas_btn_folder)?.setOnClickListener {
+            getGamesDirectory.launch(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).data)
+        }
+        root.findViewById<View>(R.id.novas_btn_keys)?.setOnClickListener {
+            main.getProdKey.launch(arrayOf("*/*"))
+        }
+        root.findViewById<View>(R.id.novas_btn_firmware)?.setOnClickListener {
+            main.getFirmware.launch(arrayOf("application/zip"))
+        }
+        root.findViewById<View>(R.id.novas_btn_saves)?.setOnClickListener {
+            findNavController().navigate(
+                HomeNavigationDirections.actionGlobalSettingsSubscreenActivity(SettingsSubscreen.INSTALLABLE, null)
+            )
+        }
+        root.findViewById<View>(R.id.novas_btn_settings)?.setOnClickListener { navigateToSettings() }
+        root.findViewById<View>(R.id.novas_btn_exit)?.setOnClickListener { requireActivity().finishAffinity() }
     }
 
     private fun navigateToSettings() {
@@ -521,6 +545,11 @@ class GamesFragment : Fragment() {
         binding.launchQlaunch.visibility = if (shouldShowQLaunch) View.VISIBLE else View.GONE
 
         binding.addDirectory.visibility = if (showFolder) View.VISIBLE else View.GONE
+        // NovaS: the landscape home has its own row of buttons instead of the floating ones.
+        if (binding.root.findViewById<View>(R.id.novas_actions) != null) {
+            binding.launchQlaunch.visibility = View.GONE
+            binding.addDirectory.visibility = View.GONE
+        }
     }
 
     private fun setInsets() =

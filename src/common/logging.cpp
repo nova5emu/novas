@@ -280,9 +280,14 @@ struct FileBackend final : public Backend {
 #endif
         bytes_written += file->WriteSpan(std::span<const char>{message.begin(), message.end()});
 
-        // Option to log each line rather than 4k buffers
+        // Option to log each line rather than 4k buffers. Android apps are killed without warning (watchdog,
+        // native crash), so there every line goes to disk at once: the last lines are what explain the close.
+#ifdef __ANDROID__
+        file->Flush();
+#else
         if (Settings::values.log_flush_line.GetValue())
             file->Flush();
+#endif
 
         using namespace Common::Literals;
         // Prevent logs from exceeding a set maximum size in the event that log entries are spammed.

@@ -283,6 +283,9 @@ object GameHelper {
             programId = name.substring(0, name.lastIndexOf("."))
         }
 
+        // NovaS: the known Switch 2 game's name, else the file name without its tags (as on PC).
+        name = NovaSCovers.tidyName(name)
+
         val newGame = Game(
             name,
             filePath,

@@ -4,10 +4,12 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <thread>
 
 #include <ranges>
 #include "common/settings.h"
+#include "video_core/renderer_vulkan/vk_hang_guard.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -105,7 +107,27 @@ void MasterSemaphore::Wait(u64 tick) {
 
     // If none of the above is hit, fallback to a regular wait
     try {
-        while (!semaphore.Wait(tick)) {
+        // Wait in one-second slices so a GPU that stops answering leaves a trace in the log (on phones the
+        // driver or the system may kill the app during a long hang, and nothing else would say where it was).
+        using Clock = std::chrono::steady_clock;
+        const auto wait_start = Clock::now();
+        int reported_seconds = 0;
+        while (!semaphore.Wait(tick, 1'000'000'000ULL)) {
+            const auto waited = std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - wait_start);
+            if (waited.count() >= reported_seconds + 1) {
+                reported_seconds = static_cast<int>(waited.count());
+                const u64 gpu_at = semaphore.GetCounter();
+                LOG_ERROR(Render_Vulkan, "GPU stall: waiting {} s for GPU tick {} (GPU is at {})",
+                          reported_seconds, tick, gpu_at);
+                if (reported_seconds == 3) {
+                    HangGuard::OnStall(gpu_at, tick);
+                }
+            }
+        }
+        if (reported_seconds > 0) {
+            LOG_ERROR(Render_Vulkan, "GPU stall over: tick {} reached after {} s", tick,
+                      std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - wait_start)
+                              .count() / 1000.0);
         }
     } catch (const vk::Exception& exception) {
         // The throw ends the process; say why first (a device loss reached nothing else here).

@@ -107,6 +107,7 @@ class MainActivity : AppCompatActivity(), ThemeProvider {
                 .getBoolean(Settings.PREF_FIRST_APP_LAUNCH, true)
             if (!firstTimeSetup) {
                 checkKeys()
+                GpuDriverHelper.selectBundledTurnipOnce()
             }
             checkedDecryption = true
         }
@@ -300,7 +301,13 @@ class MainActivity : AppCompatActivity(), ThemeProvider {
     }
 
     private fun checkKeys() {
+        // NovaS: decrypted games (folders, .nup) need no keys, so the warning shows only once, not at every start.
+        val prefs = PreferenceManager.getDefaultSharedPreferences(applicationContext)
+        if (prefs.getBoolean("novas_keys_warning_shown", false)) {
+            return
+        }
         if (!NativeLibrary.areKeysPresent()) {
+            prefs.edit().putBoolean("novas_keys_warning_shown", true).apply()
             MessageDialogFragment.newInstance(
                 titleId = R.string.keys_missing,
                 descriptionId = R.string.keys_missing_description,

@@ -64,10 +64,10 @@ android {
     }
 
     defaultConfig {
-        applicationId = "dev.eden.eden_emulator"
+        applicationId = "io.github.nova5emu.novas"
         minSdk = 24
         targetSdk = 36
-        versionName = getGitVersion()
+        versionName = System.getenv("NOVAS_VERSION") ?: getGitVersion()
         versionCode = autoVersion
 
         externalNativeBuild {
@@ -190,8 +190,8 @@ android {
             isDefault = true
             minSdk = 33
 
-            manifestPlaceholders += mapOf("appNameBase" to "Eden")
-            resValue("string", "app_name_suffixed", "Eden")
+            manifestPlaceholders += mapOf("appNameBase" to "NovaS")
+            resValue("string", "app_name_suffixed", "NovaS")
 
             ndk {
                 abiFilters += listOf("arm64-v8a")
@@ -270,7 +270,7 @@ android {
 
         // apply nightly suffix I/A
         resValue("string", "app_name_suffixed", "$currentName$suffix")
-        resValue("string", "app_name", "Eden$suffix")
+        resValue("string", "app_name", "NovaS$suffix")
     }
 
     sourceSets {
