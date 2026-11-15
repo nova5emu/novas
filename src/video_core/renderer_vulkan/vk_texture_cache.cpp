@@ -327,7 +327,7 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
         IsHugeAstcArray(device, info) || info.type != ImageType::e2D || info.size.depth != 1) {
         return false;
     }
-    return Settings::values.accelerate_astc.GetValue() == Settings::AstcDecodeMode::Gpu &&
+    return Settings::GetAstcDecodeMode() == Settings::AstcDecodeMode::Gpu &&
            Settings::GetAstcRecompression() != Settings::AstcRecompression::Uncompressed;
 }
 
@@ -338,7 +338,7 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
     if (IsHugeAstcArray(device, info)) {
         return true;
     }
-    if (Settings::values.accelerate_astc.GetValue() != Settings::AstcDecodeMode::Gpu) {
+    if (Settings::GetAstcDecodeMode() != Settings::AstcDecodeMode::Gpu) {
         return false;
     }
     return Settings::GetAstcRecompression() == Settings::AstcRecompression::Uncompressed &&
@@ -1275,6 +1275,27 @@ void UseBc3ForSwitch2OnSmallCards(const Device& device) {
                 memory >> 20);
     Settings::SetAstcRecompressionOverride(Settings::AstcRecompression::Bc3);
 }
+
+// AMD's integrated GPUs on the proprietary Windows driver (ROG Ally, Radeon 890M, driver 2.0.395)
+// stall for seconds, and sometimes for good with no TDR, in the GPU ASTC transcode path of
+// Ocarina of Time's 90-layer arrays, even split into small batches. The CPU decodes them in the
+// background instead; this also replaces an explicit Gpu choice. Huge arrays still decode on the
+// GPU. EDEN_NX2_ASTC_GPU=1 keeps the GPU decode.
+void UseCpuAstcDecodeOnAmdIntegrated(const Device& device) {
+    if (device.IsOptimalAstcSupported() || !device.IsIntegrated() ||
+        device.GetDriverID() != VK_DRIVER_ID_AMD_PROPRIETARY ||
+        Settings::GetAstcDecodeMode() != Settings::AstcDecodeMode::Gpu) {
+        return;
+    }
+    const char* keep_gpu = std::getenv("EDEN_NX2_ASTC_GPU");
+    if (keep_gpu != nullptr && keep_gpu[0] == '1') {
+        return;
+    }
+    LOG_WARNING(Render_Vulkan, "AMD integrated GPU without native ASTC: ASTC textures except huge "
+                               "arrays are decoded on the CPU in the background for this session. "
+                               "Set EDEN_NX2_ASTC_GPU=1 to decode them on the GPU");
+    Settings::SetAstcDecodeOverride(Settings::AstcDecodeMode::CpuAsynchronous);
+}
 } // Anonymous namespace
 
 TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& scheduler_,
@@ -1291,8 +1312,9 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
       resolution{Settings::values.resolution_info} {
     // Before anything below reads astc_recompression (passes, view formats).
     UseBc3ForSwitch2OnSmallCards(device);
+    UseCpuAstcDecodeOnAmdIntegrated(device);
     // Huge ASTC arrays always decode on the GPU (IsHugeAstcArray), whatever the decode setting.
-    if (Settings::values.accelerate_astc.GetValue() == Settings::AstcDecodeMode::Gpu ||
+    if (Settings::GetAstcDecodeMode() == Settings::AstcDecodeMode::Gpu ||
         !device.IsOptimalAstcSupported()) {
         astc_decoder_pass.emplace(device, scheduler, descriptor_pool, staging_buffer_pool,
                                   compute_pass_descriptor_queue, memory_allocator);
@@ -1326,8 +1348,8 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
     }
 }
 
-void TextureCacheRuntime::Finish() {
-    scheduler.Finish();
+void TextureCacheRuntime::Finish(std::source_location location) {
+    scheduler.Finish({}, {}, location);
 }
 
 StagingBufferRef TextureCacheRuntime::UploadStagingBuffer(size_t size, bool deferred) {
@@ -3037,7 +3059,7 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
         flags |= VideoCommon::ImageFlagBits::Converted;
         flags |= VideoCommon::ImageFlagBits::CostlyLoad;
     } else if (IsPixelFormatASTC(info.format) && !runtime->device.IsOptimalAstcSupported()) {
-        switch (Settings::values.accelerate_astc.GetValue()) {
+        switch (Settings::GetAstcDecodeMode()) {
         case Settings::AstcDecodeMode::Gpu:
             if (WillUseAcceleratedAstcDecode(runtime->device, info) ||
                 WillUseGpuBcnTranscode(runtime->device, info)) {
@@ -3129,7 +3151,7 @@ void Image::AllocateComputeUnswizzleBuffer(u32 max_slices) {
 }
 
 void Image::UploadMemory(VkBuffer buffer, VkDeviceSize offset,
-                         std::span<const VideoCommon::BufferImageCopy> copies) {
+                         std::span<const VideoCommon::BufferImageCopy> copies, bool staging_upload) {
     // TODO: Move this to another API
     if (ENABLE_MSAA_RESOLVE_CONSUME && runtime != nullptr) {
         runtime->InvalidateResolveShadow(Handle());
@@ -3164,7 +3186,10 @@ void Image::UploadMemory(VkBuffer buffer, VkDeviceSize offset,
         const VkImageAspectFlags vk_aspect_mask = upload_aspect_mask;
 
         scheduler->Record([src_buffer, temp_vk_image, vk_aspect_mask,
-                           vk_copies](vk::CommandBuffer cmdbuf) {
+                           vk_copies, staging_upload](vk::CommandBuffer cmdbuf) {
+            const VideoCommon::GpuOperationTrace::PurposeScope trace_upload{
+                staging_upload ? VideoCommon::GpuOperationTrace::Purpose::StagingUpload
+                               : VideoCommon::GpuOperationTrace::Purpose::Generic};
             CopyBufferToImage(cmdbuf, src_buffer, temp_vk_image, vk_aspect_mask, false, vk_copies);
         });
 
@@ -3218,7 +3243,10 @@ void Image::UploadMemory(VkBuffer buffer, VkDeviceSize offset,
     const bool was_initialized = std::exchange(initialized, true);
 
     scheduler->Record([src_buffer, vk_image, vk_aspect_mask, was_initialized,
-                       vk_copies](vk::CommandBuffer cmdbuf) {
+                       vk_copies, staging_upload](vk::CommandBuffer cmdbuf) {
+        const VideoCommon::GpuOperationTrace::PurposeScope trace_upload{
+            staging_upload ? VideoCommon::GpuOperationTrace::Purpose::StagingUpload
+                           : VideoCommon::GpuOperationTrace::Purpose::Generic};
         CopyBufferToImage(cmdbuf, src_buffer, vk_image, vk_aspect_mask, was_initialized, vk_copies);
     });
 
@@ -3228,7 +3256,7 @@ void Image::UploadMemory(VkBuffer buffer, VkDeviceSize offset,
 }
 
 void Image::UploadMemory(const StagingBufferRef& map, std::span<const BufferImageCopy> copies) {
-    UploadMemory(map.buffer, map.offset, copies);
+    UploadMemory(map.buffer, map.offset, copies, map.usage == MemoryUsage::Upload);
 }
 
 void Image::DownloadMemory(VkBuffer buffer, size_t offset,
@@ -3713,14 +3741,24 @@ bool Image::BindZeroBlock() {
     VkResult result;
     {
         std::scoped_lock lock{scheduler->submit_mutex};
-        result = device.GetGraphicsQueue().BindSparse(bind_info, *fence);
+        result = device.GetGraphicsQueue().BindSparse(bind_info, *fence,
+            HangTrace::Enabled() ? scheduler->CurrentTick() : 0);
     }
     if (result != VK_SUCCESS) {
         LOG_ERROR(Render_Vulkan, "Sparse tiled image {:#x}: binding the zeroed block failed ({})",
                   gpu_addr, static_cast<int>(result));
         return false;
     }
-    fence.Wait();
+    if (HangTrace::Enabled()) {
+        const u64 tick = scheduler->CurrentTick();
+        const auto call = HangTrace::Event("sparse-fence-enter fence", tick,
+            {HangTrace::Handle(*fence)});
+        const auto wait_result = fence.Wait();
+        HangTrace::Event("sparse-fence-return call,result,fence", tick,
+            {call, static_cast<u64>(wait_result), HangTrace::Handle(*fence)});
+    } else {
+        fence.Wait();
+    }
     // Every block now reads the shared block (and the tail its own memory): zero them all.
     ClearTiles();
     return true;
@@ -3934,7 +3972,8 @@ bool Image::BindTiles(std::span<const VideoCommon::LevelRect> rects) {
     VkResult result;
     {
         std::scoped_lock lock{scheduler->submit_mutex};
-        result = device.GetGraphicsQueue().BindSparse(bind_info, *fence);
+        result = device.GetGraphicsQueue().BindSparse(bind_info, *fence,
+            HangTrace::Enabled() ? scheduler->CurrentTick() : 0);
     }
     if (result != VK_SUCCESS) {
         LOG_ERROR(Render_Vulkan, "Sparse tiled image {:#x}: binding failed ({})", gpu_addr,
@@ -3942,7 +3981,16 @@ bool Image::BindTiles(std::span<const VideoCommon::LevelRect> rects) {
         roll_back();
         return false;
     }
-    fence.Wait();
+    if (HangTrace::Enabled()) {
+        const u64 tick = scheduler->CurrentTick();
+        const auto call = HangTrace::Event("sparse-fence-enter fence", tick,
+            {HangTrace::Handle(*fence)});
+        const auto wait_result = fence.Wait();
+        HangTrace::Event("sparse-fence-return call,result,fence", tick,
+            {call, static_cast<u64>(wait_result), HangTrace::Handle(*fence)});
+    } else {
+        fence.Wait();
+    }
     return true;
 }
 
@@ -4094,7 +4142,8 @@ std::vector<u32> Image::BindLayers(std::span<const u32> layers) {
     VkResult result;
     {
         std::scoped_lock lock{scheduler->submit_mutex};
-        result = device.GetGraphicsQueue().BindSparse(bind_info, *fence);
+        result = device.GetGraphicsQueue().BindSparse(bind_info, *fence,
+            HangTrace::Enabled() ? scheduler->CurrentTick() : 0);
     }
     if (result != VK_SUCCESS) {
         LOG_ERROR(Render_Vulkan, "Sparse layered image {:#x}: binding failed ({})", gpu_addr,
@@ -4102,7 +4151,16 @@ std::vector<u32> Image::BindLayers(std::span<const u32> layers) {
         roll_back();
         return {};
     }
-    fence.Wait();
+    if (HangTrace::Enabled()) {
+        const u64 tick = scheduler->CurrentTick();
+        const auto call = HangTrace::Event("sparse-fence-enter fence", tick,
+            {HangTrace::Handle(*fence)});
+        const auto wait_result = fence.Wait();
+        HangTrace::Event("sparse-fence-return call,result,fence", tick,
+            {call, static_cast<u64>(wait_result), HangTrace::Handle(*fence)});
+    } else {
+        fence.Wait();
+    }
     return bound;
 }
 

@@ -10,6 +10,7 @@
 #include <functional>
 #include <optional>
 #include <span>
+#include <source_location>
 #include <utility>
 #include "common/common_types.h"
 #include "common/polyfill_thread.h"
@@ -38,6 +39,10 @@ namespace VideoCommon::OotNetwork {
 struct BypassState;
 }
 
+namespace VideoCommon::DeferredWrites {
+struct Write;
+}
+
 namespace VideoCore {
 
 enum class LoadCallbackStage {
@@ -50,6 +55,18 @@ using DiskResourceLoadCallback = std::function<void(LoadCallbackStage, std::size
 /// Set while the query cache signals the fence that writes a fence-flagged report, so the fence
 /// manager makes that fence even when it is empty (FenceManager::SignalFence).
 inline thread_local bool g_signaling_query_report_fence = false;
+
+// Independently sampled counters; reading them must not wait for the scheduler or its locks.
+struct FenceProgress {
+    bool supported{};
+    u64 uncommitted_operations{};
+    u64 queued_fences{};
+    u64 queued_operations{};
+    u64 retiring_fences{};
+    u64 retiring_operations{};
+    u64 idle_promotions{};
+    u64 completed_operations{};
+};
 
 class RasterizerInterface {
 public:
@@ -97,7 +114,41 @@ public:
     virtual void SignalReference() = 0;
 
     /// Release all pending fences.
-    virtual void ReleaseFences(bool force = true) = 0;
+    virtual void ReleaseFences(
+        bool force = true, std::source_location caller = std::source_location::current()) = 0;
+
+    /// GPU front at an idle boundary: request back-owned progress when split, otherwise service it.
+    virtual void FlushPendingOperations() {}
+
+    virtual FenceProgress GetFenceProgress() const {
+        return {};
+    }
+
+    // Scheduler owner, without cache/mapping locks. Unsupported backends must fail closed.
+    virtual bool ResolveDeferredWriteReadbacks() {
+        return false;
+    }
+
+    // Scheduler owner only; snapshot upload never reads or writes guest backing.
+    virtual bool UploadCpuEpochPage([[maybe_unused]] DAddr device,
+                                    [[maybe_unused]] PAddr physical,
+                                    [[maybe_unused]] std::span<const u8> bytes) {
+        return false;
+    }
+
+    // Owner only, without cache/mapping locks. All other epochs must be closed and CPU writers
+    // excluded and readbacks drained. The prepared page is pinned Opening and has no native access.
+    // Samples current bindings only. Subsequent consumers must close or veto opening.
+    virtual bool PrepareCpuEpochPage([[maybe_unused]] DAddr device,
+                                     [[maybe_unused]] PAddr physical, u64& downloaded_bytes) {
+        downloaded_bytes = 0;
+        return false;
+    }
+
+    // Scheduler owner only. A false result is an invariant failure for an accepted CPU commit.
+    virtual bool ApplyDeferredWrite([[maybe_unused]] const VideoCommon::DeferredWrites::Write& write) {
+        return false;
+    }
 
     /// Writes the region's query reports to guest memory, waiting for pending host results.
     virtual void FlushQueryResults(DAddr addr, u64 size) {
@@ -180,6 +231,21 @@ public:
     }
 
     virtual bool OnCPUWrite(PAddr addr, u64 size) = 0;
+
+#ifdef HAS_NCE
+    // Caller holds a validated, unique/protected CPU mapping proof for the page.
+    virtual Core::NceExactStore::Result GrantDeferredWriteLease(
+        [[maybe_unused]] DAddr page, [[maybe_unused]] PAddr physical,
+        [[maybe_unused]] u64 mapping_generation,
+        [[maybe_unused]] VideoCommon::DeferredWrites::Journal::Lease& lease) {
+        return Core::NceExactStore::Result::BackendUnsupported;
+    }
+    virtual Core::NceExactStore::Result WriteNceStore(
+        [[maybe_unused]] DAddr addr, [[maybe_unused]] std::span<const u8> bytes,
+        [[maybe_unused]] const Core::NceExactStore::Backing& backing) {
+        return Core::NceExactStore::Result::BackendUnsupported;
+    }
+#endif
 
     /// Sync memory between guest and host.
     virtual void InvalidateGPUCache() = 0;

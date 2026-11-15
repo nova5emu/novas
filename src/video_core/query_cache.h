@@ -22,7 +22,9 @@
 #include "common/settings.h"
 #include "common/slot_vector.h"
 #include "video_core/control/channel_state_cache.h"
+#include "video_core/deferred_write_journal.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/gpu.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/rasterizer_interface.h"
@@ -103,9 +105,9 @@ private:
 template <class QueryCache, class CachedQuery, class CounterStream, class HostCounter>
 class QueryCacheLegacy : public VideoCommon::ChannelSetupCaches<VideoCommon::ChannelInfo> {
 public:
-    explicit QueryCacheLegacy(VideoCore::RasterizerInterface& rasterizer_,
+    explicit QueryCacheLegacy(Tegra::GPU& gpu_, VideoCore::RasterizerInterface& rasterizer_,
                               Tegra::MaxwellDeviceMemoryManager& device_memory_)
-        : rasterizer{rasterizer_},
+        : gpu{gpu_}, rasterizer{rasterizer_},
           // Use reinterpret_cast instead of static_cast as workaround for
           // UBSan bug (https://github.com/llvm/llvm-project/issues/59060)
           device_memory{device_memory_},
@@ -137,9 +139,12 @@ public:
      * @param timestamp Timestamp, when empty the flushed query is assumed to be short.
      */
     void Query(GPUVAddr gpu_addr, VideoCore::QueryType type, std::optional<u64> timestamp) {
-        std::unique_lock lock{mutex};
         const std::optional<VAddr> cpu_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
         ASSERT(cpu_addr);
+        ASSERT_OR_EXECUTE(cpu_addr, return;);
+        // Keep the full slot excluded across rewrites that add or remove a timestamp.
+        auto deferred_writer = gpu.BeginDeferredQueryWrite(*cpu_addr, 16);
+        std::unique_lock lock{mutex};
 
         CachedQuery* query = TryGet(*cpu_addr);
         if (!query) {
@@ -147,6 +152,7 @@ public:
             u8* const host_ptr = gpu_memory->GetPointer(gpu_addr);
 
             query = Register(type, *cpu_addr, host_ptr, timestamp.has_value());
+            query->SetDeferredWriter(std::move(deferred_writer));
         }
 
         auto result = query->BindCounter(Stream(type).Current(), timestamp);
@@ -315,8 +321,11 @@ private:
             }
             uncommitted_flushes->push_back(new_async_job_id);
         }
+        auto deferred_writer = query->GetDeferredWriter();
         lock.unlock();
-        std::function<void()> operation([this, new_async_job_id, timestamp] {
+        std::function<void()> operation([this, new_async_job_id, timestamp,
+                                        deferred_writer = std::move(deferred_writer)] {
+            [[maybe_unused]] const auto& keep_writer = deferred_writer;
             std::unique_lock local_lock{mutex};
             AsyncJob& async_job = slot_async_jobs[new_async_job_id];
             u64 value = async_job.value;
@@ -345,6 +354,7 @@ private:
 
     Common::SlotVector<AsyncJob> slot_async_jobs;
 
+    Tegra::GPU& gpu;
     VideoCore::RasterizerInterface& rasterizer;
     Tegra::MaxwellDeviceMemoryManager& device_memory;
 
@@ -472,6 +482,14 @@ public:
         return assigned_async_job;
     }
 
+    void SetDeferredWriter(std::shared_ptr<DeferredWrites::Journal::WriterPermission> writer) {
+        deferred_writer = std::move(writer);
+    }
+
+    auto GetDeferredWriter() const {
+        return deferred_writer;
+    }
+
 protected:
     /// Returns true when querying the counter may potentially block.
     bool WaitPending() const noexcept {
@@ -488,6 +506,7 @@ private:
     std::shared_ptr<HostCounter> counter; ///< Host counter to query, owns the dependency tree.
     std::optional<u64> timestamp;         ///< Timestamp to flush to guest memory.
     AsyncJobId assigned_async_job;
+    std::shared_ptr<DeferredWrites::Journal::WriterPermission> deferred_writer;
 };
 
 } // namespace VideoCommon

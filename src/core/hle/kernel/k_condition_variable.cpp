@@ -4,6 +4,9 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <boost/container/small_vector.hpp>
+
+#include "common/scope_exit.h"
 #include "core/arm/exclusive_monitor.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_condition_variable.h"
@@ -114,6 +117,7 @@ KConditionVariable::KConditionVariable(Core::System& system)
 KConditionVariable::~KConditionVariable() = default;
 
 Result KConditionVariable::SignalToAddress(KernelCore& kernel, KProcessAddress addr) {
+    GetCurrentMemory(kernel).PrepareKernelWrite(GetInteger(addr), sizeof(u32));
     KThread* owner_thread = GetCurrentThreadPointer(kernel);
 
     // Signal the address.
@@ -146,6 +150,8 @@ Result KConditionVariable::SignalToAddress(KernelCore& kernel, KProcessAddress a
 
         // If necessary, signal the next owner thread.
         if (next_owner_thread != nullptr) {
+            owner_thread->ProfileWake(*next_owner_thread, GetInteger(addr),
+                                     Common::GuestHandoffProfile::WakeKind::Mutex);
             next_owner_thread->EndWait(kernel, result);
         }
 
@@ -154,6 +160,7 @@ Result KConditionVariable::SignalToAddress(KernelCore& kernel, KProcessAddress a
 }
 
 Result KConditionVariable::WaitForAddress(KernelCore& kernel, Handle handle, KProcessAddress addr, u32 value) {
+    GetCurrentMemory(kernel).PrepareKernelWrite(GetInteger(addr), sizeof(u32));
     KThread* cur_thread = GetCurrentThreadPointer(kernel);
     ThreadQueueImplForKConditionVariableWaitForAddress wait_queue(kernel);
 
@@ -186,6 +193,7 @@ Result KConditionVariable::WaitForAddress(KernelCore& kernel, Handle handle, KPr
         // Begin waiting.
         cur_thread->BeginWait(kernel, std::addressof(wait_queue));
         cur_thread->SetWaitReasonForDebugging(ThreadWaitReasonForDebugging::ConditionVar);
+        cur_thread->ProfileWait("mutex", GetInteger(addr), owner_thread->GetThreadId(), value);
     }
 
     // Close our reference to the owner thread, now that the wait is over.
@@ -195,12 +203,15 @@ Result KConditionVariable::WaitForAddress(KernelCore& kernel, Handle handle, KPr
     R_RETURN(cur_thread->GetWaitResult());
 }
 
-void KConditionVariable::SignalImpl(KernelCore& kernel, KThread* thread) {
+void KConditionVariable::SignalImpl(KernelCore& kernel, KThread* thread, KThread*& deferred_owner) {
     // Check pre-conditions.
     ASSERT(KScheduler::IsSchedulerLockedByCurrentThread(kernel));
+    ASSERT(deferred_owner == nullptr);
 
     // Update the tag.
     KProcessAddress address = thread->GetAddressKey();
+    // Wait prepared this persistent VA role; MapPages carries it to any replacement backing.
+    ASSERT(GetCurrentMemory(kernel).IsKernelWritePrepared(GetInteger(address), sizeof(u32)));
     u32 own_tag = thread->GetAddressKeyValue();
 
     u32 prev_tag{};
@@ -219,18 +230,21 @@ void KConditionVariable::SignalImpl(KernelCore& kernel, KThread* thread) {
     if (can_access) {
         if (prev_tag == Svc::InvalidHandle) {
             // If nobody held the lock previously, we're all good.
+            if (Common::GuestHandoffProfile::Enabled()) {
+                GetCurrentThread(kernel).ProfileWake(*thread, GetInteger(address),
+                    Common::GuestHandoffProfile::WakeKind::Mutex);
+            }
             thread->EndWait(kernel, ResultSuccess);
         } else {
             // Get the previous owner.
-            KThread* owner_thread = GetCurrentProcess(kernel)
+            deferred_owner = GetCurrentProcess(kernel)
                 .GetHandleTable()
                 .GetObjectWithoutPseudoHandle<KThread>(kernel, Handle(prev_tag & ~Svc::HandleWaitMask))
                 .ReleasePointerUnsafe();
 
-            if (owner_thread) {
+            if (deferred_owner) {
                 // Add the thread as a waiter on the owner.
-                owner_thread->AddWaiter(kernel, thread);
-                owner_thread->Close(kernel);
+                deferred_owner->AddWaiter(kernel, thread);
             } else {
                 // The lock was tagged with a thread that doesn't exist.
                 thread->EndWait(kernel, ResultInvalidState);
@@ -243,6 +257,17 @@ void KConditionVariable::SignalImpl(KernelCore& kernel, KThread* thread) {
 }
 
 void KConditionVariable::Signal(u64 cv_key, s32 count) {
+    GetCurrentMemory(m_system.Kernel()).PrepareKernelWrite(cv_key, sizeof(u32));
+    boost::container::small_vector<KThread*, 4> deferred_owners;
+    SCOPE_EXIT {
+        // A last reference may finalize TLS/backing; release after the scheduler lock.
+        for (KThread* owner_thread : deferred_owners) {
+            if (owner_thread) {
+                owner_thread->Close(m_system.Kernel());
+            }
+        }
+    };
+
     // Perform signaling.
     s32 num_waiters{};
     {
@@ -250,12 +275,14 @@ void KConditionVariable::Signal(u64 cv_key, s32 count) {
 
         auto it = m_tree.nfind_key({cv_key, -1});
         while ((it != m_tree.end()) && (count <= 0 || num_waiters < count) && (it->GetConditionVariableKey() == cv_key)) {
+            // Allocate the ownership slot before changing the tree or acquiring a reference.
+            deferred_owners.push_back(nullptr);
             KThread* target_thread = std::addressof(*it);
 
             it = m_tree.erase(it);
             target_thread->ClearConditionVariable();
 
-            this->SignalImpl(m_system.Kernel(), target_thread);
+            this->SignalImpl(m_system.Kernel(), target_thread, deferred_owners.back());
 
             ++num_waiters;
         }
@@ -269,6 +296,9 @@ void KConditionVariable::Signal(u64 cv_key, s32 count) {
 }
 
 Result KConditionVariable::Wait(KProcessAddress addr, u64 key, u32 value, s64 timeout) {
+    auto& memory = GetCurrentMemory(m_system.Kernel());
+    memory.PrepareKernelWrite(GetInteger(addr), sizeof(u32));
+    memory.PrepareKernelWrite(key, sizeof(u32));
     // Prepare to wait.
     KThread* cur_thread = GetCurrentThreadPointer(m_system.Kernel());
     KHardwareTimer* timer{};
@@ -301,6 +331,8 @@ Result KConditionVariable::Wait(KProcessAddress addr, u64 key, u32 value, s64 ti
                 }
 
                 // Wake up the next owner.
+                cur_thread->ProfileWake(*next_owner_thread, GetInteger(addr),
+                                       Common::GuestHandoffProfile::WakeKind::Mutex);
                 next_owner_thread->EndWait(m_system.Kernel(), ResultSuccess);
             }
 
@@ -329,6 +361,7 @@ Result KConditionVariable::Wait(KProcessAddress addr, u64 key, u32 value, s64 ti
         wait_queue.SetHardwareTimer(timer);
         cur_thread->BeginWait(m_system.Kernel(), std::addressof(wait_queue));
         cur_thread->SetWaitReasonForDebugging(ThreadWaitReasonForDebugging::ConditionVar);
+        cur_thread->ProfileWait("condition_variable", key, GetInteger(addr), value);
     }
 
     // Get the wait result.

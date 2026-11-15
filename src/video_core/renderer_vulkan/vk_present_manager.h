@@ -7,6 +7,8 @@
 #pragma once
 
 #include <atomic>
+#include <array>
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <boost/container/deque.hpp>
@@ -52,7 +54,7 @@ public:
     ~PresentManager();
 
     /// Returns the last used presentation frame
-    Frame* GetRenderFrame();
+    Frame* GetRenderFrame(bool generated = false);
 
     /// Pushes a frame for presentation
     void Present(Frame* frame);
@@ -109,6 +111,12 @@ private:
     std::atomic<std::size_t> image_count{};
     std::atomic<std::size_t> swapchain_image_count{};
     std::atomic<VkFormat> swapchain_image_format{};
+    struct FrameWaitTrace {
+        u64 calls{};
+        double free_ms{}, fence_ms{}, max_free_ms{}, max_fence_ms{};
+    };
+    std::array<FrameWaitTrace, 2> frame_wait_trace{};
+    std::chrono::steady_clock::time_point frame_wait_window{};
 };
 
 } // namespace Vulkan

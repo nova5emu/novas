@@ -7,6 +7,20 @@
 using namespace Common::Literals;
 namespace TCM = VideoCommon::TextureCacheMemory;
 
+TEST_CASE("Mobile texture pressure admits idle images after one second", "[video_core][texture_pressure]") {
+    CHECK_FALSE(TCM::PressureAgeEligible(100, 100, 2'000'000'000, 0, 10));
+    CHECK_FALSE(TCM::PressureAgeEligible(101, 100, 999'999'999, 0, 10));
+    CHECK(TCM::PressureAgeEligible(101, 100, 1'000'000'000, 0, 10));
+    CHECK(TCM::PressureAgeEligible(110, 100, 1, 0, 10));
+    CHECK_FALSE(TCM::PressureAgeEligible(101, 100, 2'000'000'000, 0, 10, 5));
+    CHECK(TCM::PressureAgeEligible(105, 100, 2'000'000'000, 0, 10, 5));
+}
+
+TEST_CASE("A new texture use renews the pressure age", "[video_core][texture_pressure]") {
+    CHECK_FALSE(TCM::PressureAgeEligible(102, 101, 2'000'000'000, 1'500'000'000, 10));
+    CHECK(TCM::PressureAgeEligible(102, 101, 2'500'000'000, 1'500'000'000, 10));
+}
+
 TEST_CASE("Texture cache memory limit: Auto is three quarters of the device", "[video_core]") {
     CHECK(TCM::ResolveLimit(0, 16_GiB) == 12_GiB);
     CHECK(TCM::ResolveLimit(0, 8_GiB) == 6_GiB);

@@ -9,6 +9,7 @@
 #include <array>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <vector>
 #include <bitset>
 #include <map>
@@ -168,6 +169,54 @@ struct ConstantBufferDescriptor {
     u32 count;
 
     auto operator<=>(const ConstantBufferDescriptor&) const = default;
+};
+
+enum class StorageWriteReason : u8 {
+    NotCollected,
+    None,
+    NoWrites,
+    NotCompute,
+    NativeGlobalBounds,
+    IndirectDescriptor,
+    UnresolvedGlobal,
+    DynamicBinding,
+    UnsupportedStore,
+    DynamicOrUnsupportedOffset,
+    Overflow,
+    Budget,
+    NeedsDispatch,
+    BaseRequired,
+    IndirectDispatch,
+    InvalidDimensions,
+    InvocationLimit,
+    IntervalLimit,
+    OutsideBinding,
+    BaseGpuModified,
+    BaseWritableAlias,
+    BaseSnapshotBounds,
+    BaseSnapshotLimit,
+    FragmentationLimit,
+};
+
+std::string_view StorageWriteReasonName(StorageWriteReason reason);
+
+struct StorageWriteTerm {
+    std::array<u32, 6> coefficients{}; // Workgroup XYZ, then local invocation XYZ.
+    u32 constant{};
+    u32 width{};
+    u32 base_mask{};
+    bool needs_base{};
+};
+
+struct StorageWriteFootprint {
+    // Conservative byte envelope relative to the aligned SSBO binding.
+    bool known{};
+    u64 begin{};
+    u64 end{};
+    StorageWriteReason reason{StorageWriteReason::NotCollected};
+    std::vector<StorageWriteTerm> terms;
+    bool symbolic{};
+    bool coherence_eligible{}; // First experiment: ordinary 32/64/128-bit stores only.
 };
 
 struct StorageBufferDescriptor {
@@ -375,6 +424,7 @@ struct Info {
     boost::container::static_vector<ConstantBufferDescriptor, MAX_CBUFS>
         constant_buffer_descriptors;
     boost::container::static_vector<StorageBufferDescriptor, MAX_SSBOS> storage_buffers_descriptors;
+    std::vector<StorageWriteFootprint> storage_write_footprints;
     TextureBufferDescriptors texture_buffer_descriptors;
     ImageBufferDescriptors image_buffer_descriptors;
     TextureDescriptors texture_descriptors;

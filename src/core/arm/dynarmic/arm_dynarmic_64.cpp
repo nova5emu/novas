@@ -9,12 +9,14 @@
 #if defined(_M_X64) || defined(__x86_64__)
 #include <immintrin.h>
 #endif
+#include "common/gpu_transition_profile.h"
 #include "common/settings.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
 #include "core/arm/dynarmic/window_trace.h"
 #include "core/core_timing.h"
+#include "core/deferred_write_config.h"
 #include "core/hle/kernel/k_process.h"
 #include "dynarmic/interface/A64/config.h"
 
@@ -90,6 +92,10 @@ void DynarmicCallbacks64::MemoryWrite128(u64 vaddr, Dynarmic::A64::Vector value)
         m_memory.Write64(vaddr, value[0]);
         m_memory.Write64(vaddr + 8, value[1]);
     }
+}
+
+void DynarmicCallbacks64::MemoryPrepareExclusive(u64 vaddr, size_t size) {
+    m_memory.PrepareExclusiveAccess(vaddr, size);
 }
 
 bool DynarmicCallbacks64::MemoryWriteExclusive8(u64 vaddr, std::uint8_t value, std::uint8_t expected) {
@@ -456,6 +462,18 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         config.fastmem_pointer = std::nullopt;
         config.fastmem_exclusive_access = false;
     }
+#if defined(_M_X64) || defined(__x86_64__)
+    if (DeferredWritesConfig::ProducerRequested()) {
+        config.prepare_exclusive_memory = true;
+        config.exclusive_prepare_table = m_cb->m_memory.GetExclusiveFastTable();
+        config.exclusive_prepare_table_mask = static_cast<u32>(Memory::Memory::ExclusiveFastTableMask);
+        m_cb->m_exclusive_inline_counter = Common::GpuTransitionProfile::RegisterExclusiveInlineCounter();
+        if (m_cb->m_exclusive_inline_counter) {
+            config.exclusive_prepare_fast_hits = &m_cb->m_exclusive_inline_counter->hits;
+        }
+        config.optimizations &= ~Dynarmic::OptimizationFlag::Unsafe_IgnoreGlobalMonitor;
+    }
+#endif
     m_jit.emplace(config);
 }
 

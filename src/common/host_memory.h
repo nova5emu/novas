@@ -51,6 +51,12 @@ public:
 
     void Protect(size_t virtual_offset, size_t length, MemoryPermission perms);
 
+    // Linux 4 KiB only. Caller proves and pins this native alias's physical identity;
+    // Android separate heaps must call through HeapTracker to preserve remap metadata.
+    // Removes native access and reports OS failure, preserving read traps on rejected openings.
+    bool TryReprotectCpuEpoch(size_t virtual_offset, size_t length = 0x1000);
+    bool TryGrantCpuEpoch(size_t virtual_offset, size_t length = 0x1000);
+
     void EnableDirectMappedAddress();
 
     /// Clears guest memory being handed out. Memory still zero since it was created (or since its
@@ -87,6 +93,10 @@ public:
 
     [[nodiscard]] size_t VirtualSize() const noexcept {
         return virtual_size;
+    }
+
+    [[nodiscard]] size_t BackingSize() const noexcept {
+        return backing_size;
     }
 
     /// NovaS diagnostics: bytes of the backing (guest RAM) resident in host RAM, and in use by the

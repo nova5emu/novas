@@ -6,21 +6,27 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
 #include <deque>
 #include <memory>
 #include <mutex>
-#include <vector>
 #include <span>
+#include <utility>
+#include <vector>
 
 #include "common/common_types.h"
+#include "common/gpu_transition_profile.h"
 #include "common/range_mutex.h"
 #include "common/scratch_buffer.h"
 #include "common/thread_worker.h"
 #include "common/sparse_large_vector.h"
 
+namespace VideoCommon::CpuEpochs {
+enum class Exclusion : u8;
+}
 namespace Core {
 
 constexpr size_t DEVICE_PAGEBITS = 12ULL;
@@ -40,6 +46,11 @@ struct Asid {
     size_t id;
 };
 
+struct DeviceMemoryPhysicalSpan {
+    u64 offset; ///< Byte offset from the start of DRAM, not a guest physical address.
+    u64 size;
+};
+
 template <typename Traits>
 class DeviceMemoryManager {
     using DeviceInterface = typename Traits::DeviceInterface;
@@ -57,12 +68,75 @@ public:
     /// Marks the memory behind [address, address + size) cold (Common::HostMemory::HintCold),
     /// from a low-priority thread: data the host GPU has its own copy of, e.g. uploaded textures.
     void HintCold(DAddr address, size_t size);
+    void ExcludeCpuEpochExport(DAddr address, u64 size) const;
+    void ExcludeCpuEpochRange(DAddr address, u64 size,
+                             VideoCommon::CpuEpochs::Exclusion reason) const;
 
     DAddr Allocate(size_t size);
     void AllocateFixed(DAddr start, size_t size);
     void Free(DAddr start, size_t size);
 
     void Map(DAddr address, VAddr virtual_address, size_t size, Asid asid, bool track = false);
+
+    // Fresh backing only: validation, permission and publication share mapping_guard.
+    // permit must not map/unmap, take cache locks or wait for the GPU.
+    template <typename Permit>
+    bool TryMapUnbacked(DAddr address, VAddr virtual_address, size_t size, Asid asid,
+                        bool track, Permit&& permit) {
+        std::scoped_lock lock{mapping_guard};
+        if (size == 0 || (address & page_mask) != 0 || (virtual_address & page_mask) != 0 ||
+            (size & page_mask) != 0 || address >= device_as_size || size > device_as_size - address) {
+            return false;
+        }
+        const size_t first = address >> page_bits;
+        const size_t pages = size >> page_bits;
+        for (size_t page = first; page < first + pages; ++page) {
+            if (tracked_entries[page].compressed_physical_ptr != 0) {
+                return false;
+            }
+        }
+        if (!permit()) {
+            return false;
+        }
+        MapImpl(address, virtual_address, size, asid, track);
+        return true;
+    }
+
+    // The caller owns the physical pages until every device mapping is retired. Like
+    // TryMapUnbacked, permit runs under mapping_guard before any translation is published.
+    template <typename Permit>
+    bool TryMapPhysicalUnbacked(DAddr address, std::span<const DeviceMemoryPhysicalSpan> spans,
+                               Permit&& permit) {
+        std::scoped_lock lock{mapping_guard};
+        if (spans.empty() || address == 0 || (address & page_mask) != 0 ||
+            address >= device_as_size) {
+            return false;
+        }
+        const u64 physical_limit = std::min<u64>(physical_size,
+                                                u64{compressed_device_addr.size()} << page_bits);
+        u64 size = 0;
+        for (const auto& span : spans) {
+            if (span.size == 0 || (span.offset & page_mask) != 0 ||
+                (span.size & page_mask) != 0 || span.offset >= physical_limit ||
+                span.size > physical_limit - span.offset ||
+                span.size > device_as_size - address - size) {
+                return false;
+            }
+            size += span.size;
+        }
+        const size_t first = address >> page_bits;
+        const size_t pages = size >> page_bits;
+        for (size_t page = first; page < first + pages; ++page) {
+            if (tracked_entries[page].compressed_physical_ptr != 0) {
+                return false;
+            }
+        }
+        if (!permit()) {
+            return false;
+        }
+        MapPhysicalImpl(address, spans, size);
+        return true;
+    }
 
     void Unmap(DAddr address, size_t size);
 
@@ -105,6 +179,55 @@ public:
         ApplyOpOnPAddr(address, buffer, operation);
     }
 
+#ifdef HAS_NCE
+    // Runs only for a single, matching device mapping contained in one page. The callback holds
+    // mapping_guard: it must not map/unmap, gather aliases, or acquire rasterizer cache locks.
+    template <typename Operation>
+    bool ApplyOpOnSingleMapping(const u8* pointer, size_t size, Operation&& operation) {
+        return ApplyOpOnSingleMappingImpl(pointer, size, std::forward<Operation>(operation), false);
+    }
+
+    template <typename Operation>
+    bool TryApplyOpOnSingleMapping(const u8* pointer, size_t size, Operation&& operation) {
+        return ApplyOpOnSingleMappingImpl(pointer, size, std::forward<Operation>(operation), true);
+    }
+
+private:
+    template <typename Operation>
+    bool ApplyOpOnSingleMappingImpl(const u8* pointer, size_t size, Operation&& operation, bool diagnostic) {
+        std::unique_lock lock{mapping_guard, std::defer_lock};
+        if (diagnostic) {
+            if (!lock.try_lock()) {
+                Common::GpuTransitionProfile::RecordDiagnosticDrop(
+                    Common::GpuTransitionProfile::DiagnosticSite::DeviceMappingInspection);
+                return false;
+            }
+        } else {
+            lock.lock();
+        }
+        if (!pointer || !IsPhysicalPointer(pointer)) {
+            return false;
+        }
+        const PAddr physical = GetRawPhysicalAddr(pointer);
+        const size_t offset = physical & page_mask;
+        if (size == 0 || size > page_size - offset) {
+            return false;
+        }
+        const u32 base = compressed_device_addr[physical >> page_bits];
+        if (base == 0 || (base & MULTI_FLAG) != 0) {
+            return false;
+        }
+        const DAddr address = (DAddr{base} << page_bits) + offset;
+        if (address >= device_as_size || GetPointer<u8>(address) != pointer) {
+            return false;
+        }
+        operation(address);
+        return true;
+    }
+
+public:
+#endif
+
     PAddr GetPhysicalRawAddressFromDAddr(DAddr address) const {
         PAddr subbits = PAddr(address & page_mask);
         auto paddr = tracked_entries[(address >> page_bits)].compressed_physical_ptr;
@@ -112,6 +235,46 @@ public:
             return 0;
         }
         return (PAddr(paddr - 1) << page_bits) + subbits;
+    }
+
+    // One mapped page, stable while operation(pointer, physical) runs. Cache locks precede
+    // mapping_guard; operation must not remap, acquire cache locks or wait for the GPU.
+    template <typename Operation>
+    bool ApplyOpOnMappedMemory(DAddr address, size_t size, Operation&& operation) {
+        std::scoped_lock lock{mapping_guard};
+        if (address >= device_as_size || size == 0 || size > page_size - (address & page_mask)) {
+            return false;
+        }
+        auto* pointer = GetPointer<u8>(address);
+        if (!pointer || !IsPhysicalPointer(pointer)) {
+            return false;
+        }
+        operation(pointer, GetRawPhysicalAddr(pointer));
+        return true;
+    }
+
+    // Diagnostic visitor. Cache callers must not wait for mapping mutations or retain pointers.
+    template <typename Operation>
+    bool TryInspectPhysicalRange(DAddr address, u64 size, Operation&& operation) {
+        constexpr u64 max_pages = 4096;
+        std::unique_lock lock{mapping_guard, std::try_to_lock};
+        if (!lock || address >= device_as_size || size == 0 || size > device_as_size - address ||
+            size > max_pages * page_size - (address & page_mask)) {
+            return false;
+        }
+        bool complete = true;
+        while (size != 0) {
+            const u64 part = (std::min<u64>)(size, page_size - (address & page_mask));
+            auto* pointer = GetPointer<u8>(address);
+            if (pointer && IsPhysicalPointer(pointer)) {
+                operation(GetRawPhysicalAddr(pointer), address, part);
+            } else {
+                complete = false;
+            }
+            address += part;
+            size -= part;
+        }
+        return complete;
     }
 
     template <typename T>
@@ -140,6 +303,8 @@ public:
     void ArmReadTraps(DAddr addr, size_t size);
 
 private:
+    void MapImpl(DAddr address, VAddr virtual_address, size_t size, Asid asid, bool track);
+    void MapPhysicalImpl(DAddr address, std::span<const DeviceMemoryPhysicalSpan> spans, size_t size);
     struct TranslationEntry {
         DAddr guest_page{};
         u8* host_ptr{};
@@ -182,6 +347,8 @@ private:
     static constexpr u32 MULTI_FLAG = 1U << MULTI_FLAG_BITS;
     static constexpr u32 MULTI_MASK = ~MULTI_FLAG;
 
+public:
+    // Raw physical offset <-> host pointer (used by the deferred-writes consumer).
     template <typename T>
     T* GetPointerFromRaw(PAddr addr) {
         return reinterpret_cast<T*>(physical_base + addr);
@@ -197,6 +364,8 @@ private:
         return static_cast<PAddr>(reinterpret_cast<uintptr_t>(ptr) - physical_base);
     }
 
+private:
+
     void WalkBlock(const DAddr addr, const std::size_t size, auto on_unmapped, auto on_memory,
                    auto increment);
 
@@ -207,6 +376,7 @@ private:
     std::unique_ptr<DeviceMemoryManagerAllocator<Traits>> impl;
 
     const uintptr_t physical_base;
+    const size_t physical_size;
     const DeviceMemory* device_memory_ptr;
     DeviceInterface* device_inter;
     std::unique_ptr<Common::ThreadWorker> cold_hint_worker;

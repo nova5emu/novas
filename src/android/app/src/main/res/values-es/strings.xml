@@ -1211,4 +1211,8 @@
     <string name="novas_loose_games_access_title">Permite el acceso a tus juegos</string>
     <string name="novas_loose_games_access">NovaS encontró un juego en carpetas (base, updates, dlc). Para abrirlo necesita permiso para acceder a todos los archivos. Actívalo y vuelve: el juego aparecerá en la lista.</string>
     <string name="novas_loose_games_access_open">Abrir ajustes</string>
+    <string name="renderer_oot_anti_aliasing">Antialiasing de Ocarina of Time</string>
+    <string name="renderer_oot_anti_aliasing_description">Controla la red de antialiasing y el realce de nitidez de Ocarina of Time.</string>
+    <string name="oot_anti_aliasing_game">Del juego</string>
+    <string name="oot_anti_aliasing_no_sharpening">Sin realce de nitidez (omitir red)</string>
 </resources>

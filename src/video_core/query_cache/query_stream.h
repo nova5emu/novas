@@ -7,6 +7,7 @@
 #pragma once
 
 #include <deque>
+#include <memory>
 #include <optional>
 #include <vector>
 
@@ -127,6 +128,7 @@ protected:
         if (!old_queries.empty()) {
             size_t new_id = old_queries.front();
             old_queries.pop_front();
+            std::destroy_at(&slot_queries[new_id]);
             new (&slot_queries[new_id]) QueryType(std::forward<Args>(args)...);
             return new_id;
         }
@@ -138,6 +140,7 @@ protected:
     void ReleaseQuery(size_t query_id) {
 
         if (query_id < slot_queries.size()) {
+            slot_queries[query_id].deferred_writer.reset();
             old_queries.push_back(query_id);
             return;
         }

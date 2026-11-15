@@ -26,6 +26,10 @@
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/texture_cache/util.h"
 
+#ifdef HAS_NCE
+#include "core/arm/nce/nce_exact_store.h"
+#endif
+
 namespace Vulkan {
 namespace {
 void HostReadBarrier(vk::CommandBuffer cmdbuf) {
@@ -500,8 +504,8 @@ void BufferCacheRuntime::WaitSubmittedTick(u64 tick) {
     master.Wait(tick);
 }
 
-void BufferCacheRuntime::Finish() {
-    scheduler.Finish();
+void BufferCacheRuntime::Finish(std::source_location location) {
+    scheduler.Finish({}, {}, location);
 }
 
 void BufferCacheRuntime::FinishForHostRead() {
@@ -528,6 +532,12 @@ void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
     if (dst_buffer == VK_NULL_HANDLE || src_buffer == VK_NULL_HANDLE) {
         return;
     }
+#ifdef HAS_NCE
+    const bool exact_store = Core::NceExactStore::in_exact_inline;
+    if (exact_store) {
+        Core::NceExactStore::inline_copies.fetch_add(1, std::memory_order_relaxed);
+    }
+#endif
     static constexpr VkMemoryBarrier READ_BARRIER{
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .pNext = nullptr,
@@ -545,15 +555,37 @@ void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
     boost::container::small_vector<VkBufferCopy, 8> vk_copies(copies.size());
     std::ranges::transform(copies, vk_copies.begin(), MakeBufferCopy);
     if (src_buffer == staging_pool.StreamBuf() && can_reorder_upload) {
+#ifdef HAS_NCE
+        if (exact_store) {
+            Core::NceExactStore::inline_upload_copies.fetch_add(1, std::memory_order_relaxed);
+        }
+#endif
         scheduler.RecordWithUploadBuffer([src_buffer, dst_buffer, vk_copies](
                                              vk::CommandBuffer, vk::CommandBuffer upload_cmdbuf) {
+            const VideoCommon::GpuOperationTrace::PurposeScope trace_upload{
+                VideoCommon::GpuOperationTrace::Purpose::StagingUpload};
             upload_cmdbuf.CopyBuffer(src_buffer, dst_buffer, vk_copies);
         });
         return;
     }
 
+#ifdef HAS_NCE
+    const u64 epoch = exact_store ? scheduler.RecordingEpoch() : 0;
+#endif
     scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Record([src_buffer, dst_buffer, vk_copies, barrier](vk::CommandBuffer cmdbuf) {
+#ifdef HAS_NCE
+    // EndRenderPass advances the epoch only if it ends a pass, including a deferred clear.
+    if (exact_store && scheduler.RecordingEpoch() != epoch) {
+        Core::NceExactStore::inline_render_pass_ends.fetch_add(1, std::memory_order_relaxed);
+    }
+#endif
+    const bool staging_upload =
+        scheduler.IsOperationTraceEnabled() && staging_pool.IsUploadBuffer(src_buffer);
+    scheduler.Record([src_buffer, dst_buffer, vk_copies, barrier,
+                      staging_upload](vk::CommandBuffer cmdbuf) {
+        const VideoCommon::GpuOperationTrace::PurposeScope trace_upload{
+            staging_upload ? VideoCommon::GpuOperationTrace::Purpose::StagingUpload
+                           : VideoCommon::GpuOperationTrace::Purpose::Generic};
         if (barrier) {
             cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
                                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, READ_BARRIER);

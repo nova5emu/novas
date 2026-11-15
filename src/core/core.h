@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "common/gpu_transition_profile.h"
 #include "core/file_sys/vfs/vfs_types.h"
 #include "core/hle/service/os/event.h"
 #include "core/hle/service/kernel_helpers.h"
@@ -97,6 +98,11 @@ class Host1x;
 namespace VideoCore {
 class RendererBase;
 } // namespace VideoCore
+
+namespace VideoCommon::DeferredWrites {
+class Suspension;
+class Journal;
+}
 
 namespace AudioCore {
 class AudioCore;
@@ -254,6 +260,9 @@ public:
 
     /// Gets a mutable reference to the GPU interface
     [[nodiscard]] Tegra::GPU& GPU();
+    [[nodiscard]] VideoCommon::DeferredWrites::Journal* DeferredWriteJournal();
+    [[nodiscard]] std::shared_ptr<VideoCommon::DeferredWrites::Suspension> BeginDeferredTransition(
+        Common::GpuTransitionProfile::SuspensionSite site);
 
     /// Gets an immutable reference to the GPU interface.
     [[nodiscard]] const Tegra::GPU& GPU() const;

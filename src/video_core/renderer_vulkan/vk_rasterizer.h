@@ -124,6 +124,16 @@ public:
     void OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) override;
     bool TryCacheInvalidation(DAddr addr, u64 size) override;
     bool OnCPUWrite(DAddr addr, u64 size) override;
+    bool ApplyDeferredWrite(const VideoCommon::DeferredWrites::Write& write) override;
+    bool UploadCpuEpochPage(DAddr device, PAddr physical, std::span<const u8> bytes) override;
+    bool PrepareCpuEpochPage(DAddr device, PAddr physical, u64& downloaded_bytes) override;
+#ifdef HAS_NCE
+    Core::NceExactStore::Result GrantDeferredWriteLease(
+        DAddr page, PAddr physical, u64 mapping_generation,
+        VideoCommon::DeferredWrites::Journal::Lease& lease) override;
+    Core::NceExactStore::Result WriteNceStore(DAddr addr, std::span<const u8> bytes,
+                                            const Core::NceExactStore::Backing& backing) override;
+#endif
     void InvalidateGPUCache() override;
     void UnmapMemory(DAddr addr, u64 size) override;
     void ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) override;
@@ -131,7 +141,11 @@ public:
     void SyncOperation(std::function<void()>&& func) override;
     void SignalSyncPoint(u32 value) override;
     void SignalReference() override;
-    void ReleaseFences(bool force = true) override;
+    void ReleaseFences(
+        bool force = true, std::source_location caller = std::source_location::current()) override;
+    void FlushPendingOperations() override;
+    VideoCore::FenceProgress GetFenceProgress() const override;
+    bool ResolveDeferredWriteReadbacks() override;
     void FlushQueryResults(DAddr addr, u64 size) override;
     void FlushAndInvalidateRegion(
         DAddr addr, u64 size, VideoCommon::CacheType which = VideoCommon::CacheType::All) override;

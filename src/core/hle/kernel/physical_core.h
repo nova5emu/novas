@@ -56,6 +56,11 @@ public:
     // Interrupt this core.
     void Interrupt();
 
+    // After reprotection, test whether this core is already outside native execution.
+    // Never waits or signals an active core. Host commits need separate writer guards;
+    // the coordinator must prevent a fallback from reopening the page while closing.
+    bool TryNativeQuiescence() noexcept;
+
     // Clear this core's interrupt.
     void ClearInterrupt();
 

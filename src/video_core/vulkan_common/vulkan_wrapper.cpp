@@ -558,6 +558,7 @@ void Buffer::SetObjectNameEXT(const char* name) const {
 
 void Buffer::Release() const noexcept {
     if (handle) {
+        Vulkan::HangTrace::ForgetBuffer(Vulkan::HangTrace::Handle(handle));
         vmaDestroyBuffer(allocator, handle, allocation);
     }
 }

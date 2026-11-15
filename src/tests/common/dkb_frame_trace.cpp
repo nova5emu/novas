@@ -33,3 +33,24 @@ TEST_CASE("DKB GPU timestamp differences respect valid bits", "[common][dkb_fram
     REQUIRE(TimestampDelta(0, 1, 0) == 0);
     REQUIRE(TimestampDelta(0, 1, 65) == 0);
 }
+
+TEST_CASE("DKB GPU overlap is not a wrapped positive gap", "[common][dkb_frame_trace]") {
+    using Common::DkbFrameTrace::SignedTimestampDelta;
+    REQUIRE(SignedTimestampDelta(100, 90, 64) == -10.0);
+    REQUIRE(SignedTimestampDelta(250, 5, 8) == 11.0);
+    REQUIRE(SignedTimestampDelta(5, 250, 8) == -11.0);
+    REQUIRE(SignedTimestampDelta(~u64{0} - 2, 4, 64) == 7.0);
+    REQUIRE(SignedTimestampDelta(4, ~u64{0} - 2, 64) == -7.0);
+    REQUIRE(SignedTimestampDelta(1, 1, 36) == 0.0);
+    REQUIRE(SignedTimestampDelta(1, 2, 0) == 0.0);
+    REQUIRE(SignedTimestampDelta(1, 2, 65) == 0.0);
+}
+
+TEST_CASE("DKB GPU interval coverage does not double count overlapping submissions",
+          "[common][dkb_frame_trace]") {
+    using Common::DkbFrameTrace::IntervalUnionMilliseconds;
+    REQUIRE(IntervalUnionMilliseconds({}) == 0.0);
+    REQUIRE(IntervalUnionMilliseconds({{10, 15}, {0, 5}}) == 10.0);
+    REQUIRE(IntervalUnionMilliseconds({{0, 10}, {2, 4}, {8, 12}, {12, 15}}) == 15.0);
+    REQUIRE(IntervalUnionMilliseconds({{-3, 1}, {-2, 0}, {4, 4}, {6, 5}}) == 4.0);
+}

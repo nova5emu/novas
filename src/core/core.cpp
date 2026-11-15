@@ -19,6 +19,7 @@
 #include "common/string_util.h"
 #include "core/arm/exclusive_monitor.h"
 #include "core/core.h"
+#include "core/deferred_transition.h"
 
 #include "launch_timestamp_cache.h"
 #include "core/core_timing.h"
@@ -288,6 +289,7 @@ struct System::Impl {
     void Run() {
         std::unique_lock<std::mutex> lk(suspend_guard);
 
+        Common::ADPF::ResetFrameInterval();
         kernel.SuspendEmulation(false);
         core_timing.SyncPause(false);
         is_paused.store(false, std::memory_order_relaxed);
@@ -298,6 +300,7 @@ struct System::Impl {
 
         core_timing.SyncPause(true);
         kernel.SuspendEmulation(true);
+        Common::ADPF::ResetFrameInterval();
         is_paused.store(true, std::memory_order_relaxed);
     }
 
@@ -372,6 +375,7 @@ struct System::Impl {
 
     /// Creates the program's process and sets up the rest of the system to run it.
     SystemResultStatus Load(System& system, Frontend::EmuWindow& emu_window, const std::string& filepath, Service::AM::FrontendAppletParameters& params) {
+        Common::ADPF::Configure();
         if (params.launch_type == Service::AM::LaunchType::FrontendInitiated) {
             fs_controller.InitTempStorage();
         }
@@ -382,6 +386,7 @@ struct System::Impl {
                              params.program_index);
         Settings::SetCurrentProgramIsSwitch2(switch2_program);
         Settings::SetAstcRecompressionOverride(std::nullopt);
+        Settings::SetAstcDecodeOverride(std::nullopt);
 
         // Switch 2 titles size their heap from the total memory and need the 12 GiB layout. Set it
         // as a per-game value, so RestoreGlobalState brings back the configured layout afterwards.
@@ -511,6 +516,9 @@ struct System::Impl {
     /// Stops the running program and releases what it used, keeping the System reusable for
     /// the next Load.
     void ShutdownMainProcess() {
+        // Prepare while the scheduler owner can still submit and retire old readbacks.
+        DeferredTransitionScope deferred_transition{
+            kernel.System(), Common::GpuTransitionProfile::SuspensionSite::ProcessFinalize};
         debug_service.reset();
         SetShuttingDown(true);
         Common::ADPF::Shutdown();
@@ -812,6 +820,18 @@ const Core::Memory::Memory& System::ApplicationMemory() const {
 
 Tegra::GPU& System::GPU() {
     return *impl->gpu_core;
+}
+
+std::shared_ptr<VideoCommon::DeferredWrites::Suspension> System::BeginDeferredTransition(
+    Common::GpuTransitionProfile::SuspensionSite site) {
+    if (!impl->gpu_core || !impl->gpu_core->DeferredWriteJournal()) return {};
+    return impl->gpu_core->BeginDeferredTransition(
+        site, Kernel::GetCurrentThreadPointer(impl->kernel) == nullptr ||
+                  !Kernel::KScheduler::IsSchedulerLockedByCurrentThread(impl->kernel));
+}
+
+VideoCommon::DeferredWrites::Journal* System::DeferredWriteJournal() {
+    return impl->gpu_core ? impl->gpu_core->DeferredWriteJournal() : nullptr;
 }
 
 const Tegra::GPU& System::GPU() const {

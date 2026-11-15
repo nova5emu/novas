@@ -23,13 +23,30 @@
 #include "core/device_memory.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/kernel.h"
+#include "core/hle/service/nvdrv/core/container.h"
 #include "core/memory.h"
 #include "tests/core/system_test_context.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/memory_tracker_base.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/gpu.h"
+#include "video_core/host1x/host1x.h"
 #include "video_core/renderer_null/null_rasterizer.h"
+#include "video_core/semaphore_acquire.h"
+
+namespace Tegra::Engines {
+struct PullerTestAccess {
+    static void StartAcquire(DmaPusher& pusher, u32 execute_operation, u32 value) {
+        pusher.puller.StartSemaphoreAcquire(pusher, Puller::PendingAcquire{
+            .address = 0x100000,
+            .value = value,
+            .operation = *SemaphoreAcquire::NormalizeExecute(execute_operation),
+            .since = std::chrono::steady_clock::now(),
+            .reported = false,
+        });
+    }
+};
+} // namespace Tegra::Engines
 
 namespace {
 
@@ -75,13 +92,18 @@ struct Runtime {
         return 1;
     }
     bool IsFree(u64) const {
-        return true;
+        return list_copy_ready;
     }
-    void WaitSubmittedTick(u64) {}
+    void WaitSubmittedTick(u64) {
+        if (before_list_wait) before_list_wait();
+        Finish();
+        list_copy_ready = true;
+    }
     bool CanReorderUpload(const Buffer&, std::span<VideoCommon::BufferCopy>) const {
         return false;
     }
     Staging DownloadStagingBuffer(u64 size, bool = false) {
+        if (staging) retired_staging.push_back(std::move(staging));
         staging = std::make_unique<Buffer>(*this, 0, size + 128, false);
         ++allocations;
         return {staging.get(), 128, std::span{staging->bytes}.subspan(128)};
@@ -114,6 +136,7 @@ struct Runtime {
     }
     void CopyBuffer(Buffer& dst, Buffer& src, std::span<const VideoCommon::BufferCopy> copies,
                     bool) {
+        if (before_gpu_copy) before_gpu_copy(dst, src);
         for (const auto& copy : copies) {
             REQUIRE(copy.src_offset + copy.size <= src.bytes.size());
             REQUIRE(copy.dst_offset + copy.size <= dst.bytes.size());
@@ -122,14 +145,21 @@ struct Runtime {
         }
     }
     void ClearBuffer(Buffer& buffer, u32 offset, size_t size, u32 value) {
+        if (before_clear) before_clear(buffer);
         REQUIRE(offset + size <= buffer.bytes.size());
         std::memset(buffer.bytes.data() + offset, static_cast<int>(value), size);
+    }
+    void OnBufferDeleted(Buffer& buffer) {
+        if (before_delete) before_delete(buffer);
     }
     void TickFrame(Common::SlotVector<Buffer>&) {}
     u64 GetDeviceMemoryUsage() const {
         return 0;
     }
     void FreeDeferredStagingBuffer(Staging&) {}
+    void PreCopyBarrier() {}
+    void PostCopyBarrier() {}
+    u64 CurrentTick() const { return 1; }
     void Finish() {
         if (before_completion) {
             before_completion();
@@ -162,9 +192,15 @@ struct Runtime {
     u32 host_read_barriers{};
     u64 upload_bytes{}, waited_tick{};
     std::unique_ptr<Buffer> staging;
+    std::vector<std::unique_ptr<Buffer>> retired_staging;
     std::vector<u8> stream;
     std::vector<std::function<void()>> pending;
     std::function<void()> before_completion;
+    bool list_copy_ready{true};
+    std::function<void()> before_list_wait;
+    std::function<void(Buffer&, Buffer&)> before_gpu_copy;
+    std::function<void(Buffer&)> before_clear;
+    std::function<void(Buffer&)> before_delete;
 };
 
 struct Tracker : VideoCommon::MemoryTrackerBase<Tegra::MaxwellDeviceMemoryManager> {
@@ -240,8 +276,44 @@ struct BufferCacheTestAccess {
         entry.draw_written = true;
         ++entry.writes;
     }
+    static void QueueListCopy(Cache& cache, BufferId id, DAddr page) {
+        std::scoped_lock lock{cache.nx2_list_mutex};
+        ++cache.nx2_list_pages[page].writes;
+        cache.nx2_list_copy_requests.emplace_back(id, page);
+    }
+    static void AttachChannel(Cache& cache, BufferCacheChannelInfo& channel) {
+        cache.channel_state = &channel;
+        cache.maxwell3d = &channel.maxwell3d;
+        cache.gpu_memory = &channel.gpu_memory;
+    }
+    static BufferId Find(Cache& cache, DAddr address, u32 size) {
+        return cache.FindBuffer(address, size, false);
+    }
+    static void Delete(Cache& cache, BufferId id) {
+        cache.DeleteBuffer(id);
+    }
+    static bool Contains(Cache& cache, BufferId id) {
+        return cache.slot_buffers.contains(id);
+    }
+    static void ApplyExact(Cache& cache, const DeferredWrites::Write& write) {
+        REQUIRE(cache.ApplyDeferredWrite(write));
+    }
+    static bool CpuDirty(Cache& cache, DAddr address, u64 size) {
+        return cache.memory_tracker.IsRegionCpuModified(address, size);
+    }
+    static void MarkCpuDirty(Cache& cache, DAddr address, u64 size) {
+        cache.memory_tracker.MarkRegionAsCpuModified(address, size);
+    }
     static void Download(Cache& cache, std::span<const std::pair<DAddr, u64>> ranges) {
         cache.DownloadRangesMemory(ranges);
+    }
+    static void DownloadBuffers(Cache& cache, std::span<const BufferId> ids) {
+        cache.DownloadBuffersMemory(ids);
+    }
+    static void GpuWrite(Cache& cache, BufferId id, DAddr address, u32 size) {
+        cache.MarkWrittenBuffer(id, address, size);
+        // Request a fence copy independently of the game's async-download policy.
+        cache.uncommitted_gpu_modified_ranges.Add(address, size);
     }
     static void Uniform(Cache& cache, BufferCacheChannelInfo& channel, BufferId id, DAddr address,
                         u32 size) {
@@ -335,6 +407,316 @@ struct Fixture {
 };
 
 } // namespace
+
+TEST_CASE("Deferred admission permits clean GPU ownership but requires a complete CPU-clean buffer",
+          "[buffer_ports][deferred_writes][deferred_admission]") {
+    using Reason = Common::GpuTransitionProfile::DeferredFallbackReason;
+    Fixture f;
+    CHECK(f.cache->ValidateDeferredWritePage(0x20000) == Reason::NoGpuBuffer);
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    CHECK(f.cache->ValidateDeferredWritePage(0x20000) == Reason::Success);
+    Access::Dirty(*f.cache, 0x20080, 16);
+    CHECK(f.cache->ValidateDeferredWritePage(0x20000) == Reason::Success);
+    CHECK(f.cache->ValidateDeferredWritePage(0x20001) == Reason::InvalidOperands);
+    SECTION("CPU-dirty neighbor makes the entire page ineligible") {
+        Access::MarkCpuDirty(*f.cache, 0x20f00, 4);
+        CHECK(f.cache->ValidateDeferredWritePage(0x20000) == Reason::CpuModified);
+    }
+    SECTION("Readback before the queued grant leaves the clean buffer eligible") {
+        f.cache->DownloadMemory(0x20000, 0x1000);
+        CHECK_FALSE(Access::Pending(*f.cache, 0x20000, 0x1000));
+        CHECK(f.cache->ValidateDeferredWritePage(0x20000) == Reason::Success);
+        CHECK(f.runtime.finishes == 1);
+        return;
+    }
+    SECTION("Queued old page writes must finish before granting") {
+        Access::Defer(*f.cache, 0x20004, 4);
+        CHECK(f.cache->ValidateDeferredWritePage(0x20000) == Reason::PendingWrites);
+        CHECK(Access::Deferred(*f.cache) == 1);
+    }
+    CHECK(f.runtime.uploads == 0);
+    CHECK(f.runtime.finishes == 0);
+    CHECK(Access::Get(*f.cache, id).IsInBounds(0x20000, 4096));
+}
+
+TEST_CASE("Deferred admission cannot use a buffer containing only part of a CPU page",
+          "[buffer_ports][deferred_writes][deferred_admission]") {
+    using Reason = Common::GpuTransitionProfile::DeferredFallbackReason;
+    Fixture f;
+    Access::Add(*f.cache, 0x20080, 128);
+    Access::Dirty(*f.cache, 0x20080, 16);
+    CHECK(f.cache->ValidateDeferredWritePage(0x20000) == Reason::NoGpuBufferBounds);
+    CHECK(f.runtime.uploads == 0);
+    CHECK(f.runtime.finishes == 0);
+}
+
+TEST_CASE("Fresh device mapping validates the entire target before permission or mutation",
+          "[buffer_ports][deferred_boundaries]") {
+    Fixture f;
+    constexpr DAddr target = 0x80000;
+    u32 permits{};
+    REQUIRE_FALSE(f.device.TryMapUnbacked(target, 0x10000, 0x2000, f.asid, true, [&] {
+        ++permits;
+        return false;
+    }));
+    REQUIRE(permits == 1);
+    REQUIRE(f.device.GetPointer<u8>(target) == nullptr);
+    REQUIRE(f.device.GetPointer<u8>(target + 0x1000) == nullptr);
+
+    f.device.Map(target + 0x1000, 0x21000, 0x1000, f.asid);
+    SCOPE_EXIT { f.device.Unmap(target, 0x2000); };
+    REQUIRE_FALSE(f.device.TryMapUnbacked(target, 0x10000, 0x2000, f.asid, true, [&] {
+        ++permits;
+        return true;
+    }));
+    REQUIRE(permits == 1);
+    REQUIRE(f.device.GetPointer<u8>(target) == nullptr);
+    REQUIRE(f.device.GetPointer<u8>(target + 0x1000) == f.bytes + 0x11000);
+
+    f.device.Unmap(target + 0x1000, 0x1000);
+    REQUIRE(f.device.TryMapUnbacked(target, 0x10000, 0x2000, f.asid, true, [&] {
+        ++permits;
+        return true;
+    }));
+    REQUIRE(permits == 2);
+    REQUIRE(f.device.GetPointer<u8>(target) == f.bytes);
+    REQUIRE(f.device.GetPointer<u8>(target + 0x1000) == f.bytes + 0x1000);
+    REQUIRE_FALSE(f.device.TryMapUnbacked(target + 1, 0x10000, 0x1000, f.asid, false,
+                                         [] { return true; }));
+}
+
+TEST_CASE("Concurrent fresh device mappings cannot both receive permission for the same range",
+          "[buffer_ports][deferred_boundaries]") {
+    Fixture f;
+    constexpr DAddr target = 0x80000;
+    SCOPE_EXIT { f.device.Unmap(target, 0x1000); };
+    std::barrier start{2};
+    std::atomic<u32> permits{};
+    bool first{}, second{};
+    std::jthread a{[&] {
+        start.arrive_and_wait();
+        first = f.device.TryMapUnbacked(target, 0x10000, 0x1000, f.asid, true, [&] {
+            ++permits;
+            return true;
+        });
+    }};
+    std::jthread b{[&] {
+        start.arrive_and_wait();
+        second = f.device.TryMapUnbacked(target, 0x20000, 0x1000, f.asid, true, [&] {
+            ++permits;
+            return true;
+        });
+    }};
+    a.join();
+    b.join();
+    REQUIRE(first != second);
+    REQUIRE(permits.load() == 1);
+    REQUIRE(f.device.GetPointer<u8>(target) == f.bytes + (first ? 0 : 0x10000));
+}
+
+TEST_CASE("Physical device mappings validate all spans before permission or publication",
+          "[buffer_ports][deferred_boundaries][physical_backing]") {
+    ScopedSystemTestContext context;
+    Core::DeviceMemory physical;
+    Tegra::MaxwellDeviceMemoryManager device{physical};
+    constexpr DAddr target = 0x80000;
+    DAddr destination = target;
+    std::vector<Core::DeviceMemoryPhysicalSpan> spans{{0x10000, 0x1000}, {0x20000, 0x1000}};
+    u32 permits{};
+    SECTION("Empty list") { spans.clear(); }
+    SECTION("Zero size") { spans.back().size = 0; }
+    SECTION("Unaligned physical offset") { ++spans.back().offset; }
+    SECTION("Unaligned physical size") { ++spans.back().size; }
+    SECTION("Outside actual DRAM") { spans.back().offset = physical.buffer.BackingSize(); }
+    SECTION("Physical range crosses DRAM end") {
+        spans.back() = {physical.buffer.BackingSize() - 0x1000, 0x2000};
+    }
+    SECTION("Overflowing physical offset") { spans.back().offset = ~u64{0} - 0xfff; }
+    SECTION("Unaligned device address") { ++destination; }
+    SECTION("Device zero is the reverse-map sentinel") { destination = 0; }
+    SECTION("Device range crosses address space end") {
+        destination = (1ULL << Tegra::MaxwellDeviceMemoryManager::AS_BITS) - 0x1000;
+    }
+    REQUIRE_FALSE(device.TryMapPhysicalUnbacked(destination, spans, [&] {
+        ++permits;
+        return true;
+    }));
+    REQUIRE(permits == 0);
+    REQUIRE(device.GetPointer<u8>(target) == nullptr);
+    REQUIRE(device.GetPointer<u8>(target + 0x1000) == nullptr);
+}
+
+TEST_CASE("Physical device mapping rejects occupied pages and denied permission without partial writes",
+          "[buffer_ports][deferred_boundaries][physical_backing]") {
+    ScopedSystemTestContext context;
+    Core::DeviceMemory physical;
+    Tegra::MaxwellDeviceMemoryManager device{physical};
+    constexpr DAddr target = 0x80000;
+    const std::array spans{Core::DeviceMemoryPhysicalSpan{0x10000, 0x2000}};
+    SCOPE_EXIT { device.Unmap(target, 0x2000); };
+    u32 permits{};
+    REQUIRE_FALSE(device.TryMapPhysicalUnbacked(target, spans, [&] {
+        ++permits;
+        return false;
+    }));
+    REQUIRE(permits == 1);
+    REQUIRE(device.GetPointer<u8>(target) == nullptr);
+    REQUIRE(device.GetPointer<u8>(target + 0x1000) == nullptr);
+    const std::array occupied{Core::DeviceMemoryPhysicalSpan{0x30000, 0x1000}};
+    REQUIRE(device.TryMapPhysicalUnbacked(target + 0x1000, occupied, [] { return true; }));
+    REQUIRE_FALSE(device.TryMapPhysicalUnbacked(target, spans, [&] {
+        ++permits;
+        return true;
+    }));
+    REQUIRE(permits == 1);
+    REQUIRE(device.GetPointer<u8>(target) == nullptr);
+    REQUIRE(device.GetPointer<u8>(target + 0x1000) == physical.GetPointerFromRaw<u8>(0x30000));
+}
+
+TEST_CASE("Physical backing is immediately visible without a process and preserves fragmented aliases",
+          "[buffer_ports][deferred_boundaries][physical_backing]") {
+    ScopedSystemTestContext context;
+    Core::DeviceMemory physical;
+    Tegra::MaxwellDeviceMemoryManager device{physical};
+    constexpr DAddr target = 0x80000;
+    constexpr DAddr alias = 0x90000;
+    const std::array spans{Core::DeviceMemoryPhysicalSpan{0x10000, 0x1000},
+                           Core::DeviceMemoryPhysicalSpan{0x11000, 0x1000},
+                           Core::DeviceMemoryPhysicalSpan{0x30000, 0x1000}};
+    SCOPE_EXIT {
+        device.Unmap(alias, 0x1000);
+        device.Unmap(target, 0x3000);
+    };
+    REQUIRE(device.TryMapPhysicalUnbacked(target, spans, [] { return true; }));
+    REQUIRE(device.GetSpan(target, 0x2000) == physical.GetPointerFromRaw<u8>(0x10000));
+    REQUIRE(device.GetSpan(target, 0x3000) == nullptr);
+    const std::array<u8, 4> pattern{0x12, 0x34, 0x56, 0x78};
+    device.WriteBlockUnsafe(target + 0x1ffe, pattern.data(), pattern.size());
+    REQUIRE(physical.GetPointerFromRaw<u8>(0x11ffe)[0] == pattern[0]);
+    REQUIRE(physical.GetPointerFromRaw<u8>(0x11ffe)[1] == pattern[1]);
+    REQUIRE(physical.GetPointerFromRaw<u8>(0x30000)[0] == pattern[2]);
+    REQUIRE(physical.GetPointerFromRaw<u8>(0x30000)[1] == pattern[3]);
+    std::array<u8, 4> readback{};
+    device.ReadBlockUnsafe(target + 0x1ffe, readback.data(), readback.size());
+    REQUIRE(readback == pattern);
+    // These calls must not dereference a process/ASID for physical-only pages.
+    device.UpdatePagesCachedCount(target, 0x3000, 1);
+    device.UpdatePagesCachedCount(target, 0x3000, -1);
+
+    const std::array alias_span{Core::DeviceMemoryPhysicalSpan{0x10000, 0x1000}};
+    REQUIRE(device.TryMapPhysicalUnbacked(alias, alias_span, [] { return true; }));
+    Common::ScratchBuffer<u32> scratch;
+    std::vector<DAddr> aliases;
+    device.ApplyOpOnPAddr(0x10000, scratch, [&](DAddr address) { aliases.push_back(address); });
+    std::sort(aliases.begin(), aliases.end());
+    const std::vector<DAddr> expected{target, alias};
+    REQUIRE(aliases == expected);
+    device.Unmap(alias, 0x1000);
+    aliases.clear();
+    device.ApplyOpOnPAddr(0x10000, scratch, [&](DAddr address) { aliases.push_back(address); });
+    REQUIRE(aliases == std::vector<DAddr>{target});
+
+    device.Unmap(target + 0x1000, 0x1000);
+    REQUIRE(device.GetSpan(target, 0x2000) == nullptr);
+    const std::array replacement{Core::DeviceMemoryPhysicalSpan{0x40000, 0x1000}};
+    REQUIRE(device.TryMapPhysicalUnbacked(target + 0x1000, replacement, [] { return true; }));
+    REQUIRE(device.GetPointer<u8>(target + 0x1000) == physical.GetPointerFromRaw<u8>(0x40000));
+    REQUIRE(device.GetSpan(target, 0x2000) == nullptr);
+}
+
+TEST_CASE("Concurrent physical backing claims grant permission to only one producer",
+          "[buffer_ports][deferred_boundaries][physical_backing]") {
+    ScopedSystemTestContext context;
+    Core::DeviceMemory physical;
+    Tegra::MaxwellDeviceMemoryManager device{physical};
+    constexpr DAddr target = 0x80000;
+    SCOPE_EXIT { device.Unmap(target, 0x1000); };
+    std::barrier start{2};
+    std::atomic<u32> permits{};
+    bool first{}, second{};
+    const auto claim = [&](u64 offset) {
+        const std::array spans{Core::DeviceMemoryPhysicalSpan{offset, 0x1000}};
+        start.arrive_and_wait();
+        return device.TryMapPhysicalUnbacked(target, spans, [&] {
+            ++permits;
+            return true;
+        });
+    };
+    std::jthread a{[&] { first = claim(0x10000); }};
+    std::jthread b{[&] { second = claim(0x20000); }};
+    a.join();
+    b.join();
+    REQUIRE(first != second);
+    REQUIRE(permits.load() == 1);
+    REQUIRE(device.GetPointer<u8>(target) == physical.GetPointerFromRaw<u8>(first ? 0x10000 : 0x20000));
+}
+
+TEST_CASE("Nvdrv session id reuse preserves queued and channel mapping owners",
+          "[buffer_ports][deferred_boundaries]") {
+    Fixture f;
+    const bool execute_callback = GENERATE(false, true);
+    Kernel::KAutoObject::Create(f.process.get());
+    // Host1x is too large for the test thread's stack.
+    auto host1x_owner = std::make_unique<Tegra::Host1x::Host1x>(f.system);
+    auto& host1x = *host1x_owner;
+    host1x.MemoryManager().BindInterface(&f.rasterizer);
+    auto container_owner = std::make_unique<Service::Nvidia::NvCore::Container>(host1x);
+    auto& container = *container_owner;
+    const auto first_id = container.OpenSession(f.process.get());
+    auto first = container.GetSessionLifetime(first_id);
+    REQUIRE(first);
+    const auto first_asid = first->asid;
+    REQUIRE(f.process->GetReferenceCount() == 2);
+
+    std::weak_ptr old_owner = first;
+    std::function<void()> queued = [owner = first] { REQUIRE(owner->process != nullptr); };
+    Tegra::Control::ChannelState channel{0};
+    channel.memory_manager_owner = std::shared_ptr<Tegra::MemoryManager>(
+        new Tegra::MemoryManager(f.system, host1x.MemoryManager(), 32, 1ULL << 31, 16),
+        [owner = first](Tegra::MemoryManager* memory) mutable {
+            delete memory;
+            owner.reset();
+        });
+    channel.memory_manager = channel.memory_manager_owner.get();
+    first.reset();
+    container.CloseSession(first_id);
+    REQUIRE(container.GetSession(first_id) == nullptr);
+    REQUIRE_FALSE(old_owner.expired());
+
+    const auto second_id = container.OpenSession(f.process.get());
+    auto second = container.GetSessionLifetime(second_id);
+    REQUIRE(second_id.id == first_id.id);
+    REQUIRE(second->asid.id != first_asid.id);
+    REQUIRE(f.process->GetReferenceCount() == 3);
+    if (execute_callback) {
+        queued();
+    }
+    queued = {};
+    REQUIRE_FALSE(old_owner.expired());
+    channel.memory_manager_owner.reset();
+    channel.memory_manager = nullptr;
+    REQUIRE(old_owner.expired());
+    REQUIRE(f.process->GetReferenceCount() == 2);
+
+    const auto recycled = host1x.MemoryManager().RegisterProcess(&f.process->GetMemory());
+    REQUIRE(recycled.id == first_asid.id);
+    host1x.MemoryManager().UnregisterProcess(recycled);
+    second.reset();
+    container.CloseSession(second_id);
+    REQUIRE(f.process->GetReferenceCount() == 1);
+}
+
+TEST_CASE("Device mappings can retire after the rasterizer has been detached",
+          "[buffer_ports][deferred_boundaries]") {
+    Fixture f;
+    constexpr DAddr target = 0x80000;
+    f.device.Map(target, 0x10000, 0x1000, f.asid);
+    REQUIRE(f.device.GetPointer<u8>(target) == f.bytes);
+    f.device.BindInterface(nullptr);
+    SCOPE_EXIT { f.device.BindInterface(&f.rasterizer); };
+    f.device.Unmap(target, 0x1000);
+    REQUIRE(f.device.GetPointer<u8>(target) == nullptr);
+}
 
 TEST_CASE("Storage binding cache tracks map changes and descriptor dependencies",
           "[buffer_ports]") {
@@ -934,4 +1316,656 @@ TEST_CASE("A failure on the owner thread reaches the test and leaves the owner u
     bool ran = false;
     owner.Do([&] { ran = VideoCommon::GpuSplit::OwnsScheduler(); });
     CHECK(ran);
+}
+
+TEST_CASE("Deferred CPU store during Finish survives single batch and GC readbacks",
+          "[buffer_ports][deferred_writes]") {
+    using namespace VideoCommon::DeferredWrites;
+    Journal journal{1, 4};
+    Fixture f;
+    f.cache->SetDeferredWriteJournal(&journal);
+    const bool mapped = GENERATE(false, true);
+    const unsigned mode = GENERATE(0u, 1u, 2u);
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000, mapped);
+    std::ranges::fill(Access::Get(*f.cache, id).bytes, 7);
+    Access::Dirty(*f.cache, 0x20000, 0x1000);
+    f.runtime.before_completion = [&] {
+        REQUIRE(f.device.ApplyOpOnMappedMemory(0x20008, 1, [&](u8* pointer, PAddr physical) {
+            Write write;
+            write.physical_address = physical;
+            write.device_address = 0x20008;
+            write.mapping_generation = 1;
+            write.lease_generation = 1;
+            write.size = 1;
+            const auto result = journal.TryPublish(0, write, [&]() noexcept {
+                *pointer = 0;
+                return true;
+            });
+            REQUIRE(result.status == PublishStatus::Published);
+        }));
+    };
+    if (mode == 0) {
+        f.cache->DownloadMemory(0x20000, 0x1000);
+    } else if (mode == 1) {
+        const std::array<std::pair<DAddr, u64>, 1> ranges{{{0x20000, 0x1000}}};
+        Access::Download(*f.cache, ranges);
+    } else {
+        const std::array ids{id};
+        Access::DownloadBuffers(*f.cache, ids);
+    }
+    REQUIRE(f.runtime.finishes == 1);
+    REQUIRE(f.bytes[0x10007] == 7);
+    REQUIRE(f.bytes[0x10008] == 0);
+    REQUIRE(f.bytes[0x10009] == 7);
+    REQUIRE(journal.CaptureCut() == 1);
+    REQUIRE(journal.AppliedThrough() == 0);
+}
+
+TEST_CASE("Async readback preserves CPU history and invalidation by a later GPU write",
+          "[buffer_ports][deferred_writes]") {
+    using namespace VideoCommon::DeferredWrites;
+    Journal journal{1, 4};
+    Fixture f;
+    f.cache->SetDeferredWriteJournal(&journal);
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    auto& buffer = Access::Get(*f.cache, id);
+    std::ranges::fill(buffer.bytes, 7);
+    Access::GpuWrite(*f.cache, id, 0x20000, 0x1000);
+    f.cache->CommitAsyncFlushes();
+    f.runtime.Finish();
+    REQUIRE(f.bytes[0x10007] == 0);
+
+    Write write;
+    write.physical_address = 0x20008;
+    write.device_address = 0x20008;
+    write.mapping_generation = 1;
+    write.lease_generation = 1;
+    write.size = 1;
+    REQUIRE(journal.TryPublish(0, write, [&]() noexcept {
+                f.bytes[0x10008] = 0;
+                return true;
+            }).status == PublishStatus::Published);
+    REQUIRE(journal.DrainThrough(1, [&](const Write&) {
+                buffer.bytes[8] = 0;
+                return true;
+            }) == DrainResult::Complete);
+    REQUIRE_FALSE(journal.RetireThrough(1));
+
+    buffer.bytes[16] = 9;
+    Access::GpuWrite(*f.cache, id, 0x20010, 1);
+    f.cache->PopAsyncFlushes();
+    REQUIRE(f.bytes[0x10007] == 7);
+    REQUIRE(f.bytes[0x10008] == 0);
+    REQUIRE(f.bytes[0x10009] == 7);
+    REQUIRE(f.bytes[0x10010] == 0);
+    REQUIRE(f.cache->IsRegionGpuModified(0x20010, 1));
+    REQUIRE_FALSE(f.cache->IsRegionGpuModified(0x20009, 1));
+    REQUIRE(journal.ReclaimableThrough() == 1);
+    REQUIRE(journal.RetireThrough(1));
+    // A fresh readback must finally deliver the newer GPU byte.
+    f.cache->DownloadMemory(0x20010, 1);
+    REQUIRE(f.bytes[0x10010] == 9);
+}
+
+TEST_CASE("Normalized SEM_EXECUTE acquires suspend the channel until their condition is met",
+          "[buffer_ports][deferred_writes][semaphore_acquire]") {
+    Fixture f;
+    const u32 operation = GENERATE(0u, 2u, 3u, 4u, 5u);
+    const u32 unmet = operation == 4 ? 0x20 : operation == 5 ? 0x10 : 0;
+    const u32 met = operation == 5 ? 0 : 0x10;
+    Tegra::Control::ChannelState channel{0};
+    Tegra::DmaPusher pusher{f.system, *f.memory, channel};
+    pusher.BindRasterizer(&f.rasterizer);
+    auto& waiters = Tegra::Nx2SemaphoreWaiters::Get();
+    SCOPE_EXIT { waiters.Remove(&pusher.puller); };
+    std::memcpy(f.bytes, &unmet, sizeof(unmet));
+    Tegra::Engines::PullerTestAccess::StartAcquire(pusher, operation, 0x10);
+    REQUIRE(pusher.puller.HasPendingAcquire());
+    REQUIRE(pusher.suspensions.load() == 1);
+    REQUIRE_FALSE(pusher.puller.CanResumeAcquire(pusher));
+    REQUIRE(pusher.suspensions.load() == 1);
+    std::memcpy(f.bytes, &met, sizeof(met));
+    REQUIRE(pusher.puller.CanResumeAcquire(pusher));
+    // A poll cannot consume the acquire or its cut; ResumeAcquire does that on the GPU thread.
+    REQUIRE(pusher.puller.HasPendingAcquire());
+    REQUIRE(pusher.suspensions.load() == 1);
+}
+
+namespace {
+VideoCommon::DeferredWrites::Publication PublishListByte(
+    VideoCommon::DeferredWrites::Journal& journal, Fixture& fixture, DAddr device, u8 value) {
+    using namespace VideoCommon::DeferredWrites;
+    Publication result{PublishStatus::InvalidWrite};
+    fixture.device.ApplyOpOnMappedMemory(device, 1, [&](u8* pointer, PAddr physical) {
+        Write write;
+        write.physical_address = physical;
+        write.device_address = device;
+        write.mapping_generation = 1;
+        write.lease_generation = 1;
+        write.size = 1;
+        write.bytes[0] = value;
+        result = journal.TryPublish(0, write, [&]() noexcept {
+            *pointer = value;
+            return true;
+        });
+    });
+    return result;
+}
+} // namespace
+
+TEST_CASE("Command list copies reject CPU publications before application and after history retirement",
+          "[buffer_ports][deferred_writes][deferred_list_copy]") {
+    using namespace VideoCommon::DeferredWrites;
+    Journal journal{1, 8};
+    Fixture f;
+    const bool alias = GENERATE(false, true);
+    f.cache->SetDeferredWriteJournal(&journal);
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    std::ranges::fill(Access::Get(*f.cache, id).bytes, 0x42);
+    Access::QueueListCopy(*f.cache, id, 0x20000);
+    REQUIRE(f.cache->Nx2CopyListPages(1));
+    f.runtime.Finish();
+    std::array<u8, 4> out{};
+    using Read = Cache::Nx2ListRead;
+    REQUIRE(f.cache->Nx2ReadListCopy(0x20008, out, true) == Read::Copied);
+    REQUIRE(out[0] == 0x42);
+    // An unrelated physical page does not invalidate this copy.
+    REQUIRE(PublishListByte(journal, f, 0x30008, 5).status == PublishStatus::Published);
+    REQUIRE(f.cache->Nx2ReadListCopy(0x20008, out, true) == Read::Copied);
+    if (alias) f.device.Map(0x70000, 0x20000, 0x1000, f.asid);
+    SCOPE_EXIT { if (alias) f.device.Unmap(0x70000, 0x1000); };
+    REQUIRE(PublishListByte(journal, f, alias ? 0x70008 : 0x20008, 9).status == PublishStatus::Published);
+    out.fill(0xaa);
+    REQUIRE(journal.AppliedThrough() == 0);
+    REQUIRE(f.cache->Nx2ReadListCopy(0x20008, out, true) == Read::Unknown);
+    REQUIRE(std::ranges::all_of(out, [](u8 byte) { return byte == 0xaa; }));
+    REQUIRE(journal.DrainThrough(journal.CaptureCut(), [&](const Write& write) {
+        if (write.physical_address == 0x20008) Access::Get(*f.cache, id).bytes[8] = write.bytes[0];
+        return true;
+    }) == DrainResult::Complete);
+    REQUIRE(journal.RetireThrough(journal.CaptureCut()));
+    REQUIRE(f.cache->Nx2ReadListCopy(0x20008, out, true) == Read::Unknown);
+    Access::QueueListCopy(*f.cache, id, 0x20000);
+    REQUIRE(f.cache->Nx2CopyListPages(2));
+    f.runtime.Finish();
+    REQUIRE(f.cache->Nx2ReadListCopy(0x20008, out, true) == Read::Copied);
+    REQUIRE(out[0] == 9);
+    REQUIRE(out[1] == 0x42);
+}
+
+TEST_CASE("Command list wait rechecks CPU publications before exposing staging bytes",
+          "[buffer_ports][deferred_writes][deferred_list_copy]") {
+    using namespace VideoCommon::DeferredWrites;
+    Journal journal{1, 4};
+    Fixture f;
+    f.cache->SetDeferredWriteJournal(&journal);
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    std::ranges::fill(Access::Get(*f.cache, id).bytes, 0x42);
+    Access::QueueListCopy(*f.cache, id, 0x20000);
+    REQUIRE(f.cache->Nx2CopyListPages(1));
+    f.runtime.list_copy_ready = false;
+    Publication publication{PublishStatus::Rejected};
+    f.runtime.before_list_wait = [&] {
+        std::jthread writer{[&] { publication = PublishListByte(journal, f, 0x20008, 9); }};
+        writer.join();
+    };
+    std::array<u8, 4> out{0xaa, 0xaa, 0xaa, 0xaa};
+    REQUIRE(f.cache->Nx2ReadListCopy(0x20008, out, true) == Cache::Nx2ListRead::Unknown);
+    REQUIRE(publication.status == PublishStatus::Published);
+    REQUIRE(journal.AppliedThrough() == 0);
+    REQUIRE(f.runtime.finishes == 1);
+    REQUIRE(std::ranges::all_of(out, [](u8 byte) { return byte == 0xaa; }));
+}
+
+TEST_CASE("Command list synced status is invalidated by CPU publication without a GPU write",
+          "[buffer_ports][deferred_writes][deferred_list_copy]") {
+    using namespace VideoCommon::DeferredWrites;
+    Journal journal{1, 4};
+    Fixture f;
+    f.cache->SetDeferredWriteJournal(&journal);
+    const bool draw_written = GENERATE(false, true);
+    if (draw_written) Access::DrawWrite(*f.cache, 0x20000);
+    f.cache->Nx2NoteListSynced(0x20000);
+    std::array<u8, 4> out{};
+    using Read = Cache::Nx2ListRead;
+    REQUIRE(f.cache->Nx2ReadListCopy(0x20008, out, true) == Read::Synced);
+    REQUIRE(PublishListByte(journal, f, 0x20008, 9).status == PublishStatus::Published);
+    REQUIRE(f.cache->Nx2ReadListCopy(0x20008, out, true) == Read::Unknown);
+    REQUIRE(journal.DrainThrough(1, [](const Write&) { return true; }) == DrainResult::Complete);
+    REQUIRE(journal.RetireThrough(1));
+    REQUIRE(f.cache->Nx2ReadListCopy(0x20008, out, true) == Read::Unknown);
+    f.cache->Nx2NoteListSynced(0x20000);
+    REQUIRE(f.cache->Nx2ReadListCopy(0x20008, out, true) == Read::Synced);
+}
+
+TEST_CASE("Command page batch cannot validate synced status over a concurrent CPU publication",
+          "[buffer_ports][deferred_writes][deferred_list_copy]") {
+    using namespace VideoCommon::DeferredWrites;
+    Journal journal{1, 4};
+    Fixture f;
+    f.cache->SetDeferredWriteJournal(&journal);
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000, true);
+    std::ranges::fill(Access::Get(*f.cache, id).bytes, 0x42);
+    Access::Dirty(*f.cache, 0x20000, 0x1000);
+    Access::DrawWrite(*f.cache, 0x20000);
+    f.runtime.before_completion = [&] {
+        REQUIRE(PublishListByte(journal, f, 0x20008, 9).status == PublishStatus::Published);
+    };
+    const std::array<DAddr, 1> pages{0x20000};
+    f.cache->Nx2FlushListPages(pages);
+    std::array<u8, 4> out{};
+    REQUIRE(f.bytes[0x10008] == 9);
+    REQUIRE(f.cache->Nx2ReadListCopy(0x20008, out, true) == Cache::Nx2ListRead::Unknown);
+    REQUIRE(journal.AppliedThrough() == 0);
+    f.runtime.before_completion = {};
+}
+
+TEST_CASE("Command list copy checks the current physical page identity",
+          "[buffer_ports][deferred_writes][deferred_list_copy]") {
+    using namespace VideoCommon::DeferredWrites;
+    Journal journal{1, 4};
+    Fixture f;
+    f.cache->SetDeferredWriteJournal(&journal);
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    std::ranges::fill(Access::Get(*f.cache, id).bytes, 0x42);
+    Access::QueueListCopy(*f.cache, id, 0x20000);
+    REQUIRE(f.cache->Nx2CopyListPages(1));
+    f.runtime.Finish();
+    std::array<u8, 4> out{};
+    REQUIRE(f.cache->Nx2ReadListCopy(0x20008, out, true) == Cache::Nx2ListRead::Copied);
+    f.device.Unmap(0x20000, 0x1000);
+    f.device.Map(0x20000, 0x30000, 0x1000, f.asid);
+    out.fill(0xaa);
+    REQUIRE(f.cache->Nx2ReadListCopy(0x20008, out, true) == Cache::Nx2ListRead::Unknown);
+    REQUIRE(std::ranges::all_of(out, [](u8 byte) { return byte == 0xaa; }));
+}
+
+namespace {
+VideoCommon::DeferredWrites::Publication PublishConsumerByte(
+    VideoCommon::DeferredWrites::Journal& journal, Fixture& fixture,
+    const VideoCommon::DeferredWrites::Journal::Lease& lease, u8 value) {
+    using namespace VideoCommon::DeferredWrites;
+    Publication result{PublishStatus::InvalidWrite};
+    fixture.device.ApplyOpOnMappedMemory(lease.device_page + 8, 1, [&](u8* pointer, PAddr physical) {
+        Write write;
+        write.physical_address = physical;
+        write.device_address = lease.device_page + 8;
+        write.mapping_generation = lease.mapping_generation;
+        write.lease_generation = lease.generation;
+        write.size = 1;
+        write.bytes[0] = value;
+        result = journal.TryPublishLeased(0, write, [&]() noexcept {
+            *pointer = value;
+            return true;
+        });
+    });
+    return result;
+}
+
+void ConnectConsumerJournal(Fixture& fixture, VideoCommon::DeferredWrites::Journal& journal) {
+    fixture.cache->SetDeferredWriteJournal(&journal, [&](VideoCommon::DeferredWrites::Cut cut) {
+        const auto result = journal.DrainThrough(cut, [&](const VideoCommon::DeferredWrites::Write& write) {
+            Access::ApplyExact(*fixture.cache, write);
+            return true;
+        });
+        REQUIRE(result == VideoCommon::DeferredWrites::DrainResult::Complete);
+    });
+}
+} // namespace
+
+TEST_CASE("Deferred sink applies recorded payload without rereading or rewriting newer CPU bytes",
+          "[buffer_ports][deferred_writes][deferred_sink]") {
+    using namespace VideoCommon::DeferredWrites;
+    Journal journal{1, 8};
+    Fixture f;
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    auto& buffer = Access::Get(*f.cache, id);
+    std::ranges::fill(buffer.bytes, 0x42);
+    Access::Dirty(*f.cache, 0x20000, 0x1000);
+    const auto lease = journal.GrantLease(0x20000, 0x20000, 1);
+    REQUIRE(lease);
+    REQUIRE(PublishConsumerByte(journal, f, *lease, 7).sequence == 1);
+    REQUIRE(PublishConsumerByte(journal, f, *lease, 9).sequence == 2);
+    const auto drain = [&](Cut cut) {
+        return journal.DrainThrough(cut, [&](const Write& write) {
+            return f.cache->ApplyDeferredWrite(write);
+        });
+    };
+    REQUIRE(drain(1) == DrainResult::Complete);
+    CHECK(buffer.bytes[8] == 7);
+    CHECK(f.bytes[0x10008] == 9);
+    CHECK(buffer.bytes[7] == 0x42);
+    CHECK(buffer.bytes[9] == 0x42);
+    CHECK(f.runtime.upload_bytes == 1);
+    CHECK(f.runtime.finishes == 0);
+    CHECK_FALSE(Access::CpuDirty(*f.cache, 0x20000, 0x1000));
+    CHECK_FALSE(Access::Pending(*f.cache, 0x20008, 1));
+    CHECK(Access::Pending(*f.cache, 0x20007, 1));
+    REQUIRE(drain(2) == DrainResult::Complete);
+    CHECK(buffer.bytes[8] == 9);
+    CHECK(f.runtime.upload_bytes == 2);
+    CHECK(journal.RetireThrough(2));
+}
+
+TEST_CASE("Deferred sink protects a newer CPU commit from an already copied async readback",
+          "[buffer_ports][deferred_writes][deferred_sink]") {
+    using namespace VideoCommon::DeferredWrites;
+    Journal journal{1, 8};
+    Fixture f;
+    ConnectConsumerJournal(f, journal);
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    auto& buffer = Access::Get(*f.cache, id);
+    std::ranges::fill(buffer.bytes, 0x42);
+    Access::GpuWrite(*f.cache, id, 0x20000, 0x1000);
+    f.cache->CommitAsyncFlushes();
+    f.runtime.Finish();
+    REQUIRE(journal.HasReadbacks());
+    const auto lease = journal.GrantLease(0x20000, 0x20000, 1);
+    REQUIRE(lease);
+    REQUIRE(PublishConsumerByte(journal, f, *lease, 7).sequence == 1);
+    REQUIRE(PublishConsumerByte(journal, f, *lease, 9).sequence == 2);
+    const auto drain = [&](Cut cut) {
+        return journal.DrainThrough(cut, [&](const Write& write) {
+            return f.cache->ApplyDeferredWrite(write);
+        });
+    };
+    REQUIRE(drain(1) == DrainResult::Complete);
+    CHECK_FALSE(journal.RetireThrough(1));
+    f.cache->PopAsyncFlushes();
+    CHECK(f.bytes[0x10007] == 0x42);
+    CHECK(f.bytes[0x10008] == 9);
+    CHECK(f.bytes[0x10009] == 0x42);
+    CHECK(buffer.bytes[8] == 7);
+    REQUIRE(drain(2) == DrainResult::Complete);
+    CHECK(buffer.bytes[8] == 9);
+    CHECK_FALSE(Access::CpuDirty(*f.cache, 0x20000, 0x1000));
+    CHECK(f.runtime.upload_bytes == 2);
+    CHECK(f.runtime.finishes == 1);
+}
+
+TEST_CASE("Deferred zero payload uploads only its exact bytes and does not require remaining GPU dirt",
+          "[buffer_ports][deferred_writes][deferred_sink]") {
+    using namespace VideoCommon::DeferredWrites;
+    Fixture f;
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    auto& buffer = Access::Get(*f.cache, id);
+    std::ranges::fill(buffer.bytes, 0x42);
+    std::memset(f.bytes + 0x10000, 0x33, 0x1000);
+    Write write;
+    write.physical_address = 0x20020;
+    write.device_address = 0x20020;
+    write.mapping_generation = 1;
+    write.lease_generation = 1;
+    write.payload = Payload::Zero;
+    write.size = 128;
+    REQUIRE_FALSE(f.cache->IsRegionGpuModified(0x20000, 0x1000));
+    REQUIRE(f.cache->ApplyDeferredWrite(write));
+    CHECK(buffer.bytes[31] == 0x42);
+    CHECK(buffer.bytes[160] == 0x42);
+    CHECK(std::all_of(buffer.bytes.begin() + 32, buffer.bytes.begin() + 160,
+                      [](u8 byte) { return byte == 0; }));
+    CHECK(f.bytes[0x10020] == 0x33);
+    CHECK(f.runtime.upload_bytes == 128);
+    CHECK(f.runtime.finishes == 0);
+    CHECK_FALSE(Access::CpuDirty(*f.cache, 0x20000, 0x1000));
+}
+
+TEST_CASE("Deferred sink rejects invalid identities and dirty pages before changing buffer state",
+          "[buffer_ports][deferred_writes][deferred_sink]") {
+    using namespace VideoCommon::DeferredWrites;
+    Fixture f;
+    Write write;
+    write.physical_address = 0x20008;
+    write.device_address = 0x20008;
+    write.mapping_generation = 1;
+    write.lease_generation = 1;
+    write.size = 1;
+    write.bytes[0] = 7;
+    CHECK_FALSE(f.cache->ApplyDeferredWrite(write));
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    auto& buffer = Access::Get(*f.cache, id);
+    std::ranges::fill(buffer.bytes, 0x42);
+    Access::Dirty(*f.cache, 0x20000, 0x1000);
+    SECTION("Changed physical identity") {
+        write.physical_address = 0x30008;
+    }
+    SECTION("CPU dirty page cannot trigger a whole-page upload") {
+        Access::MarkCpuDirty(*f.cache, 0x20000, 0x1000);
+    }
+    SECTION("Store crosses its device page") {
+        write.device_address = 0x20fff;
+        write.physical_address = 0x20fff;
+        write.size = 2;
+    }
+    SECTION("Payload exceeds its fixed record") {
+        write.size = 33;
+    }
+    SECTION("Unknown payload") {
+        write.payload = static_cast<Payload>(2);
+    }
+    CHECK_FALSE(f.cache->ApplyDeferredWrite(write));
+    CHECK(f.runtime.uploads == 0);
+    CHECK(f.runtime.upload_bytes == 0);
+    CHECK(f.runtime.finishes == 0);
+    CHECK(buffer.bytes[8] == 0x42);
+    CHECK(Access::Pending(*f.cache, 0x20008, 1));
+}
+
+TEST_CASE("DMA reservation spans nested joins and the scoped guest-memory writeback",
+          "[buffer_ports][deferred_writes][deferred_consumer]") {
+    using namespace VideoCommon::DeferredWrites;
+    Journal journal{1, 8};
+    Fixture f;
+    const u64 size = GENERATE(u64{16}, u64{0x10000});
+    f.memory->Map(0x200000, 0x20000, 0x30000, Tegra::PTEKind::PITCH, true);
+    Tegra::Control::ChannelState state{0};
+    state.memory_manager = &*f.memory;
+    state.payload.emplace(f.system, *f.memory, state);
+    VideoCommon::BufferCacheChannelInfo channel{state};
+    Access::AttachChannel(*f.cache, channel);
+    ConnectConsumerJournal(f, journal);
+    Access::Add(*f.cache, 0x10000, 0x10000);
+    const auto source_id = Access::Add(*f.cache, 0x20000, 0x10000);
+    const auto destination_id = Access::Add(*f.cache, 0x30000, 0x10000);
+    std::ranges::fill(Access::Get(*f.cache, source_id).bytes, 0x42);
+    std::ranges::fill(Access::Get(*f.cache, destination_id).bytes, 0x24);
+    Access::Dirty(*f.cache, 0x20000, 0x1000);
+    const auto source = journal.GrantLease(0x20000, 0x20000, 1);
+    const auto destination = journal.GrantLease(0x30000, 0x30000, 1);
+    const auto unrelated = journal.GrantLease(0x10000, 0x10000, 1);
+    REQUIRE(source);
+    REQUIRE(destination);
+    REQUIRE(unrelated);
+    auto old_readback = journal.BeginReadback();
+    REQUIRE(PublishConsumerByte(journal, f, *source, 7).sequence == 1);
+    REQUIRE(PublishConsumerByte(journal, f, *destination, 3).sequence == 2);
+    unsigned copies{};
+    bool posted_unrelated{};
+    f.runtime.before_gpu_copy = [&](Buffer&, Buffer&) {
+        REQUIRE(journal.AppliedThrough() >= 2);
+        Publication source_race{PublishStatus::Rejected}, destination_race{PublishStatus::Rejected};
+        Publication outside{PublishStatus::Rejected};
+        std::jthread writer{[&] {
+            source_race = PublishConsumerByte(journal, f, *source, 9);
+            destination_race = PublishConsumerByte(journal, f, *destination, 9);
+            if (!posted_unrelated) outside = PublishConsumerByte(journal, f, *unrelated, 5);
+        }};
+        writer.join();
+        REQUIRE(source_race.status == PublishStatus::LeaseUnavailable);
+        REQUIRE(destination_race.status == PublishStatus::LeaseUnavailable);
+        REQUIRE_FALSE(journal.GrantLease(0x20000, 0x20000, 2));
+        REQUIRE_FALSE(journal.GrantLease(0x30000, 0x30000, 2));
+        if (!posted_unrelated) {
+            REQUIRE(outside.status == PublishStatus::Published);
+            posted_unrelated = true;
+        }
+        ++copies;
+    };
+    REQUIRE(f.cache->DMACopy(0x200008, 0x210008, size));
+    REQUIRE(copies >= 1);
+    if (size > 16) REQUIRE(copies > 1); // FindBuffer joined, then DeleteBuffer nested in the scope.
+    REQUIRE(f.bytes[0x20008] == 7); // DeviceGuestMemoryScoped's destructor has run.
+    const auto final_id = Access::Find(*f.cache, 0x30008, 1);
+    const auto& final_buffer = Access::Get(*f.cache, final_id);
+    REQUIRE(final_buffer.bytes[final_buffer.Offset(0x30008)] == 7);
+    REQUIRE_FALSE(journal.RetireThrough(2)); // Consumer completion preserves live readback history.
+    REQUIRE(journal.GrantLease(0x20000, 0x20000, 2));
+    REQUIRE(journal.GrantLease(0x30000, 0x30000, 2));
+    f.runtime.before_gpu_copy = {};
+}
+
+TEST_CASE("DMA clear applies accepted bytes before clearing and excludes a concurrent publisher",
+          "[buffer_ports][deferred_writes][deferred_consumer]") {
+    using namespace VideoCommon::DeferredWrites;
+    Journal journal{1, 4};
+    Fixture f;
+    f.memory->Map(0x200000, 0x20000, 0x10000, Tegra::PTEKind::PITCH, true);
+    Tegra::Control::ChannelState state{0};
+    state.memory_manager = &*f.memory;
+    state.payload.emplace(f.system, *f.memory, state);
+    VideoCommon::BufferCacheChannelInfo channel{state};
+    Access::AttachChannel(*f.cache, channel);
+    ConnectConsumerJournal(f, journal);
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    const auto lease = journal.GrantLease(0x20000, 0x20000, 1);
+    REQUIRE(lease);
+    REQUIRE(PublishConsumerByte(journal, f, *lease, 7).sequence == 1);
+    unsigned clears{};
+    f.runtime.before_clear = [&](Buffer& buffer) {
+        REQUIRE(journal.AppliedThrough() == 1);
+        REQUIRE(buffer.bytes[8] == 7);
+        Publication raced{PublishStatus::Rejected};
+        std::jthread writer{[&] { raced = PublishConsumerByte(journal, f, *lease, 9); }};
+        writer.join();
+        REQUIRE(raced.status == PublishStatus::LeaseUnavailable);
+        REQUIRE_FALSE(journal.GrantLease(0x20000, 0x20000, 2));
+        ++clears;
+    };
+    REQUIRE(f.cache->DMAClear(0x200000, 4, 0x11111111));
+    REQUIRE(clears == 1);
+    REQUIRE(Access::Get(*f.cache, id).bytes[8] == 0x11);
+    REQUIRE(f.bytes[0x10008] == 7); // Clear is GPU-side, not a new CPU store.
+    REQUIRE(journal.GrantLease(0x20000, 0x20000, 2));
+    f.runtime.before_clear = {};
+}
+
+TEST_CASE("Joining buffers closes their full ranges before copying and keeps deletion nested",
+          "[buffer_ports][deferred_writes][deferred_consumer]") {
+    using namespace VideoCommon::DeferredWrites;
+    Journal journal{1, 4};
+    Fixture f;
+    Tegra::Control::ChannelState state{0};
+    state.memory_manager = &*f.memory;
+    state.payload.emplace(f.system, *f.memory, state);
+    VideoCommon::BufferCacheChannelInfo channel{state};
+    Access::AttachChannel(*f.cache, channel);
+    ConnectConsumerJournal(f, journal);
+    const auto left_id = Access::Add(*f.cache, 0x20000, 0x10000);
+    const auto right_id = Access::Add(*f.cache, 0x30000, 0x10000);
+    const auto left = journal.GrantLease(0x20000, 0x20000, 1);
+    const auto right = journal.GrantLease(0x30000, 0x30000, 1);
+    REQUIRE(left);
+    REQUIRE(right);
+    auto old_readback = journal.BeginReadback();
+    REQUIRE(PublishConsumerByte(journal, f, *left, 7).sequence == 1);
+    REQUIRE(PublishConsumerByte(journal, f, *right, 8).sequence == 2);
+    unsigned copies{}, deletions{};
+    f.runtime.before_gpu_copy = [&](Buffer&, Buffer&) {
+        REQUIRE(journal.AppliedThrough() == 2);
+        Publication raced{PublishStatus::Rejected};
+        std::jthread writer{[&] { raced = PublishConsumerByte(journal, f, *right, 9); }};
+        writer.join();
+        REQUIRE(raced.status == PublishStatus::LeaseUnavailable);
+        REQUIRE_FALSE(journal.GrantLease(0x30000, 0x30000, 2));
+        ++copies;
+    };
+    f.runtime.before_delete = [&](Buffer& buffer) {
+        REQUIRE_FALSE(journal.GrantLease(buffer.CpuAddr(), buffer.CpuAddr(), 2));
+        ++deletions;
+    };
+    const auto joined_id = Access::Find(*f.cache, 0x20008, 0x10008);
+    REQUIRE(copies == 2);
+    REQUIRE(deletions == 2);
+    REQUIRE_FALSE(Access::Contains(*f.cache, left_id));
+    REQUIRE_FALSE(Access::Contains(*f.cache, right_id));
+    const auto& joined = Access::Get(*f.cache, joined_id);
+    REQUIRE(joined.bytes[8] == 7);
+    REQUIRE(joined.bytes[0x10008] == 8);
+    REQUIRE_FALSE(journal.RetireThrough(2));
+    REQUIRE(journal.GrantLease(0x20000, 0x20000, 2));
+    REQUIRE(journal.GrantLease(0x30000, 0x30000, 2));
+    f.runtime.before_gpu_copy = {};
+    f.runtime.before_delete = {};
+}
+
+TEST_CASE("Standalone buffer deletion drains its lease before invalidation without retiring history",
+          "[buffer_ports][deferred_writes][deferred_consumer]") {
+    using namespace VideoCommon::DeferredWrites;
+    Journal journal{1, 4};
+    Fixture f;
+    Tegra::Control::ChannelState state{0};
+    state.memory_manager = &*f.memory;
+    state.payload.emplace(f.system, *f.memory, state);
+    VideoCommon::BufferCacheChannelInfo channel{state};
+    Access::AttachChannel(*f.cache, channel);
+    ConnectConsumerJournal(f, journal);
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    const auto lease = journal.GrantLease(0x20000, 0x20000, 1);
+    REQUIRE(lease);
+    auto old_readback = journal.BeginReadback();
+    REQUIRE(PublishConsumerByte(journal, f, *lease, 7).sequence == 1);
+    bool observed{};
+    f.runtime.before_delete = [&](Buffer& buffer) {
+        REQUIRE(journal.AppliedThrough() == 1);
+        REQUIRE(buffer.bytes[8] == 7);
+        Publication raced{PublishStatus::Rejected};
+        std::jthread writer{[&] { raced = PublishConsumerByte(journal, f, *lease, 9); }};
+        writer.join();
+        REQUIRE(raced.status == PublishStatus::LeaseUnavailable);
+        REQUIRE_FALSE(journal.GrantLease(0x20000, 0x20000, 2));
+        observed = true;
+    };
+    Access::Delete(*f.cache, id);
+    REQUIRE(observed);
+    REQUIRE_FALSE(Access::Contains(*f.cache, id));
+    REQUIRE_FALSE(journal.RetireThrough(1));
+    REQUIRE(journal.GrantLease(0x20000, 0x20000, 2));
+    f.runtime.before_delete = {};
+}
+
+TEST_CASE("A real pending async readback survives a buffer join without overwriting newer CPU or GPU bytes",
+          "[buffer_ports][deferred_writes][deferred_consumer]") {
+    using namespace VideoCommon::DeferredWrites;
+    Journal journal{1, 4};
+    Fixture f;
+    Tegra::Control::ChannelState state{0};
+    state.memory_manager = &*f.memory;
+    state.payload.emplace(f.system, *f.memory, state);
+    VideoCommon::BufferCacheChannelInfo channel{state};
+    Access::AttachChannel(*f.cache, channel);
+    ConnectConsumerJournal(f, journal);
+    const auto old_id = Access::Add(*f.cache, 0x20000, 0x10000);
+    std::ranges::fill(Access::Get(*f.cache, old_id).bytes, 7);
+    Access::GpuWrite(*f.cache, old_id, 0x20000, 0x1000);
+    f.cache->CommitAsyncFlushes();
+    f.runtime.Finish(); // Copy completed, but its staging-to-backing readback is still pending.
+    REQUIRE(f.bytes[0x10007] == 0);
+    const auto lease = journal.GrantLease(0x20000, 0x20000, 1);
+    REQUIRE(lease);
+    REQUIRE(PublishConsumerByte(journal, f, *lease, 9).sequence == 1);
+    const auto joined_id = Access::Find(*f.cache, 0x20008, 0x10008);
+    REQUIRE_FALSE(Access::Contains(*f.cache, old_id));
+    REQUIRE(journal.AppliedThrough() == 1);
+    REQUIRE_FALSE(journal.RetireThrough(1));
+    auto& joined = Access::Get(*f.cache, joined_id);
+    REQUIRE(joined.bytes[8] == 9);
+    joined.bytes[16] = 11;
+    Access::GpuWrite(*f.cache, joined_id, 0x20010, 1);
+    f.cache->PopAsyncFlushes();
+    REQUIRE(f.bytes[0x10007] == 7);
+    REQUIRE(f.bytes[0x10008] == 9);
+    REQUIRE(f.bytes[0x10009] == 7);
+    REQUIRE(f.bytes[0x10010] == 0);
+    REQUIRE(f.cache->IsRegionGpuModified(0x20010, 1));
+    REQUIRE(journal.RetireThrough(1));
 }

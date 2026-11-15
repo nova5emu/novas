@@ -12,8 +12,10 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/common_types.h"
+#include "common/gpu_transition_profile.h"
 #include "common/logging.h"
 #include "core/core.h"
+#include "core/deferred_transition.h"
 #include "core/hle/service/nvdrv/core/container.h"
 #include "core/hle/service/nvdrv/core/heap_mapper.h"
 #include "core/hle/service/nvdrv/core/nvmap.h"
@@ -29,6 +31,8 @@
 #include "video_core/rasterizer_interface.h"
 
 namespace Service::Nvidia::Devices {
+
+namespace TransitionProfile = Common::GpuTransitionProfile;
 
 nvhost_as_gpu::nvhost_as_gpu(Core::System& system_, Module& module_, NvCore::Container& core)
     : nvdevice{system_}, module{module_}, container{core}, nvmap{core.GetNvMapFile()}, vm{},
@@ -47,6 +51,12 @@ nvhost_as_gpu::~nvhost_as_gpu() {
 
 NvResult nvhost_as_gpu::Ioctl1(DeviceFD fd, Ioctl command, std::span<const u8> input,
                                std::span<u8> output) {
+    std::optional<Core::DeferredTransitionScope> transition;
+    if (command.group == 'A' &&
+        (command.cmd == 2 || command.cmd == 3 || command.cmd == 5 || command.cmd == 6 ||
+         command.cmd == 9 || command.cmd == 0x14)) {
+        transition.emplace(system, Common::GpuTransitionProfile::SuspensionSite::Nvdrv);
+    }
     switch (command.group) {
     case 'A':
         switch (command.cmd) {
@@ -75,8 +85,8 @@ NvResult nvhost_as_gpu::Ioctl1(DeviceFD fd, Ioctl command, std::span<const u8> i
                     [this](u64 gpu_address, u64 size, bool create) {
                         Nx2Sparse(gpu_address, size, create);
                     },
-                    [this](u64 gpu_address, u64 cpu_address, u64 size) {
-                        Nx2BackSparse(gpu_address, cpu_address, size);
+                    [this](u64 gpu_address, std::span<const Core::DeviceMemoryPhysicalSpan> spans) {
+                        Nx2BackSparsePhysical(gpu_address, spans);
                     },
                     [this](u64 gpu_address, u64 cpu_address, u64 size) {
                         Nx2SparseTile(gpu_address, cpu_address, size);
@@ -129,12 +139,13 @@ NvResult nvhost_as_gpu::Ioctl3(DeviceFD fd, Ioctl command, std::span<const u8> i
 }
 
 void nvhost_as_gpu::OnOpen(NvCore::SessionId session_id, DeviceFD fd) {
-    nx2_session = session_id;
+    nx2_lifetime = container.GetSessionLifetime(session_id);
 }
 
 void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
+    auto transition = Core::DeferredTransitionScope::RequireReady(system);
     std::scoped_lock lock(mutex);
-    auto* session = container.GetSession(nx2_session);
+    const auto& session = nx2_lifetime;
     if (!gmmu || session == nullptr) {
         LOG_ERROR(Service_NVDRV, "Switch 2 GPU mapping {:#x}+{:#x}: no address space or session",
                   gpu_address, size);
@@ -145,13 +156,15 @@ void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
     Nx2DeviceRange range{};
     if (const auto it = nx2_device_ranges.find({cpu_address, size}); it != nx2_device_ranges.end()) {
         range = it->second;
-    } else if (session->has_preallocated_area && session->mapper->IsInBounds(cpu_address, size)) {
+        TransitionProfile::RecordRange(TransitionProfile::Site::NvAsMapReuse, size);
+    } else if (session->mapper && session->mapper->IsInBounds(cpu_address, size)) {
         range = {session->mapper->Map(cpu_address, size), true};
     } else {
         const auto allocate = [&]() -> u64 {
             auto& smmu = system.Host1x().MemoryManager();
             const DAddr address = smmu.Allocate(Common::AlignUp(size, 0x20000));
             if (address != 0) {
+                session->TrackDeviceRange(address, size, Common::AlignUp(size, 0x20000));
                 smmu.Map(address, cpu_address, size, session->asid, true);
             }
             return address;
@@ -176,25 +189,33 @@ void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
     Nx2GpuMemoryRegistry::Get().RecordDeviceRange(cpu_address, size, device_address);
     // On the GPU thread, like unmaps: a GMMU map takes the texture cache lock, and the callers hold
     // nx2:gpu locks that the GPU thread takes under that lock (sparse blocks backed on write).
+    TransitionProfile::RecordRange(TransitionProfile::Site::NvAsMapQueued, size);
     system.GPU().MapInOrder(
-        gpu_address, size, [gmmu = gmmu.get(), gpu_address, device_address, size] {
+        gpu_address, size, [gmmu = gmmu, gpu_address, device_address, size] {
+            TransitionProfile::RecordRange(TransitionProfile::Site::NvAsMapExecuted, size);
             gmmu->Map(gpu_address, device_address, size, Tegra::PTEKind::PITCH, false);
-        });
+        }, std::move(transition));
     LOG_DEBUG(Service_NVDRV, "Switch 2 GPU mapping {:#x}+{:#x} -> CPU {:#x}", gpu_address, size,
               cpu_address);
 }
 
 void nvhost_as_gpu::Nx2Unmap(u64 gpu_address, u64 size) {
+    auto transition = Core::DeferredTransitionScope::RequireReady(system);
     std::scoped_lock lock(mutex);
     if (!gmmu) {
         return;
     }
     // The GPU thread may still be running command lists that use the range.
-    system.GPU().RunInOrder([gmmu = gmmu.get(), gpu_address, size] { gmmu->Unmap(gpu_address, size); });
+    TransitionProfile::RecordRange(TransitionProfile::Site::NvAsUnmapQueued, size);
+    system.GPU().RunInOrder([gmmu = gmmu, gpu_address, size] {
+        TransitionProfile::RecordRange(TransitionProfile::Site::NvAsUnmapExecuted, size);
+        gmmu->Unmap(gpu_address, size);
+    }, std::move(transition));
     LOG_DEBUG(Service_NVDRV, "Switch 2 GPU unmapping {:#x}+{:#x}", gpu_address, size);
 }
 
 void nvhost_as_gpu::Nx2Release(u64 cpu_address, u64 size) {
+    auto transition = Core::DeferredTransitionScope::RequireReady(system);
     std::scoped_lock lock(mutex);
     const auto it = nx2_device_ranges.find({cpu_address, size});
     if (it == nx2_device_ranges.end()) {
@@ -206,24 +227,24 @@ void nvhost_as_gpu::Nx2Release(u64 cpu_address, u64 size) {
         !Nx2GpuMemoryRegistry::Get().ReleaseDeviceRange(range.asid, cpu_address, size)) {
         return; // another address space of the process still maps it
     }
-    auto* session = container.GetSession(nx2_session);
-    auto* const mapper = range.heap && session != nullptr ? session->mapper.get() : nullptr;
-    auto& smmu = system.Host1x().MemoryManager();
     // Queued after the GPU unmaps of the range, so the GPU thread is done with it.
-    system.GPU().RunInOrder([&smmu, mapper, range, cpu_address, size] {
+    TransitionProfile::RecordRange(TransitionProfile::Site::NvAsReleaseQueued, size);
+    system.GPU().RunInOrder([lifetime = nx2_lifetime, range, cpu_address, size] {
         if (range.heap) {
-            if (mapper != nullptr) {
-                mapper->Unmap(cpu_address, size);
+            if (lifetime && lifetime->mapper) {
+                TransitionProfile::RecordRange(TransitionProfile::Site::NvAsReleaseExecuted, size);
+                lifetime->mapper->Unmap(cpu_address, size);
             }
             return;
         }
-        smmu.Unmap(range.address, size);
-        smmu.Free(range.address, Common::AlignUp(size, 0x20000));
-    });
+        TransitionProfile::RecordRange(TransitionProfile::Site::NvAsReleaseExecuted, size);
+        lifetime->FreeDeviceRange(range.address);
+    }, std::move(transition));
     LOG_DEBUG(Service_NVDRV, "Switch 2 released backing {:#x}+{:#x}", cpu_address, size);
 }
 
 void nvhost_as_gpu::Nx2Sparse(u64 gpu_address, u64 size, bool create) {
+    auto transition = Core::DeferredTransitionScope::RequireReady(system);
     std::scoped_lock lock(mutex);
     if (!gmmu) {
         return;
@@ -238,12 +259,13 @@ void nvhost_as_gpu::Nx2Sparse(u64 gpu_address, u64 size, bool create) {
         const DAddr device_address = it->second.second;
         nx2_sparse_ranges.erase(it);
         // After the command lists that may still use it.
-        system.GPU().RunInOrder([gmmu = gmmu.get(), &smmu, gpu_address, size, device_address,
-                                 device_size] {
+        TransitionProfile::RecordRange(TransitionProfile::Site::NvSparseDestroyQueued, size);
+        system.GPU().RunInOrder([gmmu = gmmu, lifetime = nx2_lifetime, gpu_address, size,
+                                 device_address] {
+            TransitionProfile::RecordRange(TransitionProfile::Site::NvSparseDestroyExecuted, size);
             gmmu->Unmap(gpu_address, size);
-            smmu.Unmap(device_address, size);
-            smmu.Free(device_address, device_size);
-        });
+            lifetime->FreeDeviceRange(device_address);
+        }, std::move(transition));
         return;
     }
     const DAddr device_address = smmu.Allocate(device_size);
@@ -252,37 +274,64 @@ void nvhost_as_gpu::Nx2Sparse(u64 gpu_address, u64 size, bool create) {
                      gpu_address, size);
         return;
     }
+    nx2_lifetime->TrackDeviceRange(device_address, size, device_size);
     nx2_sparse_ranges[gpu_address] = {size, device_address};
     // On the GPU thread, as in Nx2Map.
+    TransitionProfile::RecordRange(TransitionProfile::Site::NvSparseCreateQueued, size);
     system.GPU().MapInOrder(
-        gpu_address, size, [gmmu = gmmu.get(), gpu_address, device_address, size] {
+        gpu_address, size, [gmmu = gmmu, gpu_address, device_address, size] {
+            TransitionProfile::RecordRange(TransitionProfile::Site::NvSparseCreateExecuted, size);
             gmmu->Map(gpu_address, device_address, size, Tegra::PTEKind::PITCH, false);
-        });
+        }, std::move(transition));
     LOG_DEBUG(Service_NVDRV, "Switch 2 sparse region {:#x}+{:#x} -> device {:#x}", gpu_address,
               size, device_address);
 }
 
-void nvhost_as_gpu::Nx2BackSparse(u64 gpu_address, u64 cpu_address, u64 size) {
+void nvhost_as_gpu::Nx2BackSparsePhysical(
+    u64 gpu_address, std::span<const Core::DeviceMemoryPhysicalSpan> spans) {
+    const auto transition = Core::DeferredTransitionScope::Current(system);
+    const auto fresh = Core::FreshDeferredIdentityScope::Current(system);
     std::scoped_lock lock(mutex);
     auto it = nx2_sparse_ranges.upper_bound(gpu_address);
-    auto* session = container.GetSession(nx2_session);
+    const auto& session = nx2_lifetime;
     if (it == nx2_sparse_ranges.begin() || session == nullptr) {
         return;
     }
     --it;
     const auto& [start, range] = *it;
     const auto& [region_size, device_address] = range;
+    u64 size = 0;
+    for (const auto& span : spans) {
+        ASSERT_MSG(span.size <= region_size - size, "Sparse physical backing exceeds its region");
+        size += span.size;
+    }
     if (size > region_size || gpu_address - start > region_size - size) {
         return;
     }
-    system.Host1x().MemoryManager().Map(device_address + (gpu_address - start), cpu_address, size,
-                                        session->asid, true);
+    TransitionProfile::RecordRange(TransitionProfile::Site::NvSparseBackMapped, size);
+    auto& smmu = system.Host1x().MemoryManager();
+    const DAddr target = device_address + (gpu_address - start);
+    if (!fresh || transition) {
+        [[maybe_unused]] const auto ready = Core::DeferredTransitionScope::RequireReady(system);
+    }
+    const bool mapped = smmu.TryMapPhysicalUnbacked(target, spans, [&] {
+        if (fresh && !transition) {
+            using namespace VideoCommon::DeferredWrites;
+            const std::array ranges{TransitionRange{TransitionSpace::Device, target, size}};
+            return fresh->TryExtend(ranges);
+        }
+        return true;
+    });
+    if (!mapped) {
+        UNREACHABLE_MSG("Sparse physical backing cannot replace a live mapping or deferred identity");
+    }
 }
 
 void nvhost_as_gpu::Nx2SparseTile(u64 gpu_address, u64 cpu_address, u64 size) {
+    auto transition = Core::DeferredTransitionScope::RequireReady(system);
     std::scoped_lock lock(mutex);
     auto it = nx2_sparse_ranges.upper_bound(gpu_address);
-    auto* session = container.GetSession(nx2_session);
+    const auto& session = nx2_lifetime;
     if (it == nx2_sparse_ranges.begin() || session == nullptr) {
         return;
     }
@@ -297,13 +346,15 @@ void nvhost_as_gpu::Nx2SparseTile(u64 gpu_address, u64 cpu_address, u64 size) {
     // whose contents are now what the game's memory holds there.
     const DAddr device = device_address + (gpu_address - start);
     auto& smmu = system.Host1x().MemoryManager();
+    TransitionProfile::RecordRange(TransitionProfile::Site::NvSparseTileQueued, size);
     system.GPU().MapInOrder(
-        gpu_address, size, [&smmu, device, cpu_address, size, asid = session->asid] {
+        gpu_address, size, [&smmu, device, cpu_address, size, lifetime = session] {
+            TransitionProfile::RecordRange(TransitionProfile::Site::NvSparseTileExecuted, size);
             smmu.Unmap(device, size);
             if (cpu_address != 0) {
-                smmu.Map(device, cpu_address, size, asid, true);
+                smmu.Map(device, cpu_address, size, lifetime->asid, true);
             }
-        });
+        }, std::move(transition));
 }
 
 void nvhost_as_gpu::OnClose(DeviceFD fd) {}
@@ -386,7 +437,13 @@ NvResult nvhost_as_gpu::AllocAsEx(IoctlAllocAsEx& params) {
         vm.big_page_size_bits)};
     vm.big_page_allocator.emplace(start_big_pages, end_big_pages);
 
-    gmmu = std::make_unique<Tegra::MemoryManager>(system, max_big_page_bits, vm.va_range_split, vm.big_page_size_bits, VM::PAGE_SIZE_BITS);
+    gmmu = std::shared_ptr<Tegra::MemoryManager>(
+        new Tegra::MemoryManager(system, max_big_page_bits, vm.va_range_split,
+                                 vm.big_page_size_bits, VM::PAGE_SIZE_BITS),
+        [lifetime = nx2_lifetime](Tegra::MemoryManager* memory) mutable {
+            delete memory;
+            lifetime.reset();
+        });
     system.GPU().InitAddressSpace(*gmmu);
     vm.initialised = true;
 
@@ -663,6 +720,7 @@ NvResult nvhost_as_gpu::BindChannel(IoctlBindChannel& params) {
     LOG_DEBUG(Service_NVDRV, "called, fd={:X}", params.fd);
 
     auto gpu_channel_device = module.GetDevice<nvhost_gpu>(params.fd);
+    gpu_channel_device->channel_state->memory_manager_owner = gmmu;
     gpu_channel_device->channel_state->memory_manager = gmmu.get();
     return NvResult::Success;
 }

@@ -591,12 +591,16 @@ public:
 
     Result MapManualLoadModuleMemory(Out<u64> out_load_address, ClientProcessId client_pid,
                                      u64 nro_address, u64 nro_size, u64 bss_address, u64 bss_size) {
+        const auto deferred_transition = system.BeginDeferredTransition(
+            Common::GpuTransitionProfile::SuspensionSite::Ro);
         R_TRY(m_ro->ValidateProcess(m_context_id, *client_pid));
         R_RETURN(m_ro->MapManualLoadModuleMemory(system.Kernel(), out_load_address.Get(), m_context_id, nro_address,
                                                  nro_size, bss_address, bss_size));
     }
 
     Result UnmapManualLoadModuleMemory(ClientProcessId client_pid, u64 nro_address) {
+        const auto deferred_transition = system.BeginDeferredTransition(
+            Common::GpuTransitionProfile::SuspensionSite::Ro);
         R_TRY(m_ro->ValidateProcess(m_context_id, *client_pid));
         R_RETURN(m_ro->UnmapManualLoadModuleMemory(m_context_id, nro_address));
     }

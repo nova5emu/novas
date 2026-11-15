@@ -63,7 +63,8 @@ public:
     void SyncOperation(std::function<void()>&& func) override;
     void SignalSyncPoint(u32 value) override;
     void SignalReference() override;
-    void ReleaseFences(bool force) override;
+    void ReleaseFences(
+        bool force, std::source_location caller = std::source_location::current()) override;
     void FlushAndInvalidateRegion(
         DAddr addr, u64 size, VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     void WaitForIdle() override;

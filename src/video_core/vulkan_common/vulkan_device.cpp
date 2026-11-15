@@ -9,6 +9,7 @@
 #include <bitset>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -787,6 +788,11 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
                                VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
     }
 
+    const bool amd_markers = HangTrace::Enabled() &&
+        supported_extensions.contains(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
+    if (amd_markers) {
+        loaded_extensions.insert(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
+    }
     logical = vk::Device::Create(physical, queue_cis, ExtensionListForVulkan(loaded_extensions), first_next, dld);
 
     graphics_queue = logical.GetQueue(graphics_family);
@@ -846,6 +852,51 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
 
     vk::Check(vmaCreateAllocator(&allocator_info, &allocator));
 
+    if (amd_markers) {
+        const auto write_marker = reinterpret_cast<PFN_vkCmdWriteBufferMarkerAMD>(
+            dld.vkGetDeviceProcAddr(*logical, "vkCmdWriteBufferMarkerAMD"));
+        if (write_marker) {
+            auto markers = std::make_unique<HangTrace::GpuMarkers>();
+            const VkBufferCreateInfo ci{
+                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                .size = HangTrace::GpuMarkers::BufferSize,
+                .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            };
+            const VmaAllocationCreateInfo ai{
+                .flags = VMA_ALLOCATION_CREATE_MAPPED_BIT |
+                         VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+                .usage = VMA_MEMORY_USAGE_AUTO,
+                .requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            };
+            VmaAllocationInfo info{};
+            const auto result = vmaCreateBuffer(allocator, &ci, &ai, &markers->buffer,
+                                                &hang_marker_allocation, &info);
+            if (result == VK_SUCCESS) {
+                std::memset(info.pMappedData, 0, HangTrace::GpuMarkers::BufferSize);
+                markers->mapped = static_cast<const u32*>(info.pMappedData);
+                markers->write = write_marker;
+                hang_markers = std::move(markers);
+                dld.hang_markers = hang_markers.get();
+                {
+                    std::scoped_lock lock{HangTrace::marker_registry_mutex};
+                    HangTrace::marker_registry.push_back(hang_markers.get());
+                }
+                HangTrace::dump_gpu_markers.store(HangTrace::DumpGpuMarkers,
+                                                  std::memory_order_release);
+                LOG_INFO(Render_Vulkan, "HANG AMD buffer markers enabled: {} slots, {} bytes, TOP/BOTTOM",
+                         HangTrace::GpuMarkers::SlotCount, HangTrace::GpuMarkers::BufferSize);
+            } else {
+                LOG_WARNING(Render_Vulkan, "HANG AMD marker allocation failed: {}", static_cast<int>(result));
+            }
+        } else {
+            LOG_WARNING(Render_Vulkan, "HANG AMD marker entry point unavailable");
+        }
+    } else if (HangTrace::Enabled()) {
+        LOG_INFO(Render_Vulkan, "HANG AMD buffer markers unavailable: extension not advertised");
+    }
+
     owns_static_pipeline_cache = surface != VkSurfaceKHR{};
     LoadStaticPipelineCache();
 
@@ -885,6 +936,13 @@ std::string Device::DescribeMemoryUse() const {
 }
 
 Device::~Device() {
+    if (hang_markers) {
+        std::scoped_lock lock{HangTrace::marker_registry_mutex};
+        std::erase(HangTrace::marker_registry, hang_markers.get());
+        dld.hang_markers = nullptr;
+        vmaDestroyBuffer(allocator, hang_markers->buffer, hang_marker_allocation);
+        hang_markers.reset();
+    }
     const Device* self = this;
     g_presenting_device.compare_exchange_strong(self, nullptr, std::memory_order_acq_rel);
 #ifdef EGLANTINE_STREAMLINE

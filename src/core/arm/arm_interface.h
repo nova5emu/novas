@@ -59,6 +59,11 @@ public:
     // Runs the CPU until an event happens.
     virtual HaltReason RunThread(Kernel::KThread* thread) = 0;
 
+#ifdef HAS_NCE
+    // Called after the physical core releases its native context and interrupt handshake.
+    virtual void CompleteHostOperations(Kernel::KThread*) {}
+#endif
+
     // Runs the CPU for one instruction or until an event happens.
     virtual HaltReason StepThread(Kernel::KThread* thread) = 0;
 

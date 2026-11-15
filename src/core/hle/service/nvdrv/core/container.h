@@ -8,7 +8,9 @@
 #pragma once
 
 #include <deque>
+#include <map>
 #include <memory>
+#include <mutex>
 #include "common/container/unordered_map.h"
 
 #include "core/device_memory_manager.h"
@@ -30,12 +32,37 @@ class SyncpointManager;
 
 struct ContainerImpl;
 
+// Kept by queued mappings and channels after the session id can be reused.
+struct SessionLifetime {
+    SessionLifetime(Tegra::Host1x::Host1x& host1x_, Kernel::KProcess* process_, Core::Asid asid_);
+    ~SessionLifetime();
+
+    SessionLifetime(const SessionLifetime&) = delete;
+    SessionLifetime& operator=(const SessionLifetime&) = delete;
+
+    void TrackDeviceRange(DAddr address, size_t size, size_t allocation_size);
+    void FreeDeviceRange(DAddr address);
+
+    Tegra::Host1x::Host1x& host1x;
+    Kernel::KProcess* process;
+    Core::Asid asid;
+    std::shared_ptr<HeapMapper> mapper;
+
+private:
+    struct DeviceRange {
+        size_t size;
+        size_t allocation_size;
+    };
+    std::mutex ranges_mutex;
+    std::map<DAddr, DeviceRange> device_ranges;
+};
+
 struct SessionId {
     size_t id;
 };
 
 struct Session {
-    Session(SessionId id_, Kernel::KProcess* process_, Core::Asid asid_);
+    Session(SessionId id_, std::shared_ptr<SessionLifetime> lifetime_);
     ~Session();
 
     Session(const Session&) = delete;
@@ -47,9 +74,10 @@ struct Session {
     Kernel::KProcess* process;
     Core::Asid asid;
     bool has_preallocated_area{};
-    std::unique_ptr<HeapMapper> mapper{};
+    std::shared_ptr<HeapMapper> mapper{};
     bool is_active{};
     s32 ref_count{};
+    std::shared_ptr<SessionLifetime> lifetime;
 };
 
 class Container {
@@ -61,6 +89,7 @@ public:
     void CloseSession(SessionId id);
 
     Session* GetSession(SessionId id);
+    std::shared_ptr<SessionLifetime> GetSessionLifetime(SessionId id);
 
     NvMap& GetNvMapFile();
 

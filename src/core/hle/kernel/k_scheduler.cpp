@@ -199,6 +199,9 @@ u64 KScheduler::UpdateHighestPriorityThread(KernelCore& kernel, KThread* highest
         }
 
         m_state.highest_priority_thread = highest_thread;
+        if (highest_thread != nullptr) {
+            highest_thread->ProfileHandoffChosen(m_core_id);
+        }
         m_state.needs_scheduling = true;
         return (1ULL << m_core_id);
     } else {
@@ -341,6 +344,11 @@ void KScheduler::SwitchThread(KernelCore& kernel, KThread* next_thread) {
         return;
     }
 
+    if (Common::GuestThreadProfile::Enabled()) {
+        cur_thread->ProfileSwitch(kernel, false, m_core_id);
+        next_thread->ProfileSwitch(kernel, true, m_core_id);
+    }
+
     // Next thread is now known not to be nullptr, and must not be dispatchable.
     ASSERT(next_thread->GetDisableDispatchCount() == 1);
     ASSERT(!next_thread->IsDummyThread());
@@ -389,6 +397,10 @@ void KScheduler::ScheduleImpl(KernelCore& kernel) {
     // Load the appropriate thread pointers for scheduling.
     KThread* const cur_thread{GetCurrentThreadPointer(kernel)};
     KThread* highest_priority_thread{m_state.highest_priority_thread};
+
+    if (highest_priority_thread != nullptr && !m_state.interrupt_task_runnable) {
+        highest_priority_thread->ProfileHandoffService(m_core_id);
+    }
 
     // Check whether there are runnable interrupt tasks.
     if (m_state.interrupt_task_runnable) {
@@ -554,6 +566,7 @@ void KScheduler::OnThreadStateChanged(KernelCore& kernel, KThread* thread, Threa
 
 void KScheduler::OnThreadPriorityChanged(KernelCore& kernel, KThread* thread, s32 old_priority) {
     ASSERT(IsSchedulerLockedByCurrentThread(kernel));
+    thread->ProfileHandoffMetadata();
 
     // If the thread is runnable, we want to change its priority in the queue.
     if (thread->GetRawState() == ThreadState::Runnable) {
@@ -567,6 +580,7 @@ void KScheduler::OnThreadPriorityChanged(KernelCore& kernel, KThread* thread, s3
 void KScheduler::OnThreadAffinityMaskChanged(KernelCore& kernel, KThread* thread,
                                              const KAffinityMask& old_affinity, s32 old_core) {
     ASSERT(IsSchedulerLockedByCurrentThread(kernel));
+    thread->ProfileHandoffMetadata();
 
     // If the thread is runnable, we want to change its affinity in the queue.
     if (thread->GetRawState() == ThreadState::Runnable) {

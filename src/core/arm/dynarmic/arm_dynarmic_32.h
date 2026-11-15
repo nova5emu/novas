@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <memory>
 #include <dynarmic/interface/A32/a32.h>
 #include <dynarmic/interface/code_page.h>
 
@@ -14,6 +15,10 @@
 
 namespace Core::Memory {
 class Memory;
+}
+
+namespace Common::GpuTransitionProfile {
+struct ExclusiveInlineCounter;
 }
 
 namespace Kernel {
@@ -36,6 +41,7 @@ public:
         last_code_addr = u64(-1); //reset back, force refetch
     }
     void MemoryWrite(Dynarmic::A32::VAddr vaddr, u64 value, size_t size) override;
+    void MemoryPrepareExclusive(u32 vaddr, size_t size) override;
     bool MemoryWriteExclusive8(u32 vaddr, u8 value, u8 expected) override;
     bool MemoryWriteExclusive16(u32 vaddr, u16 value, u16 expected) override;
     bool MemoryWriteExclusive32(u32 vaddr, u32 value, u32 expected) override;
@@ -51,6 +57,7 @@ public:
     u64 last_code_addr = u64(-1);
     ArmDynarmic32& m_parent;
     Core::Memory::Memory& m_memory;
+    std::shared_ptr<Common::GpuTransitionProfile::ExclusiveInlineCounter> m_exclusive_inline_counter;
     Kernel::KProcess* m_process{};
     const bool m_debugger_enabled{};
     const bool m_check_memory_access{};

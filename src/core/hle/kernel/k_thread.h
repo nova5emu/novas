@@ -15,6 +15,8 @@
 #include <utility>
 #include <vector>
 
+#include "common/guest_thread_profile.h"
+#include "common/guest_handoff_profile.h"
 #include "common/intrusive_list.h"
 
 #include "common/intrusive_red_black_tree.h"
@@ -580,6 +582,27 @@ public:
 
     void SetWaitReasonForDebugging(ThreadWaitReasonForDebugging reason) {
         m_wait_reason_for_debugging = reason;
+        if (Common::GuestThreadProfile::Enabled() && reason != ThreadWaitReasonForDebugging::None) {
+            ProfileWaitReason(reason);
+        }
+    }
+
+    void ProfileSwitch(KernelCore& kernel, bool scheduled, s32 core);
+    void ProfileWait(const char* reason, u64 object = 0, u64 detail = 0, u64 target = 0);
+    void ProfileWake(const KThread& waiter, u64 object,
+                     Common::GuestHandoffProfile::WakeKind kind =
+                         Common::GuestHandoffProfile::WakeKind::Arbiter);
+    void ProfileHandoffChosen(s32 core);
+    void ProfileHandoffMetadata();
+    void ProfileHandoffService(s32 core);
+    void ProfileHandoffNceRun(size_t core);
+    bool ProfileHandoffPending() const;
+    void ProfileHandoffCancel();
+    void ProfileHandoffEnter(size_t core, u64 entry_ns = 0, u64 entry_frame = ~u64{0});
+    void SetProfileSvcId(u32 svc) {
+        if (Common::GuestThreadProfile::Enabled()) {
+            m_profile_svc_id.store(static_cast<u8>(svc), std::memory_order_relaxed);
+        }
     }
 
     ThreadWaitReasonForDebugging GetWaitReasonForDebugging() const {
@@ -685,6 +708,7 @@ public:
         std::atomic<u32> lock{1};
         bool is_running{};
         u32 magic{Common::MakeMagic('Y', 'U', 'Z', 'U')};
+        std::atomic<u64> handoff_entry_ns{}, handoff_entry_frame{};
     };
 
     NativeExecutionParameters& GetNativeExecutionParameters() {
@@ -752,6 +776,10 @@ private:
                                    KProcessAddress user_stack_top, s32 prio, s32 core,
                                    KProcess* owner, ThreadType type,
                                    std::function<void()>&& init_func);
+
+    Common::GuestThreadProfile::ThreadInfo ProfileThreadInfo() const;
+    void ProfileWaitReason(ThreadWaitReasonForDebugging reason);
+    void ProfileCurrentState();
 
     // For core KThread implementation
     Svc::ThreadContext m_thread_context{};
@@ -948,6 +976,12 @@ private:
     KProcessAddress m_mutex_wait_address_for_debugging{};
     ThreadWaitReasonForDebugging m_wait_reason_for_debugging{};
     uintptr_t m_argument{};
+    u64 m_profile_entrypoint{};
+    bool m_profile_main_thread{};
+    std::atomic<u8> m_profile_svc_id{0xff};
+    mutable Common::GuestHandoffProfile::ThreadState m_profile_handoff;
+    std::atomic<u64> m_profile_virtual_affinity{}, m_profile_physical_affinity{};
+    std::atomic<u32> m_profile_priority{};
     KProcessAddress m_stack_top{};
     NativeExecutionParameters m_native_execution_parameters{};
 

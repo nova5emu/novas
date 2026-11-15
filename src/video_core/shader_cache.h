@@ -11,6 +11,7 @@
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <span>
 #include "video_core/page_filter.h"
 #include "common/container/unordered_map.h"
@@ -172,6 +173,7 @@ private:
     void RememberRejection(VAddr addr);
     /// Hash of the state task and mesh programs are translated with.
     u64 MeshStateHash() const;
+    void TraceOotCompute(const ShaderInfo& shader);
 
     Tegra::MaxwellDeviceMemoryManager& device_memory;
 
@@ -190,6 +192,10 @@ private:
     /// Bounds of every address ever rejected (never shrinks): a quick test for invalidations.
     std::atomic<VAddr> rejected_lowest{~VAddr{}};
     std::atomic<VAddr> rejected_highest{};
+
+    std::mutex oot_compute_mutex;
+    std::set<std::pair<u64, u64>> oot_compute_identities;
+    std::atomic<u64> oot_compute_dropped{};
 };
 
 } // namespace VideoCommon

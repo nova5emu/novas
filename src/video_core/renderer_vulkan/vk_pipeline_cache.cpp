@@ -15,6 +15,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <thread>
 #include <vector>
 #include <bit>
@@ -49,6 +50,8 @@
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_hang_guard.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/gpu_write_trace.h"
+#include "video_core/gpu_write_trace_dump.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
@@ -1910,7 +1913,46 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
                     max_shared_memory / 1024);
         program.shared_memory_size = max_shared_memory;
     }
+    std::string trace_ir;
+    if (VideoCommon::GpuWriteTrace::enabled) {
+        trace_ir = VideoCommon::GpuWriteTrace::PrepareComputeDump(program);
+    }
     std::vector<u32> code{EmitSPIRV(profile, program)};
+    static const bool trace_hmma = [] {
+        const char* value = std::getenv("EDEN_NX2_HMMA_TRACE");
+        return value && std::string_view{value} == "1";
+    }();
+    bool trace_hmma_pipeline = false;
+    if (trace_hmma) {
+        std::array<u32, 2> hmma_counts{};
+        for (const auto* block : program.blocks) {
+            for (const auto& inst : block->Instructions()) {
+                if (inst.GetOpcode() == Shader::IR::Opcode::TensorMulAdd) {
+                    const u32 depth = inst.Flags<u32>();
+                    if (depth == 8 || depth == 16) {
+                        ++hmma_counts[depth == 16];
+                    }
+                }
+            }
+        }
+        if (hmma_counts[0] != 0 || hmma_counts[1] != 0) {
+            trace_hmma_pipeline = true;
+            LOG_INFO(Render_Vulkan,
+                     "HMMA pipeline={:016x} s6:{:016x} path=software-loop-dontinline "
+                     "static_k8={} static_k16={} required_subgroup={} max_subgroup={} "
+                     "spirv_words={} shared_bytes={}",
+                     key.Hash(), key.unique_hash,
+                     hmma_counts[0], hmma_counts[1],
+                     device.IsExtSubgroupSizeControlSupported() &&
+                             device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT)
+                         ? 32 : 0,
+                     profile.max_subgroup_size, code.size(), program.shared_memory_size);
+        }
+    }
+    if (VideoCommon::GpuWriteTrace::enabled) {
+        VideoCommon::GpuWriteTrace::RegisterComputeDump(key.unique_hash, key.Hash(),
+                                                       std::move(trace_ir), code);
+    }
     device.SaveShader(code);
     vk::ShaderModule spv_module{BuildShader(device, code)};
 
@@ -1947,7 +1989,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     return {.pipeline = std::make_unique<ComputePipeline>(
                 device, scheduler, vulkan_pipeline_cache, descriptor_pool, guest_descriptor_queue,
                 descriptor_buffer_ring, thread_worker, statistics, &shader_notify, info,
-                std::move(spv_module), key.unique_hash),
+                std::move(spv_module), key.unique_hash, trace_hmma_pipeline),
             .null_pointer_slots = env.IsNativeProgram() ? env.NullStoragePointerSlots()
                                                         : std::vector<std::pair<u32, u32>>{},
             .mapped_pointers =

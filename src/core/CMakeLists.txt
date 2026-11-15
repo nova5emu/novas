@@ -17,6 +17,14 @@ add_library(core STATIC
     constants.h
     core.cpp
     core.h
+    deferred_transition.cpp
+    deferred_transition.h
+    deferred_kernel_writes.h
+    deferred_cpu_mappings.h
+    deferred_write_config.h
+    arm/nce/nce_store_backing.h
+    arm/nce/nce_fault_policy.h
+    arm/nce/deferred_publication_budget.h
     game_settings.cpp
     game_settings.h
     core_timing.cpp
@@ -357,6 +365,7 @@ add_library(core STATIC
     hle/kernel/slab_helpers.h
     hle/kernel/svc.cpp
     hle/kernel/svc.h
+    hle/kernel/svc_deferred_transition.h
     hle/kernel/svc/svc_activity.cpp
     hle/kernel/svc/svc_address_arbiter.cpp
     hle/kernel/svc/svc_address_translation.cpp
@@ -1054,6 +1063,7 @@ add_library(core STATIC
     hle/service/nx2_streamplay.h
     hle/service/nx2_stub_interface.h
     hle/service/nx2_gsv.h
+    hle/service/nx2_release_batch.h
     hle/service/nx2_movie_clock.h
     hle/service/nx2_video_input_queue.h
     hle/service/nx2_image_layout.h

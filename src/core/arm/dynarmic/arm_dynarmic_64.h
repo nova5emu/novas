@@ -22,6 +22,10 @@ namespace Core::Memory {
 class Memory;
 }
 
+namespace Common::GpuTransitionProfile {
+struct ExclusiveInlineCounter;
+}
+
 namespace Core::WindowTrace {
 class Session;
 }
@@ -49,6 +53,7 @@ public:
     }
     void MemoryWrite(Dynarmic::A64::VAddr vaddr, u64 value, std::size_t size) override;
     void MemoryWrite128(u64 vaddr, Dynarmic::A64::Vector value) override;
+    void MemoryPrepareExclusive(u64 vaddr, size_t size) override;
     bool MemoryWriteExclusive8(u64 vaddr, std::uint8_t value, std::uint8_t expected) override;
     bool MemoryWriteExclusive16(u64 vaddr, std::uint16_t value, std::uint16_t expected) override;
     bool MemoryWriteExclusive32(u64 vaddr, std::uint32_t value, std::uint32_t expected) override;
@@ -67,6 +72,7 @@ public:
     u64 last_code_addr = u64(-1);
     ArmDynarmic64& m_parent;
     Core::Memory::Memory& m_memory;
+    std::shared_ptr<Common::GpuTransitionProfile::ExclusiveInlineCounter> m_exclusive_inline_counter;
     u64 m_tpidrro_el0{};
     u64 m_tpidr_el0{};
     u64 m_last_cntpct{}; ///< The previous counter read (GetCNTPCT spin detection)

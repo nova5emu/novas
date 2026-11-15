@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include "core/hle/kernel/k_auto_object.h"
 #include "core/hle/kernel/k_synchronization_object.h"
 #include "core/hle/kernel/slab_helpers.h"
@@ -29,6 +31,21 @@ public:
         return m_parent;
     }
 
+    void SetWaitProfile(const char* reason, u64 detail = 0, u64 target = 0) {
+        m_profile_detail.store(detail, std::memory_order_relaxed);
+        m_profile_target.store(target, std::memory_order_relaxed);
+        m_profile_reason.store(reason, std::memory_order_release);
+    }
+    const char* GetWaitProfileReason() const {
+        return m_profile_reason.load(std::memory_order_acquire);
+    }
+    u64 GetWaitProfileDetail() const {
+        return m_profile_detail.load(std::memory_order_relaxed);
+    }
+    u64 GetWaitProfileTarget() const {
+        return m_profile_target.load(std::memory_order_relaxed);
+    }
+
     Result Signal(KernelCore& kernel);
     Result Clear(KernelCore& kernel);
     bool IsSignaled(KernelCore& kernel) const override;
@@ -37,6 +54,8 @@ public:
 
 private:
     bool m_is_signaled{};
+    std::atomic<const char*> m_profile_reason{};
+    std::atomic<u64> m_profile_detail{}, m_profile_target{};
     KEvent* m_parent{};
 };
 

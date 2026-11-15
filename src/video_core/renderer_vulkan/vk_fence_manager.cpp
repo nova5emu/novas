@@ -25,8 +25,9 @@ void InnerFence::Queue() {
     }
     // Get the current tick so we can wait for it
     wait_tick = scheduler.CurrentTick();
-    if (!scheduler.DeferFlush()) {
-        scheduler.Flush();
+    const char* reason = VideoCore::g_signaling_query_report_fence ? "query-report-fence" : "fence";
+    if (!scheduler.DeferFlush(reason)) {
+        scheduler.FlushWithReason(reason);
     }
 }
 
@@ -74,9 +75,9 @@ void FenceManager::WaitFence(Fence& fence) {
     fence->Wait();
 }
 
-void FenceManager::SubmitDeferredWork() {
+void FenceManager::SubmitDeferredWork(const char* reason) {
     if (VideoCommon::GpuSplit::OnBackThread()) {
-        scheduler.FlushDeferred();
+        scheduler.FlushDeferred(reason);
     }
 }
 

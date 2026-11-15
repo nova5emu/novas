@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/settings.h"
+#include "common/dkb_frame_trace.h"
 #include "common/thread.h"
 #include "core/frontend/emu_window.h"
 #ifdef HAS_LSFG
@@ -175,8 +176,10 @@ PresentManager::PresentManager(const vk::Instance& instance_,
 
 PresentManager::~PresentManager() = default;
 
-Frame* PresentManager::GetRenderFrame() {
-
+Frame* PresentManager::GetRenderFrame(bool generated) {
+    const bool trace = Common::DkbFrameTrace::Enabled();
+    const auto entered = trace ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
     // Wait for free presentation frames
     std::unique_lock lock{free_mutex};
     free_cv.wait(lock, [this] { return !free_queue.empty(); });
@@ -186,8 +189,49 @@ Frame* PresentManager::GetRenderFrame() {
     free_queue.pop_front();
 
     // Wait for the presentation to be finished so all frame resources are free
+    const auto fence_started = trace ? std::chrono::steady_clock::now()
+                                     : std::chrono::steady_clock::time_point{};
+    HangTrace::Event("frame-fence-wait frame,fence,ready", 0,
+        {frame->index, HangTrace::Handle(*frame->present_done), HangTrace::Handle(*frame->render_ready)});
     frame->present_done.Wait();
+    const auto fence_complete = trace ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
+    HangTrace::Event("frame-fence-complete frame,fence", 0,
+        {frame->index, HangTrace::Handle(*frame->present_done)});
     frame->present_done.Reset();
+
+    if (trace) {
+        lock.unlock();
+        // GetRenderFrame runs on the composite owner. Separate real/generated acquisitions.
+        const auto ms = [](auto elapsed) {
+            return std::chrono::duration<double, std::milli>(elapsed).count();
+        };
+        auto& item = frame_wait_trace[generated ? 1 : 0];
+        ++item.calls;
+        const double free_ms = ms(fence_started - entered);
+        const double fence_ms = ms(fence_complete - fence_started);
+        item.free_ms += free_ms;
+        item.fence_ms += fence_ms;
+        item.max_free_ms = std::max(item.max_free_ms, free_ms);
+        item.max_fence_ms = std::max(item.max_fence_ms, fence_ms);
+        if (frame_wait_window == std::chrono::steady_clock::time_point{}) {
+            frame_wait_window = entered;
+        }
+        if (fence_complete - frame_wait_window >= std::chrono::seconds{10}) {
+            for (size_t i = 0; i < frame_wait_trace.size(); ++i) {
+                const auto& stats = frame_wait_trace[i];
+                LOG_INFO(Render_Vulkan,
+                         "DKB present_wait kind={} async_present={} window_ms={:.3f} calls={} "
+                         "free_queue_ms={:.3f} resource_fence_ms={:.3f} max_free_ms={:.3f} "
+                         "max_resource_fence_ms={:.3f}",
+                         i == 0 ? "real" : "generated", use_present_thread,
+                         ms(fence_complete - frame_wait_window), stats.calls, stats.free_ms,
+                         stats.fence_ms, stats.max_free_ms, stats.max_fence_ms);
+            }
+            frame_wait_trace = {};
+            frame_wait_window = fence_complete;
+        }
+    }
 
     return frame;
 }
@@ -399,13 +443,20 @@ void PresentManager::DiscardFrame(Frame* frame) {
     };
 
     std::scoped_lock submit_lock{scheduler.submit_mutex};
-    void(device.GetGraphicsQueue().Submit(submit_info, *frame->present_done));
+    HangTrace::Event("discard-enter frame,queue,wait,fence", 0,
+        {frame->index, HangTrace::Handle(device.GetGraphicsQueue().Handle()), HangTrace::Handle(render_ready),
+         HangTrace::Handle(*frame->present_done)});
+    const VkResult result = device.GetGraphicsQueue().Submit(submit_info, *frame->present_done);
+    HangTrace::Event("discard-return frame,result", 0, {frame->index, static_cast<u64>(result)});
 }
 
 void PresentManager::CopyToSwapchain(Frame* frame) {
     bool requires_recreation = false;
 
     for (u32 attempt = 0; attempt < MAX_PRESENT_ATTEMPTS; ++attempt) {
+        HangTrace::Event("present-attempt frame,attempt,recreate,async,ready", 0,
+            {frame->index, attempt, requires_recreation ? 1ULL : 0ULL,
+             use_present_thread ? 1ULL : 0ULL, HangTrace::Handle(*frame->render_ready)});
         try {
             // Recreate surface and swapchain if needed.
             if (requires_recreation) {
@@ -419,6 +470,8 @@ void PresentManager::CopyToSwapchain(Frame* frame) {
             return CopyToSwapchainImpl(frame);
         } catch (const vk::Exception& except) {
             const VkResult result = except.GetResult();
+            HangTrace::Event("present-catch frame,attempt,result", 0,
+                {frame->index, attempt, static_cast<u64>(result)});
             if (result != VK_ERROR_SURFACE_LOST_KHR && result != VK_INCOMPLETE &&
                 result != VK_ERROR_OUT_OF_DATE_KHR && result != VK_ERROR_NATIVE_WINDOW_IN_USE_KHR) {
                 throw;
@@ -580,8 +633,14 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
     // Submit the image copy/blit to the swapchain
     {
         std::scoped_lock submit_lock{scheduler.submit_mutex};
-        switch (const VkResult result =
-                    device.GetGraphicsQueue().Submit(submit_info, *frame->present_done)) {
+        HangTrace::Event("blit-enter frame,image,queue,acquire_wait,ready_wait,signal,fence,wait_count", 0,
+            {frame->index, swapchain.GetImageIndex(), HangTrace::Handle(device.GetGraphicsQueue().Handle()),
+             HangTrace::Handle(present_semaphore), HangTrace::Handle(*frame->render_ready),
+             HangTrace::Handle(render_semaphore), HangTrace::Handle(*frame->present_done), 2});
+        const VkResult blit_result = device.GetGraphicsQueue().Submit(submit_info, *frame->present_done);
+        HangTrace::Event("blit-return frame,image,result", 0,
+            {frame->index, swapchain.GetImageIndex(), static_cast<u64>(blit_result)});
+        switch (const VkResult result = blit_result) {
         case VK_SUCCESS:
             break;
         case VK_ERROR_DEVICE_LOST:

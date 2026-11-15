@@ -11,10 +11,18 @@
 
 #include "common/bit_field.h"
 #include "common/common_types.h"
+#include "common/gpu_transition_profile.h"
 #include "core/hle/service/nvdrv/nvdata.h"
 #include "video_core/cdma_pusher.h"
+#include "video_core/deferred_write_journal.h"
+#include "video_core/cpu_epoch_coordinator.h"
 #include "video_core/framebuffer_config.h"
 #include "video_core/rasterizer_download_area.h"
+
+#ifdef HAS_NCE
+#include <span>
+#include "core/arm/nce/nce_exact_store.h"
+#endif
 
 namespace Core {
 class System;
@@ -24,6 +32,12 @@ namespace VideoCore {
 class RendererBase;
 class ShaderNotify;
 } // namespace VideoCore
+
+namespace VideoCommon::DeferredWrites {
+class Journal;
+class Suspension;
+enum class SuspensionResult;
+}
 
 namespace Tegra {
 class DmaPusher;
@@ -177,6 +191,63 @@ public:
 
     void WaitForSyncOperation(u64 fence);
 
+    /// Finite CPU-write prefix. Capture never retains the publication gate on return.
+    [[nodiscard]] u64 CaptureDeferredWriteCut() const;
+    [[nodiscard]] VideoCommon::DeferredWrites::Journal* DeferredWriteJournal();
+    /// Query owner, before cache locks or writable-pointer capture. Retain through callbacks.
+    [[nodiscard]] std::shared_ptr<VideoCommon::DeferredWrites::Journal::WriterPermission>
+    BeginDeferredQueryWrite(DAddr address, u64 size);
+    /// Called by the GPU frontend; orders the prefix before subsequent GPU methods.
+    void OrderDeferredWriteCut(u64 cut, Common::GpuTransitionProfile::DeferredDrainSite site =
+                                          Common::GpuTransitionProfile::DeferredDrainSite::Transition);
+    /// Transition drain: caller must release ALL outer kernel/mapping/cache locks first.
+    /// Applies only the cut; readback completion and mapping revalidation remain separate.
+    [[nodiscard]] bool DrainDeferredWriteCutWithoutLocks(u64 cut);
+    /// Before ALL writer locks. The caller pins/revalidates mappings, retains this through
+    /// commit and uses the old path's cache/readback invalidation. Never enters from a signal.
+    [[nodiscard]] std::shared_ptr<VideoCommon::DeferredWrites::Journal::WriterPermission>
+    BeginDeferredWriterPermission(
+        std::span<const VideoCommon::DeferredWrites::TransitionRange> ranges);
+    /// Admission only, no GPU waits. Used while serializing a physical identity snapshot.
+    [[nodiscard]] std::shared_ptr<VideoCommon::DeferredWrites::Journal::WriterPermission>
+    ReserveDeferredWriterPermission(
+        std::span<const VideoCommon::DeferredWrites::TransitionRange> ranges,
+        VideoCommon::DeferredWrites::WriterOrigin origin = VideoCommon::DeferredWrites::WriterOrigin::Temporary,
+        Common::GpuTransitionProfile::DeferredFallbackReason first_reason = Common::GpuTransitionProfile::DeferredFallbackReason::Count);
+    /// Complete an existing reservation after releasing ALL outer locks.
+    [[nodiscard]] std::shared_ptr<VideoCommon::DeferredWrites::Journal::WriterPermission>
+    PrepareDeferredWriterPermission(
+        std::shared_ptr<VideoCommon::DeferredWrites::Journal::WriterPermission> permission);
+    /// Admission only; null when B is disabled. Keep the token through deferred mutations.
+    [[nodiscard]] std::unique_ptr<VideoCommon::DeferredWrites::Suspension> SuspendDeferredWrites();
+    /// Outer transaction only, before kernel/mapping/cache locks. Never returns an unready token.
+    /// Shared ownership allows callbacks to keep admission closed after their caller returns.
+    [[nodiscard]] std::shared_ptr<VideoCommon::DeferredWrites::Suspension> BeginDeferredTransition(
+        Common::GpuTransitionProfile::SuspensionSite site, bool can_wait = true);
+    /// Host continuation only, with no kernel/monitor/cache/mapping locks held.
+    /// False means there was no abandoned epoch to adopt. Caller must retry admission afterwards.
+    [[nodiscard]] bool RecoverAbandonedDeferredWritesWithoutLocks();
+    /// Host continuation, without outer locks. resolve_readbacks must arrange their completion
+    /// on the appropriate owner; applying the journal cut alone does not resolve GPU readbacks.
+    [[nodiscard]] VideoCommon::DeferredWrites::SuspensionResult
+    PrepareDeferredWriteSuspensionWithoutLocks(
+        VideoCommon::DeferredWrites::Suspension& token,
+        const std::function<bool()>& resolve_readbacks);
+    /// A satisfied acquire authorizes a new prefix within an existing command list.
+    void OnDeferredWriteAcquire();
+
+#ifdef HAS_NCE
+    // exact_only completes under Ready with the same eligibility and mapping checks.
+    Core::NceExactStore::Result PublishNceStore(size_t core, DAddr addr, std::span<const u8> bytes,
+                                              const Core::NceExactStore::Backing& backing,
+        u64& publication_ns, bool exact_only = false);
+    // Called from NCE's host continuation, never from its signal handler.
+    Core::NceExactStore::Result WriteNceStore(DAddr addr, std::span<const u8> bytes,
+                                            const Core::NceExactStore::Backing& backing);
+#endif
+
+    VideoCommon::CpuEpochs::Coordinator::Mutation BeforeCpuEpochConsumption();
+    bool TryOpenCpuEpoch(VideoCommon::CpuEpochs::Identity identity);
     void WaitForIdle();
 
     /// Tick pending requests within the GPU.
@@ -260,12 +331,15 @@ public:
     void FlushRegion(DAddr addr, u64 size);
 
     /// Runs func on the GPU thread after the command lists submitted so far.
-    void RunInOrder(std::function<void()>&& func);
+    /// An optional Ready token pins admission through this one-shot callback, without preparing here.
+    void RunInOrder(std::function<void()>&& func,
+                    std::shared_ptr<VideoCommon::DeferredWrites::Suspension> transition = {});
 
     /// RunInOrder for GPU memory maps: also done before the GPU thread reads the command lists
     /// submitted later (with the GPU split, on its front rather than its back).
     /// [gpu_addr, gpu_addr + size) is the range of GPU addresses the map changes.
-    void MapInOrder(GPUVAddr gpu_addr, u64 size, std::function<void()>&& func);
+    void MapInOrder(GPUVAddr gpu_addr, u64 size, std::function<void()>&& func,
+                    std::shared_ptr<VideoCommon::DeferredWrites::Suspension> transition = {});
 
     /// Whether a MapInOrder over part of [gpu_addr, gpu_addr + size) is queued and not done yet.
     [[nodiscard]] bool IsMapPending(GPUVAddr gpu_addr, u64 size) const;
@@ -281,6 +355,9 @@ public:
     void FlushAndInvalidateRegion(DAddr addr, u64 size);
 
 private:
+    std::shared_ptr<VideoCommon::DeferredWrites::Suspension> PrepareDeferredTransition(
+        std::shared_ptr<VideoCommon::DeferredWrites::Suspension> token,
+        Common::GpuTransitionProfile::SuspensionSite site, bool can_wait);
     struct Impl;
     mutable std::unique_ptr<Impl> impl;
 };

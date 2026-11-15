@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <utility>
 #include <vector>
 
@@ -14,6 +15,7 @@
 #include "common/assert.h"
 #include "common/bit_util.h"
 #include "common/common_types.h"
+#include "common/gpu_transition_profile.h"
 #include "common/literals.h"
 #include "video_core/cache_memory_stats.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -141,11 +143,53 @@ void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
 }
 
 void StagingBufferPool::TickFrame() {
+    const bool memory_profile = Common::GpuTransitionProfile::enabled.load(std::memory_order_relaxed);
+    u64 now{};
+#ifdef __ANDROID__
+    now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+#else
+    if (memory_profile) {
+        now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+#endif
+#ifdef __ANDROID__
+    // Low frame rates must not stretch a complete cache sweep to a minute.
+    if (now - last_mobile_release_ns >= 1'000'000'000) {
+        last_mobile_release_ns = now;
+        for (size_t level = 0; level < NUM_LEVELS; ++level) {
+            ReleaseLevel(device_local_cache, level);
+            ReleaseLevel(upload_cache, level);
+            ReleaseLevel(download_cache, level);
+        }
+    }
+#endif
     current_delete_level = (current_delete_level + 1) % NUM_LEVELS;
 
     ReleaseCache(MemoryUsage::DeviceLocal);
     ReleaseCache(MemoryUsage::Upload);
     ReleaseCache(MemoryUsage::Download);
+    if (memory_profile && now - last_memory_sample_ns >= 5'000'000'000) {
+        last_memory_sample_ns = now;
+        u64 free_bytes{}, pending_bytes{};
+        for (const auto* cache : {&device_local_cache, &upload_cache, &download_cache}) {
+            for (size_t level = 0; level < NUM_LEVELS; ++level) {
+                for (const auto& entry : (*cache)[level].entries) {
+                    auto& bytes = !entry.deferred && scheduler.IsFree(entry.tick)
+                                      ? free_bytes : pending_bytes;
+                    bytes += u64{1} << level;
+                }
+            }
+        }
+        VideoCommon::CacheMemoryStats::staging_free_bytes.store(free_bytes, std::memory_order_relaxed);
+        VideoCommon::CacheMemoryStats::staging_pending_bytes.store(pending_bytes, std::memory_order_relaxed);
+        VideoCommon::CacheMemoryStats::staging_bytes.store(free_bytes + pending_bytes,
+                                                          std::memory_order_relaxed);
+        VideoCommon::CacheMemoryStats::staging_stream_bytes.store(stream_buffer_size + STREAM_BUFFER_TAIL,
+                                                                 std::memory_order_relaxed);
+        VideoCommon::CacheMemoryStats::staging_sample_ns.store(now, std::memory_order_relaxed);
+    }
 }
 
 StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
@@ -244,8 +288,6 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
         buffer_ci.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     }
     vk::Buffer buffer = memory_allocator.CreateBuffer(buffer_ci, usage);
-    VideoCommon::CacheMemoryStats::staging_bytes.fetch_add(u64{1} << log2_size,
-                                                           std::memory_order_relaxed);
     if (device.HasDebuggingToolAttached()) {
         ++buffer_index;
         buffer.SetObjectNameEXT(fmt::format("Staging Buffer {}", buffer_index).c_str());
@@ -266,6 +308,20 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
         .deferred = deferred,
     });
     return entry.Ref();
+}
+
+bool StagingBufferPool::IsUploadBuffer(VkBuffer buffer) const {
+    if (buffer == *stream_buffer) {
+        return true;
+    }
+    for (const auto& level : upload_cache) {
+        for (const auto& entry : level.entries) {
+            if (buffer == *entry.buffer) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 StagingBufferPool::StagingBuffersCache& StagingBufferPool::GetCache(MemoryUsage usage) {
@@ -302,8 +358,6 @@ void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
     entries.erase(std::remove_if(begin, end, is_deletable), end);
 
     const size_t new_size = entries.size();
-    VideoCommon::CacheMemoryStats::staging_bytes.fetch_sub(
-        static_cast<u64>(old_size - new_size) << log2, std::memory_order_relaxed);
     staging.delete_index += deletions_per_tick;
     if (staging.delete_index >= new_size) {
         staging.delete_index = 0;

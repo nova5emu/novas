@@ -7,6 +7,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <numeric>
 #include <cstdio>
 #include <cstdlib>
@@ -20,15 +21,18 @@
 #include <boost/container/small_vector.hpp>
 
 #include "common/alignment.h"
+#include "common/gpu_transition_profile.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/slot_vector.h"
 #include "video_core/cache_memory_stats.h"
 #include "video_core/control/channel_state.h"
+#include "video_core/cpu_epoch_coordinator.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/nce_page_usage_profile.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/conversion.h"
 #include "video_core/texture_cache/memory_limits.h"
@@ -41,6 +45,11 @@
 #include "video_core/textures/decoders.h"
 
 namespace VideoCommon {
+
+inline u64 TextureMemoryNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 /// EDEN_NATIVE_DRAW_DIAGNOSTICS is read once: getenv scans the whole environment block on Windows.
 [[nodiscard]] inline bool NativeDrawDiagnostics() {
@@ -141,6 +150,11 @@ TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManag
 
 template <class P>
 void TextureCache<P>::RunGarbageCollector() {
+    const u64 collection_ns = TextureMemoryNowNs();
+    static const u64 min_age = [] {
+        const char* value = std::getenv("EDEN_NX2_TC_MIN_AGE");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
+    }();
     bool high_priority_mode = false;
     bool aggressive_mode = false;
     bool evict_old_costly = false;
@@ -196,10 +210,6 @@ void TextureCache<P>::RunGarbageCollector() {
         aggressive_mode = allow_aggressive && used_memory() >= critical_memory;
         ticks_to_destroy = aggressive_mode ? 10ULL : high_priority_mode ? 25ULL : 50ULL;
         // EDEN_NX2_TC_MIN_AGE=<frames>: never evict images used more recently (thrash tests).
-        static const u64 min_age = [] {
-            const char* value = std::getenv("EDEN_NX2_TC_MIN_AGE");
-            return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
-        }();
         ticks_to_destroy = (std::max)(ticks_to_destroy, min_age);
         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : 10);
     };
@@ -255,6 +265,23 @@ void TextureCache<P>::RunGarbageCollector() {
     // emptiest blocks go first, so blocks drain and go back to the driver; placement already
     // prefers the fullest blocks (best fit). Images with memory of their own sit in the middle.
     const auto Collect = [&] {
+#ifdef __ANDROID__
+        if (aggressive_mode) {
+            std::vector<ImageId> candidates;
+            lru_cache.ForEachItemBelow(frame_tick, [&](ImageId image_id) {
+                const auto& image = slot_images[image_id];
+                if (TextureCacheMemory::PressureAgeEligible(frame_tick, image.last_used_frame,
+                        collection_ns, image.last_used_ns, ticks_to_destroy, min_age)) {
+                    candidates.push_back(image_id);
+                }
+                return candidates.size() >= num_iterations * 8;
+            });
+            for (const auto image_id : candidates) {
+                if (Cleanup(image_id)) break;
+            }
+            return;
+        }
+#endif
         if constexpr (requires(const Image& image) { image.MemoryBlock(); }) {
             std::vector<ImageId> candidates;
             const size_t limit = num_iterations * 8;
@@ -529,9 +556,81 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
 
 template <class P>
 void TextureCache<P>::TickFrame() {
-    CacheMemoryStats::texture_bytes.store(total_used_memory, std::memory_order_relaxed);
-    CacheMemoryStats::texture_created.store(images_created, std::memory_order_relaxed);
-    CacheMemoryStats::texture_deleted.store(images_deleted, std::memory_order_relaxed);
+    Common::GpuTransitionProfile::WatchdogFrameTick();
+    const bool memory_profile = Common::GpuTransitionProfile::enabled.load(std::memory_order_relaxed);
+    const u64 snapshot_ns = memory_profile ? TextureMemoryNowNs() : 0;
+    if (memory_profile && snapshot_ns - memory_snapshot_ns >= 5'000'000'000) {
+        static const u64 minimum_age = [] {
+            const char* value = std::getenv("EDEN_NX2_TC_MIN_AGE");
+            return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
+        }();
+        memory_snapshot_ns = snapshot_ns;
+        std::array<u64, 5> ages{};
+        std::array<u64, 6> states{}, state_bytes{};
+        u64 registered_base_bytes{}, registered_scaled_bytes{}, registered_images{};
+        for (const auto [image_id, image] : slot_images) {
+            if (False(image->flags & ImageFlagBits::Registered)) continue;
+            const u64 base_bytes = ImageMemoryBytes(*image);
+            const u64 scaled_bytes = image->HasScaled() ? GetScaledImageSizeBytes(*image) : 0;
+            const u64 bytes = base_bytes + scaled_bytes;
+            registered_base_bytes += base_bytes;
+            registered_scaled_bytes += scaled_bytes;
+            ++registered_images;
+            const u64 age = frame_tick - image->last_used_frame;
+            size_t bucket = 4;
+            if (age == 0) bucket = 0;
+            else if (age < 10) bucket = 1;
+            else if (age < 25) bucket = 2;
+            else if (age < 50) bucket = 3;
+            ages[bucket] += bytes;
+            bool gpu_pending = false;
+            if constexpr (requires { runtime.IsFree(image->last_used_gpu_tick); }) {
+                gpu_pending = !runtime.IsFree(image->last_used_gpu_tick);
+            }
+            bool old_enough = age >= (total_used_memory >= critical_memory ? 10ULL :
+                                      total_used_memory >= expected_memory ? 25ULL : 50ULL);
+#ifdef __ANDROID__
+            if (total_used_memory >= critical_memory) {
+                old_enough = TextureCacheMemory::PressureAgeEligible(frame_tick,
+                    image->last_used_frame, snapshot_ns, image->last_used_ns, 10, minimum_age);
+            }
+#endif
+            old_enough &= age >= minimum_age;
+            const bool policy_protected =
+                (total_used_memory < critical_memory && True(image->flags & ImageFlagBits::CostlyLoad)) ||
+                (total_used_memory < expected_memory && IsDownloadable(*image) &&
+                 False(image->flags & ImageFlagBits::BadOverlap));
+            size_t state = 4;
+            if (age == 0) state = 0;
+            else if (True(image->flags & ImageFlagBits::IsDecoding)) state = 1;
+            else if (gpu_pending) state = 2;
+            else if (!old_enough) state = 3;
+            else if (policy_protected) state = 5;
+            ++states[state];
+            state_bytes[state] += bytes;
+        }
+        for (size_t i = 0; i < ages.size(); ++i) {
+            CacheMemoryStats::texture_age_bytes[i].store(ages[i], std::memory_order_relaxed);
+        }
+        for (size_t i = 0; i < states.size(); ++i) {
+            CacheMemoryStats::texture_blocked_images[i].store(states[i], std::memory_order_relaxed);
+            CacheMemoryStats::texture_blocked_bytes[i].store(state_bytes[i], std::memory_order_relaxed);
+        }
+        CacheMemoryStats::texture_deferred_bytes.store(
+            gpu_sentenced_bytes +
+                std::accumulate(sentenced_image_bytes.begin(), sentenced_image_bytes.end(), u64{}),
+            std::memory_order_relaxed);
+        CacheMemoryStats::texture_registered_base_bytes.store(registered_base_bytes,
+                                                             std::memory_order_relaxed);
+        CacheMemoryStats::texture_registered_scaled_bytes.store(registered_scaled_bytes,
+                                                               std::memory_order_relaxed);
+        CacheMemoryStats::texture_images.store(registered_images, std::memory_order_relaxed);
+        CacheMemoryStats::texture_snapshot_ns.store(snapshot_ns, std::memory_order_release);
+    }
+    if (memory_profile) {
+        CacheMemoryStats::texture_created.store(images_created, std::memory_order_relaxed);
+        CacheMemoryStats::texture_deleted.store(images_deleted, std::memory_order_relaxed);
+    }
     // Upload buffers grown for one huge image (title 1's 341 MiB terrain layer pools) are freed
     // rather than kept for the rest of the session.
     for (auto* const scratch : {&swizzle_data_buffer, &unswizzle_data_buffer}) {
@@ -1914,6 +2013,17 @@ bool TextureCache<P>::IsRescaling(const ImageViewBase& image_view) const noexcep
 }
 
 template <class P>
+bool TextureCache<P>::IsRegionRegistered(DAddr addr, size_t size) {
+    bool registered = false;
+    // The CPU page table contains all mapped segments, including sparse image mappings.
+    ForEachImageInRegion(addr, size, [&registered](ImageId, ImageBase&) {
+        registered = true;
+        return true;
+    });
+    return registered;
+}
+
+template <class P>
 bool TextureCache<P>::IsRegionGpuModified(DAddr addr, size_t size) {
     bool is_modified = false;
     ForEachImageInRegion(addr, size, [&is_modified](ImageId, ImageBase& image) {
@@ -1997,12 +2107,31 @@ void TextureCache<P>::DownloadImageIntoBuffer(typename TextureCache<P>::Image* i
 }
 
 template <class P>
+std::vector<DeferredWrites::TransitionRange> TextureCache<P>::DeferredUploadRanges(
+    GPUVAddr address, u64 size) {
+    std::vector<DeferredWrites::TransitionRange> ranges;
+    if (!deferred_writes || size == 0) return ranges;
+    for (const auto& [gpu_addr, length] : gpu_memory->GetSubmappedRange(address, size)) {
+        const auto device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
+        ASSERT(device_addr);
+        DeferredWrites::AddConsumerDeviceRange(ranges, device_memory, *device_addr, length);
+    }
+    return ranges;
+}
+
+template <class P>
 void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
+    Common::GpuTransitionProfile::Record(Common::GpuTransitionProfile::Site::TextureRefresh);
     if (False(image.flags & ImageFlagBits::CpuModified)) {
         // Only upload modified images
         return;
     }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
+    Common::GpuTransitionProfile::Record(Common::GpuTransitionProfile::Site::TextureRefreshUpload);
+
+    const auto deferred_ranges = DeferredUploadRanges(image.gpu_addr, image.guest_size_bytes);
+    DeferredWrites::ConsumerScope deferred_scope{
+        deferred_writes, deferred_ranges, [this](auto cut) { ApplyDeferredConsumerCut(cut); }};
 
     image.flags &= ~ImageFlagBits::CpuModified;
 
@@ -2107,6 +2236,10 @@ bool TextureCache<P>::UploadInChunks(Image& image) {
         MapSizeBytes(image) < min_size) {
         return false;
     }
+    const auto deferred_ranges = DeferredUploadRanges(image.gpu_addr, image.guest_size_bytes);
+    DeferredWrites::ConsumerScope deferred_scope{
+        deferred_writes, deferred_ranges, [this](auto cut) { ApplyDeferredConsumerCut(cut); }};
+    PrepareDeferredUpload(deferred_ranges);
     for (u64 offset = 0; offset < image.guest_size_bytes; offset += chunk_size) {
         const std::array range{
             std::pair<u64, u64>{offset, std::min<u64>(offset + chunk_size, image.guest_size_bytes)}};
@@ -2186,6 +2319,9 @@ void TextureCache<P>::MarkRangeWritten(Image& image, DAddr cpu_addr, size_t size
 template <class P>
 void TextureCache<P>::RefreshSparseTiles(Image& image) {
     if constexpr (requires { &Image::BindTiles; }) {
+        const auto deferred_ranges = DeferredUploadRanges(image.gpu_addr, image.guest_size_bytes);
+        DeferredWrites::ConsumerScope deferred_scope{
+            deferred_writes, deferred_ranges, [this](auto cut) { ApplyDeferredConsumerCut(cut); }};
         // The ranges written since the last upload, or, for a new image, all of it that can hold
         // data (the tiles the game maps there, or the blocks written).
         std::vector<std::pair<u64, u64>> ranges = std::move(image.dirty_ranges);
@@ -2201,6 +2337,7 @@ void TextureCache<P>::RefreshSparseTiles(Image& image) {
             return;
         }
         const size_t bytes = UnswizzledRectsBytes(image.info, rects);
+        PrepareDeferredUpload(deferred_ranges);
         auto staging = runtime.UploadStagingBuffer(bytes);
         const std::vector<BufferImageCopy> copies =
             UnswizzleImageRects(*gpu_memory, image.gpu_addr, image.info, rects, staging.mapped_span);
@@ -2308,6 +2445,10 @@ std::vector<u32> TextureCache<P>::BindSparseLayers(Image& image, std::span<const
 template <class P>
 void TextureCache<P>::UploadLayers(Image& image, std::span<const u32> layers) {
     if constexpr (requires { &Runtime::AccelerateImageUploadLayers; }) {
+        const auto deferred_ranges = DeferredUploadRanges(image.gpu_addr, image.guest_size_bytes);
+        DeferredWrites::ConsumerScope deferred_scope{
+            deferred_writes, deferred_ranges, [this](auto cut) { ApplyDeferredConsumerCut(cut); }};
+        PrepareDeferredUpload(deferred_ranges);
         if (False(image.flags & ImageFlagBits::AcceleratedUpload)) {
             // Plain formats: each layer unswizzled on its own into its layer of the image.
             ImageInfo layer_info = image.info;
@@ -2366,6 +2507,10 @@ void TextureCache<P>::UploadLayers(Image& image, std::span<const u32> layers) {
 template <class P>
 template <typename StagingBuffer>
 void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) {
+    const auto deferred_ranges = DeferredUploadRanges(image.gpu_addr, image.guest_size_bytes);
+    DeferredWrites::ConsumerScope deferred_scope{
+        deferred_writes, deferred_ranges, [this](auto cut) { ApplyDeferredConsumerCut(cut); }};
+    PrepareDeferredUpload(deferred_ranges);
     const std::span<u8> mapped_span = staging.mapped_span;
     const GPUVAddr gpu_addr = image.gpu_addr;
 
@@ -2641,6 +2786,11 @@ void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
     UNIMPLEMENTED_IF(False(image.flags & ImageFlagBits::Converted));
     LOG_DEBUG(HW_GPU, "Queuing async texture decode {:#x}", image.gpu_addr);
 
+    const auto deferred_ranges = DeferredUploadRanges(image.gpu_addr, image.guest_size_bytes);
+    DeferredWrites::ConsumerScope deferred_scope{
+        deferred_writes, deferred_ranges, [this](auto cut) { ApplyDeferredConsumerCut(cut); }};
+    PrepareDeferredUpload(deferred_ranges);
+
     image.flags |= ImageFlagBits::IsDecoding;
     ++async_decodes_queued;
     auto decode = std::make_unique<AsyncDecodeContext>();
@@ -2774,6 +2924,10 @@ void TextureCache<P>::TickAsyncUnswizzle() {
             if (copy_amount == 0) copy_amount = task.bytes_per_slice;
         }
 
+        const auto deferred_ranges = DeferredUploadRanges(image.gpu_addr + task.current_offset, copy_amount);
+        DeferredWrites::ConsumerScope deferred_scope{
+            deferred_writes, deferred_ranges, [this](auto cut) { ApplyDeferredConsumerCut(cut); }};
+        PrepareDeferredUpload(deferred_ranges);
         gpu_memory->ReadBlock(image.gpu_addr + task.current_offset,
                               task.staging_buffer.mapped_span.data() + task.current_offset,
                               copy_amount);
@@ -3401,7 +3555,14 @@ std::pair<u32, u32> TextureCache<P>::PrepareDmaImage(ImageId dst_id, GPUVAddr ba
     const auto& image = slot_images[dst_id];
     const auto base = image.TryFindBase(base_addr);
     PrepareImage(dst_id, mark_as_modified, false);
-    const auto& new_image = slot_images[dst_id];
+    auto& new_image = slot_images[dst_id];
+    new_image.last_used_frame = frame_tick;
+    new_image.last_used_ns = TextureMemoryNowNs();
+    if constexpr (requires { runtime.CurrentTick(); }) {
+        if (Common::GpuTransitionProfile::enabled.load(std::memory_order_relaxed)) {
+            new_image.last_used_gpu_tick = runtime.CurrentTick();
+        }
+    }
     lru_cache.Touch(new_image.lru_index, frame_tick);
     return std::make_pair(base->level, base->layer);
 }
@@ -3696,12 +3857,29 @@ ImageViewId TextureCache<P>::FindOrEmplaceImageView(ImageId image_id, const Imag
 
 template <class P>
 void TextureCache<P>::RegisterImage(ImageId image_id) {
+    Common::GpuTransitionProfile::Record(Common::GpuTransitionProfile::Site::TextureRegister);
     ImageBase& image = slot_images[image_id];
+    const auto deferred_ranges = DeferredUploadRanges(image.gpu_addr, image.guest_size_bytes);
+    for (const auto& range : deferred_ranges) {
+        if (range.space == DeferredWrites::TransitionSpace::Device) {
+            device_memory.ExcludeCpuEpochRange(range.address, range.size,
+                                               CpuEpochs::Exclusion::Texture);
+        }
+    }
+    DeferredWrites::ConsumerScope deferred_scope{
+        deferred_writes, deferred_ranges, [this](auto cut) { ApplyDeferredConsumerCut(cut); }};
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
     total_used_memory += ImageMemoryBytes(slot_images[image_id]);
     image.lru_index = lru_cache.Insert(image_id, frame_tick);
+    image.last_used_frame = frame_tick;
+    image.last_used_ns = TextureMemoryNowNs();
+    if constexpr (requires { runtime.CurrentTick(); }) {
+        if (Common::GpuTransitionProfile::enabled.load(std::memory_order_relaxed)) {
+            image.last_used_gpu_tick = runtime.CurrentTick();
+        }
+    }
 
     ForEachGPUPage(image.gpu_addr, image.guest_size_bytes, [this, image_id](u64 page) {
         (*channel_state->gpu_page_table)[page].push_back(image_id);
@@ -4022,6 +4200,15 @@ void TextureCache<P>::RemoveFramebuffers(std::span<const ImageViewId> removed_vi
 
 template <class P>
 void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
+    if (NcePageUsageProfile::Enabled()) {
+        if (True(image.flags & ImageFlagBits::Sparse)) {
+            NcePageUsageProfile::CoverageGap(image.guest_size_bytes);
+        } else {
+            NcePageUsageProfile::UseDeviceRange(device_memory, image.cpu_addr, image.guest_size_bytes,
+                NcePageUsageProfile::Bit(NcePageUsageProfile::Use::Texture) |
+                NcePageUsageProfile::Bit(NcePageUsageProfile::Use::GpuWrite));
+        }
+    }
     image.flags |= ImageFlagBits::GpuModified;
     image.modification_tick = ++modification_tick;
     NoteAliasTick(image);
@@ -4100,6 +4287,14 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
 template <class P>
 void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool invalidate) {
     Image& image = slot_images[image_id];
+    if (NcePageUsageProfile::Enabled() && image.last_used_frame != frame_tick) {
+        if (True(image.flags & ImageFlagBits::Sparse)) {
+            NcePageUsageProfile::CoverageGap(image.guest_size_bytes);
+        } else {
+            NcePageUsageProfile::UseDeviceRange(device_memory, image.cpu_addr, image.guest_size_bytes,
+                NcePageUsageProfile::Bit(NcePageUsageProfile::Use::Texture));
+        }
+    }
     if (invalidate) {
         image.flags &= ~(ImageFlagBits::CpuModified | ImageFlagBits::GpuModified);
         if (False(image.flags & ImageFlagBits::Tracked)) {
@@ -4148,6 +4343,13 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
         MarkModification(image);
     }
     lru_cache.Touch(image.lru_index, frame_tick);
+    image.last_used_frame = frame_tick;
+    image.last_used_ns = TextureMemoryNowNs();
+    if constexpr (requires { runtime.CurrentTick(); }) {
+        if (Common::GpuTransitionProfile::enabled.load(std::memory_order_relaxed)) {
+            image.last_used_gpu_tick = runtime.CurrentTick();
+        }
+    }
 }
 
 template <class P>

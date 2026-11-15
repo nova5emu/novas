@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <thread>
+#include <stdexcept>
 
 #ifdef _MSC_VER
 #include <intrin.h>
@@ -22,6 +23,7 @@
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
+#include "core/device_memory.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu_split.h"
@@ -33,6 +35,23 @@ namespace VideoCommon {
 
 namespace {
 
+void CloseCpuEpochsBeforeGpuWork(Core::System* system) {
+    if (!system) {
+        return;
+    }
+    auto& epochs = system->DeviceMemory().CpuEpochs();
+    if (!epochs.Requested() || epochs.ActivePages() == 0) {
+        return;
+    }
+    const auto result = epochs.CloseAllOnOwner(CpuEpochs::CloseReason::Consumer);
+    if (result != CpuEpochs::CloseResult::Complete) {
+        LOG_CRITICAL(HW_GPU,
+                     "CPU_EPOCH_BOUNDARY failed result={} "
+                     "contract=native_only_without_host_writers operation_not_consumed=true",
+                     static_cast<unsigned>(result));
+        throw std::runtime_error("CPU epoch could not close before GPU work");
+    }
+}
 void Pause() {
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
     _mm_pause();
@@ -238,8 +257,8 @@ void GpuSplit::Drain(DrainSite site) {
     Publish();
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
     const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Ticks() : 0;
-    // Everything consumed is not enough: the back submits deferred work (Scheduler::DeferFlush)
-    // from its idle hook afterwards, and the caller may use the scheduler once this returns.
+    // Also observe the idle hook completing deferred submissions. This is a completed cut,
+    // not a transfer of scheduler ownership: a later request may wake the back again.
     bool hook_asked = false;
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
@@ -530,6 +549,7 @@ u64 GpuSplit::SettleWrites() {
 }
 
 size_t GpuSplit::Execute(const u64* entry, size_t words) {
+    CloseCpuEpochsBeforeGpuWork(system);
     const u64 head = entry[0];
     switch (static_cast<Kind>(head & 0xf)) {
     case Kind::Wrap:
@@ -636,6 +656,8 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     const Common::DkbCpuTrace::Registration cpu_trace{Common::DkbCpuTrace::Role::GpuBack};
     Common::SetCurrentThreadName("GPUBack");
     on_back_thread = true;
+    // Service operations queued before BackRunning became visible to external producers.
+    back_quiet.store(false, std::memory_order_seq_cst);
     back_running.store(true, std::memory_order_release);
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
     Common::SetCurrentThreadToPerformanceCores();
@@ -647,25 +669,40 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     g_back_thread_id.store(GetCurrentThreadId(), std::memory_order_relaxed);
 #endif
     u64 read_position = 0;
+#ifdef __ANDROID__
+    constexpr u32 spin_limit = 64;
+#else
+    constexpr u32 spin_limit = 8192;
+#endif
+    if (Nx2Profile::Enabled()) {
+        constexpr const char* wait_backend = "atomic_wait";
+        LOG_INFO(HW_GPU, "GPU split back idle policy spin_limit={} wait_backend={}", spin_limit,
+                 wait_backend);
+    }
     while (!stop_token.stop_requested()) {
         Nx2Profile::Report("GPU back thread");
         u64 available = published.load(std::memory_order_acquire);
         if (available == read_position) {
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
-            // The front usually sends more within microseconds: spin briefly before sleeping.
-            for (u32 spins = 0; spins < 8192 && available == read_position &&
-                                !hook_requested.load(std::memory_order_relaxed);
-                 ++spins) {
-                Pause();
-                available = published.load(std::memory_order_acquire);
+            // Keep a short polling window for bursts, then let the producer and guest cores run.
+            {
+                Nx2Profile::Scope spin{Nx2Profile::Zone::SplitSpin};
+                for (u32 spins = 0; spins < spin_limit && available == read_position &&
+                                    !hook_requested.load(std::memory_order_relaxed);
+                     ++spins) {
+                    Pause();
+                    available = published.load(std::memory_order_acquire);
+                }
             }
             if (available == read_position) {
-                hook_requested.store(false, std::memory_order_seq_cst);
-                // The front may already see everything consumed: Drain() waits for back_quiet
-                // too, so the deferred submit can't overlap whatever the front does next.
-                if (!back_quiet.load(std::memory_order_relaxed)) {
+                const bool requested = hook_requested.exchange(false, std::memory_order_seq_cst);
+                // Drain() also observes the idle hook finishing. Only the back owns the
+                // scheduler while split is active, including after a new external request.
+                if (requested || !back_quiet.load(std::memory_order_relaxed)) {
+                    back_quiet.store(false, std::memory_order_seq_cst);
                     if (idle_hook != nullptr) {
-                        idle_hook(idle_argument);
+                        Nx2Profile::Scope idle{Nx2Profile::Zone::SplitIdleHook};
+                        idle_hook(idle_argument, true);
                     }
                     back_quiet.store(true, std::memory_order_release);
                 }
@@ -680,6 +717,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 // A request made after the hook ran (RequestIdleHook) runs it before sleeping.
                 if (available == read_position && !stop_token.stop_requested() &&
                     !hook_requested.load(std::memory_order_seq_cst)) {
+                    Nx2Profile::Scope park{Nx2Profile::Zone::SplitPark};
                     wake.wait(seen, std::memory_order_seq_cst);
                 }
                 back_waiting.store(false, std::memory_order_relaxed);
@@ -695,9 +733,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 Execute(&ring[index], std::min<u64>(available - read_position, RingWords - index));
             read_position += size != 0 ? size : RingWords - index;
             if (hook_requested.load(std::memory_order_relaxed) &&
+                hook_requested.exchange(false, std::memory_order_seq_cst) &&
                 idle_hook != nullptr) [[unlikely]] {
-                hook_requested.store(false, std::memory_order_seq_cst);
-                idle_hook(idle_argument);
+                idle_hook(idle_argument, false);
             }
             // Hand ring space back now and then while working through a long batch, and at once
             // when the front waits for this position (WaitForWriters).
@@ -712,6 +750,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         consumed.store(read_position, std::memory_order_seq_cst);
         NotifyFront();
     }
+    CloseCpuEpochsBeforeGpuWork(system);
     back_running.store(false, std::memory_order_seq_cst);
     front_wake.fetch_add(1, std::memory_order_seq_cst);
     front_wake.notify_all();

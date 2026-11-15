@@ -250,6 +250,7 @@ void AxxEmitX64::EmitExclusiveReadMemory(AxxEmitContext& ctx, IR::Inst* inst) {
             code.mfence();
         }
         code.CallLambda([](AxxUserConfig& conf, Axx::VAddr vaddr) -> T {
+            if (conf.prepare_exclusive_memory) conf.callbacks->MemoryPrepareExclusive(vaddr, bitsize / CHAR_BIT);
             return conf.global_monitor->ReadAndMark<T>(conf.processor_id, vaddr, [&]() -> T {
                 return (conf.callbacks->*callback)(vaddr, bitsize / CHAR_BIT);
             });
@@ -269,6 +270,7 @@ void AxxEmitX64::EmitExclusiveReadMemory(AxxEmitContext& ctx, IR::Inst* inst) {
             code.mfence();
         }
         code.CallLambda([](AxxUserConfig& conf, Axx::VAddr vaddr, Vector& ret) {
+            if (conf.prepare_exclusive_memory) conf.callbacks->MemoryPrepareExclusive(vaddr, bitsize / CHAR_BIT);
             ret = conf.global_monitor->ReadAndMark<Vector>(conf.processor_id, vaddr, [&]() -> Vector {
                 return (conf.callbacks->*callback)(vaddr);
             });
@@ -309,6 +311,7 @@ void AxxEmitX64::EmitExclusiveWriteMemory(AxxEmitContext& ctx, IR::Inst* inst) {
     if constexpr (bitsize != 128) {
         using T = mcl::unsigned_integer_of_size<bitsize>;
         code.CallLambda([](AxxUserConfig& conf, Axx::VAddr vaddr, T value) -> u32 {
+            if (conf.prepare_exclusive_memory) conf.callbacks->MemoryPrepareExclusive(vaddr, bitsize / CHAR_BIT);
             return conf.global_monitor->DoExclusiveOperation<T>(conf.processor_id, vaddr, [&](T expected) -> bool {
                 return (conf.callbacks->*callback)(vaddr, value, expected);
             }) ? 0 : 1;
@@ -321,6 +324,7 @@ void AxxEmitX64::EmitExclusiveWriteMemory(AxxEmitContext& ctx, IR::Inst* inst) {
         code.lea(code.ABI_PARAM3, ptr[rsp + ABI_SHADOW_SPACE]);
         code.movaps(xword[code.ABI_PARAM3], xmm1);
         code.CallLambda([](AxxUserConfig& conf, Axx::VAddr vaddr, Vector& value) -> u32 {
+            if (conf.prepare_exclusive_memory) conf.callbacks->MemoryPrepareExclusive(vaddr, bitsize / CHAR_BIT);
             return conf.global_monitor->DoExclusiveOperation<Vector>(conf.processor_id, vaddr, [&](Vector expected) -> bool {
                 return (conf.callbacks->*callback)(vaddr, value, expected);
             }) ? 0 : 1;
@@ -361,6 +365,7 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
 
     const auto wrapped_fn = read_fallbacks[std::make_tuple(ordered, bitsize, vaddr.getIdx(), value_idx)];
 
+    EmitExclusivePreparation<bitsize, Axx::VAddr>(code, ctx, vaddr, tmp, tmp2);
     EmitExclusiveLock(code, conf, tmp, tmp2.cvt32());
 
     code.mov(code.byte[code.ABI_JIT_PTR + offsetof(AxxJitState, exclusive_state)], u8(1));
@@ -435,6 +440,7 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
 
     const auto wrapped_fn = exclusive_write_fallbacks[std::make_tuple(ordered, bitsize, vaddr.getIdx(), value.getIdx())];
 
+    EmitExclusivePreparation<bitsize, Axx::VAddr>(code, ctx, vaddr, tmp, tmp2);
     EmitExclusiveLock(code, conf, tmp, tmp2.cvt32());
 
     SharedLabel end = ctx.GenSharedLabel();

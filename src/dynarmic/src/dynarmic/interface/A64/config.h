@@ -9,6 +9,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -100,6 +101,10 @@ struct UserCallbacks {
     // Writes through these callbacks may not be aligned.
     virtual void MemoryWrite(VAddr vaddr, std::uint64_t value, std::size_t size) = 0;
     virtual void MemoryWrite128(VAddr vaddr, Vector value) = 0;
+
+    // Opt-in x64 exclusive preparation, before the global monitor is locked.
+    // The callback must complete before returning; it must not re-enter this JIT.
+    virtual void MemoryPrepareExclusive(VAddr /*vaddr*/, std::size_t /*size*/) {}
 
     // Writes through these callbacks may not be aligned.
     virtual bool MemoryWriteExclusive8(VAddr /*vaddr*/, std::uint8_t /*value*/, std::uint8_t /*expected*/) { return false; }
@@ -278,6 +283,14 @@ struct UserConfig {
     /// writes. On x64, dynarmic currently relies on x64 cmpxchg semantics which may not
     /// provide fully accurate emulation.
     bool fastmem_exclusive_access = false;
+    /// Calls MemoryPrepareExclusive before accessing exclusive memory on x64.
+    bool prepare_exclusive_memory = false;
+    /// Optional stable cache of permanent exclusions: ((VA & ((1<<48)-1)) >> 12) + 1,
+    /// indexed by page & mask. Entries must remain valid across remaps until JIT teardown.
+    const std::atomic<std::uint64_t>* exclusive_prepare_table = nullptr;
+    std::uint32_t exclusive_prepare_table_mask = 0;
+    /// Optional cumulative counter written only by this JIT; readers must never reset it.
+    std::atomic<std::uint64_t>* exclusive_prepare_fast_hits = nullptr;
     /// Determines if exclusive access instructions that pagefault should cause
     /// recompilation of that block with fastmem disabled. Recompiled code will use memory
     /// callbacks.

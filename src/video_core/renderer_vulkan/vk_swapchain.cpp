@@ -169,9 +169,14 @@ void Swapchain::Create(
 }
 
 bool Swapchain::AcquireNextImage(bool may_flush) {
+    HangTrace::Event("acquire-enter swapchain,frame_index,semaphore", 0,
+        {HangTrace::Handle(*swapchain), frame_index, HangTrace::Handle(*present_semaphores[frame_index])});
     const VkResult result = device.GetLogical().AcquireNextImageKHR(
         *swapchain, (std::numeric_limits<u64>::max)(), *present_semaphores[frame_index],
         VK_NULL_HANDLE, &image_index);
+    HangTrace::Event("acquire-return result,image_index,frame_index,semaphore", 0,
+        {static_cast<u64>(result), image_index, frame_index,
+         HangTrace::Handle(*present_semaphores[frame_index])});
     switch (result) {
     case VK_SUCCESS:
         break;
@@ -243,7 +248,13 @@ void Swapchain::Present(VkSemaphore render_semaphore) {
         .pResults = nullptr,
     };
     std::scoped_lock lock{scheduler.submit_mutex};
-    switch (const VkResult result = present_queue.Present(present_info)) {
+    HangTrace::Event("present-enter queue,swapchain,image_index,wait", 0,
+        {HangTrace::Handle(present_queue.Handle()), HangTrace::Handle(*swapchain), image_index,
+         HangTrace::Handle(render_semaphore)});
+    const VkResult present_result = present_queue.Present(present_info);
+    HangTrace::Event("present-return result,image_index,wait", 0,
+        {static_cast<u64>(present_result), image_index, HangTrace::Handle(render_semaphore)});
+    switch (const VkResult result = present_result) {
     case VK_SUCCESS:
         break;
     case VK_SUBOPTIMAL_KHR:

@@ -22,6 +22,7 @@
 #include "common/sparse_large_vector.h"
 #include "video_core/invalidation_accumulator.h"
 #include "video_core/cache_types.h"
+#include "video_core/deferred_write_journal.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/pte_kind.h"
 
@@ -85,6 +86,7 @@ public:
         const auto address = GpuToCpuAddress(addr);
         if (!address)
             return {};
+        memory.ExcludeCpuEpochExport(*address, sizeof(T));
         return memory.GetPointer<T>(*address);
     }
 
@@ -122,6 +124,10 @@ public:
     void WriteBlockCached(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size);
     /// WriteBlockCached of `count` consecutive words within one device page, in a single write.
     void WriteWordsCached(GPUVAddr gpu_dest_addr, const u32* words, std::size_t count);
+
+    /// Reserve before capturing writable spans or queuing a fence callback; retain until commit.
+    [[nodiscard]] std::shared_ptr<VideoCommon::DeferredWrites::Journal::WriterPermission>
+    BeginDeferredBackingWrite(GPUVAddr address, std::size_t size);
 
     /**
      * Checks if a gpu region can be simply read with a pointer.

@@ -29,7 +29,9 @@
 #include "core/memory.h"
 #include "hid_core/hid_core.h"
 #include "video_core/gpu.h"
+#include "video_core/gpu_split.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
 
 namespace Core::Nx2Debug {
@@ -187,6 +189,7 @@ json Status(ToolState& state, const json& params) {
     const u64 after = g_nx2_present_count.load(std::memory_order_relaxed);
     const double seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+    const auto fences = state.system.GPU().Renderer().ReadRasterizer()->GetFenceProgress();
     return {
         {"title", state.title},
         {"program_id", fmt::format("{:016X}", state.program_id)},
@@ -197,6 +200,18 @@ json Status(ToolState& state, const json& params) {
         {"powered_on", state.system.IsPoweredOn()},
         {"paused", state.system.IsPaused()},
         {"presents", after},
+        {"gpu_front_has_pending_channels", VideoCommon::GpuSplit::Get().FrontHasPendingChannels()},
+        {"gpu_back_running", VideoCommon::GpuSplit::Get().BackRunning()},
+        {"fence_progress",
+         {{"supported", fences.supported},
+          {"coherent_snapshot", false},
+          {"uncommitted_operations", fences.uncommitted_operations},
+          {"queued_fences", fences.queued_fences},
+          {"queued_operations", fences.queued_operations},
+          {"retiring_fences", fences.retiring_fences},
+          {"retiring_operations", fences.retiring_operations},
+          {"idle_promotions", fences.idle_promotions},
+          {"completed_operations", fences.completed_operations}}},
         {"fps", seconds > 0.0 ? static_cast<double>(after - before) / seconds : 0.0},
         {"uptime_s", std::chrono::duration<double>(std::chrono::steady_clock::now() - state.start)
                          .count()},

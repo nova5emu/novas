@@ -427,6 +427,11 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
         vk::Check(vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info));
     }
     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
+    HangTrace::RegisterBuffer(HangTrace::Handle(handle),
+        {0, ci.size, HangTrace::Handle(alloc_info.deviceMemory), alloc_info.offset,
+         alloc_info.size, property_flags,
+         (usage == MemoryUsage::Upload || usage == MemoryUsage::Stream)
+             ? static_cast<const u8*>(alloc_info.pMappedData) : nullptr});
 
     // Log GPU memory allocation for buffers
     if (GPU::Logging::IsActive() &&
@@ -484,6 +489,11 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
     vk::Check(vmaCreateBufferWithAlignment(allocator, &ci, &alloc_ci, min_alignment, &handle,
                                            &allocation, &alloc_info));
     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
+    HangTrace::RegisterBuffer(HangTrace::Handle(handle),
+        {0, ci.size, HangTrace::Handle(alloc_info.deviceMemory), alloc_info.offset,
+         alloc_info.size, property_flags,
+         (usage == MemoryUsage::Upload || usage == MemoryUsage::Stream)
+             ? static_cast<const u8*>(alloc_info.pMappedData) : nullptr});
 
     u8 *data = reinterpret_cast<u8 *>(alloc_info.pMappedData);
     std::span<u8> mapped_data{};

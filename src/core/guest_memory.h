@@ -110,6 +110,7 @@ public:
     }
 
     void SetAddressAndSize(u64 addr, std::size_t size) noexcept {
+        ReserveDeferredWrite(addr, size * sizeof(T));
         m_addr = addr;
         m_size = size;
         m_addr_changed = true;
@@ -158,6 +159,7 @@ public:
     }
 
     bool TrySetSpan() noexcept {
+        ReserveDeferredWrite(m_addr, this->size_bytes());
         if (u8* ptr = m_memory->GetSpan(m_addr, this->size_bytes()); ptr) {
             m_data_span = {reinterpret_cast<T*>(ptr), this->size()};
             m_span_valid = true;
@@ -168,6 +170,15 @@ public:
     }
 
 protected:
+    void ReserveDeferredWrite(u64 address, std::size_t size) {
+        if constexpr ((FLAGS & GuestMemoryFlags::Write) &&
+                      requires { m_memory->BeginDeferredBackingWrite(address, size); }) {
+            if (auto permission = m_memory->BeginDeferredBackingWrite(address, size)) {
+                m_deferred_writes.push_back(std::move(permission));
+            }
+        }
+    }
+
     bool IsDataCopy() const noexcept {
         return m_is_data_copy;
     }
@@ -177,6 +188,8 @@ protected:
     }
 
     M* m_memory;
+    // GMMU writable spans keep their exclusion through destructor writeback/invalidation.
+    std::vector<std::shared_ptr<void>> m_deferred_writes;
     u64 m_addr{};
     size_t m_size{};
     std::span<T> m_data_span{};

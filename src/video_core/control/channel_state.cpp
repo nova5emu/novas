@@ -62,7 +62,9 @@ ChannelState::Payload::Payload(Core::System& system, MemoryManager& memory_manag
     , kepler_memory(memory_manager)
     , nv01_timer(memory_manager)
     , dma_pusher(system, memory_manager, channel_state)
-{}
+{
+    kepler_compute.SetTraceChannel(channel_state.bind_id);
+}
 
 ChannelState::ChannelState(s32 bind_id_)
     : bind_id{bind_id_}

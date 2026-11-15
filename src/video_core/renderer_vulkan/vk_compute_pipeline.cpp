@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <limits>
 #include <vector>
@@ -205,7 +206,8 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
                                  Common::ThreadWorker* thread_worker,
                                  PipelineStatistics* pipeline_statistics,
                                  VideoCore::ShaderNotify* shader_notify, const Shader::Info& info_,
-                                 vk::ShaderModule spv_module_, u64 shader_hash_)
+                                 vk::ShaderModule spv_module_, u64 shader_hash_,
+                                 bool trace_hmma_pipeline)
     : device{device_},
       pipeline_cache(pipeline_cache_), guest_descriptor_queue{guest_descriptor_queue_},
       descriptor_buffer_ring{descriptor_buffer_ring_}, info{info_},
@@ -246,7 +248,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         }
     }
 
-    auto func{[this, shader_notify, pipeline_statistics] {
+    auto func{[this, shader_notify, pipeline_statistics, trace_hmma_pipeline] {
         const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
             .pNext = nullptr,
@@ -287,11 +289,20 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             .basePipelineHandle = 0,
             .basePipelineIndex = 0,
         };
+        const auto build_start = trace_hmma_pipeline ? std::chrono::steady_clock::now()
+                                                    : std::chrono::steady_clock::time_point{};
+        if (trace_hmma_pipeline) {
+            LOG_INFO(Render_Vulkan,
+                     "HMMA driver-build begin s6:{:016x} path=software-loop-dontinline "
+                     "required_subgroup={}",
+                     shader_hash, compute_ci.stage.pNext ? GuestWarpSize : 0);
+        }
         try {
             pipeline = device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);
         } catch (const vk::Exception& exception) {
-            LOG_CRITICAL(Render_Vulkan, "Adreno rejected compute shader {:016X}: {}", shader_hash,
-                         exception.what());
+            LOG_CRITICAL(Render_Vulkan,
+                         "Compute shader {:016X} pipeline creation failed: {}",
+                         shader_hash, exception.what());
             std::scoped_lock lock{build_mutex};
             is_built = true;
             build_condvar.notify_one();
@@ -299,6 +310,11 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
                 shader_notify->MarkShaderComplete();
             }
             return;
+        }
+        if (trace_hmma_pipeline) {
+            LOG_INFO(Render_Vulkan, "HMMA driver-build end s6:{:016x} cpu_ms={:.3f}", shader_hash,
+                     std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - build_start).count());
         }
 
         // Log compute pipeline creation
@@ -354,11 +370,33 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
 
     buffer_cache.SetComputeUniformBufferState(info.constant_buffer_mask, &uniform_buffer_sizes);
     buffer_cache.UnbindComputeStorageBuffers();
+    const bool footprint_image_writes = VideoCommon::GpuWriteTrace::apply_footprints &&
+        std::ranges::any_of(info.image_descriptors, [](const auto& desc) { return desc.is_written; });
     size_t ssbo_index{};
     for (const auto& desc : info.storage_buffers_descriptors) {
         ASSERT(desc.count == 1);
         buffer_cache.BindComputeStorageBuffer(ssbo_index, desc.cbuf_index, desc.cbuf_offset,
                                               desc.is_written, desc.indirect_offset);
+        if (VideoCommon::GpuWriteTrace::enabled || VideoCommon::GpuWriteTrace::profile_footprints) {
+            const auto& launch = kepler_compute.launch_description;
+            const auto* recipe = ssbo_index < info.storage_write_footprints.size()
+                ? &info.storage_write_footprints[ssbo_index] : nullptr;
+            const Shader::StorageWriteFootprint not_collected;
+            const auto& footprint = recipe ? *recipe : not_collected;
+            buffer_cache.SetComputeWriteTrace(ssbo_index, {
+                .shader = shader_hash,
+                .binding = static_cast<u32>(ssbo_index),
+                .cbuf = desc.cbuf_index,
+                .cbuf_offset = desc.cbuf_offset,
+                .grid = {launch.grid_dim_x.Value(), launch.grid_dim_y.Value(), launch.grid_dim_z.Value()},
+                .block = {launch.block_dim_x.Value(), launch.block_dim_y.Value(), launch.block_dim_z.Value()},
+                .indirect = kepler_compute.GetIndirectComputeAddress().has_value(),
+                .known = footprint.known,
+                .reason = static_cast<u8>(footprint.reason),
+                .begin = footprint.begin,
+                .end = footprint.end,
+            }, recipe, footprint_image_writes);
+        }
         ++ssbo_index;
     }
 
@@ -638,6 +676,88 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     }
 
     const bool is_rescaling = !info.texture_descriptors.empty() || !info.image_descriptors.empty();
+    if (HangTrace::ResourcesEnabled()) {
+        // Copy metadata now: descriptor queue storage can be reused after the worker consumes it.
+        const auto buffers = guest_descriptor_queue.TraceBuffers();
+        const auto& cb0 = qmd.const_buffer_config[0];
+        const u64 cb0_address = cb0.Address();
+        std::array<u64, 2> values{};
+        u64 valid{};
+        constexpr std::array<u32, 2> offsets{0xc0, 0x150};
+        for (size_t i = 0; i < offsets.size(); ++i) {
+            if ((qmd.const_buffer_enable_mask & 1) &&
+                cb0.size.Value() >= offsets[i] + sizeof(u64) &&
+                gpu_memory.IsFullyMappedRange(cb0_address + offsets[i], sizeof(u64))) {
+                // Observe guest RAM without introducing a GPU readback into the experiment.
+                gpu_memory.ReadBlockUnsafe(cb0_address + offsets[i], &values[i], sizeof(u64));
+                valid |= u64{1} << i;
+            }
+        }
+        const u64 cb0_size = cb0.size.Value();
+        const u64 descriptor_mode = uses_descriptor_buffer ? 2 : (uses_push_descriptor ? 1 : 0);
+        const u64 robust = device.IsRobustBufferAccessEnabled();
+        const u64 global = info.uses_global_memory;
+        const u64 native_bounds = info.native_global_bounds;
+        std::vector<std::array<u64, 8>> sources;
+        u64 entry{}, binding{};
+        for (const auto& desc : info.constant_buffer_descriptors) {
+            sources.push_back({shader_hash, entry, binding++, desc.count,
+                               VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, desc.index, 0, ~u64{0}});
+            entry += desc.count;
+        }
+        for (const auto& desc : info.storage_buffers_descriptors) {
+            sources.push_back({shader_hash, entry, binding++, desc.count,
+                               VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, desc.cbuf_index,
+                               desc.cbuf_offset, desc.indirect_offset});
+            entry += desc.count;
+        }
+        std::vector<HangTrace::BufferAllocation> allocations;
+        for (const auto& b : buffers) {
+            allocations.push_back(HangTrace::FindBuffer(b.buffer));
+        }
+        std::array<u64, 3> upload_values{};
+        u64 upload_entry = ~u64{0};
+        for (const auto& source : sources) {
+            if (source[4] != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || source[5] != 0) {
+                continue;
+            }
+            for (const auto& b : buffers) {
+                if (b.entry == source[1]) {
+                    upload_entry = b.entry;
+                    upload_values = HangTrace::SampleUpload(b.buffer, b.offset, b.size);
+                }
+            }
+        }
+        scheduler.Record([buffers, allocations, upload_values, upload_entry,
+                          values, valid, cb0_address, cb0_size, descriptor_mode,
+                          robust, global, native_bounds, descriptor_buffer_chunk,
+                          descriptor_buffer_offset, sources = std::move(sources),
+                          shader = shader_hash](vk::CommandBuffer cmdbuf) {
+            HangTrace::Resource("compute-descriptors cmd,shader,mode,chunk,offset,global,native_bounds,robust",
+                {HangTrace::Handle(*cmdbuf), shader, descriptor_mode, descriptor_buffer_chunk,
+                 descriptor_buffer_offset, global, native_bounds, robust});
+            HangTrace::Resource("compute-cb0-guest cmd,shader,addr,size,valid,c0_c0,c0_150,robust",
+                {HangTrace::Handle(*cmdbuf), shader, cb0_address, cb0_size, valid,
+                 values[0], values[1], robust});
+            for (const auto& source : sources) {
+                HangTrace::Resource("compute-source shader,entry,binding,count,type,cbuf,offset,indirect",
+                                    source);
+            }
+            HangTrace::Resource("compute-cb0-upload cmd,shader,entry,valid,c0_c0,c0_150",
+                {HangTrace::Handle(*cmdbuf), shader, upload_entry, upload_values[0],
+                 upload_values[1], upload_values[2]});
+            for (size_t i = 0; i < buffers.size(); ++i) {
+                const auto& b = buffers[i];
+                const auto& a = allocations[i];
+                HangTrace::Resource("compute-allocation buffer,generation,size,memory,memory_offset,allocation_size,properties,worker_generation",
+                    {b.buffer, a.generation, a.size, a.memory, a.offset, a.allocation_size,
+                     a.properties, HangTrace::FindBuffer(b.buffer).generation});
+                HangTrace::Resource("compute-buffer cmd,shader,entry,buffer,offset,range,address,mode",
+                    {HangTrace::Handle(*cmdbuf), shader, b.entry, b.buffer, b.offset,
+                     b.size, b.address, descriptor_mode});
+            }
+        });
+    }
     scheduler.Record([this, descriptor_data, is_rescaling, descriptor_buffer_offset,
                       descriptor_buffer_chunk, bind_descriptor_buffer,
                       rescaling_data = rescaling.Data()](vk::CommandBuffer cmdbuf) {
@@ -650,6 +770,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             return;
         }
         cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
+        HangTrace::Bind(true, HangTrace::Handle(*pipeline), 0, shader_hash);
         if (!descriptor_set_layout) {
             return;
         }

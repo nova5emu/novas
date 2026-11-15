@@ -4,9 +4,12 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/gpu_transition_profile.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
+#include "core/deferred_transition.h"
+#include "core/device_memory.h"
 #include "core/hle/kernel/k_address_space_info.h"
 #include "core/hle/kernel/k_page_table_base.h"
 #include "core/hle/kernel/k_scoped_resource_reservation.h"
@@ -473,7 +476,9 @@ Result KPageTableBase::FinalizeProcess() {
 }
 
 void KPageTableBase::Finalize() {
+    Common::GpuTransitionProfile::Record(Common::GpuTransitionProfile::Site::PageTableFinalize);
     this->FinalizeProcess();
+    m_system.DeviceMemory().CpuMappings().RemoveOwner(std::addressof(m_impl));
 
     auto BlockCallback = [&](KProcessAddress addr, u64 size) {
         if (m_impl.fastmem_arena) {
@@ -483,6 +488,11 @@ void KPageTableBase::Finalize() {
         // Get physical pages.
         KPageGroup pg(m_system.Kernel(), m_block_info_manager);
         this->MakePageGroup(pg, addr, size / PageSize);
+
+        for (const auto& block : pg) {
+            m_system.DeviceMemory().CpuMappings().RemoveFinalizedRange(
+                GetInteger(block.GetAddress()) - Core::DramMemoryMap::Base, block.GetSize());
+        }
 
         // Free the pages.
         pg.CloseAndReset(m_system.Kernel());
@@ -2155,6 +2165,7 @@ Result KPageTableBase::SetMemoryAttribute(KProcessAddress addr, size_t size, KMe
 }
 
 Result KPageTableBase::SetHeapSize(KProcessAddress* out, size_t size) {
+    Common::GpuTransitionProfile::Record(Common::GpuTransitionProfile::Site::HeapResize);
     // Lock the physical memory mutex.
     KScopedLightLock map_phys_mem_lk(m_map_physical_memory_lock);
 
@@ -2214,6 +2225,8 @@ Result KPageTableBase::SetHeapSize(KProcessAddress* out, size_t size) {
 
             // Update the current heap end.
             m_current_heap_end = m_heap_region_start + size;
+            m_system.DeviceMemory().CpuMappings().AllowHeapRange(
+                std::addressof(m_impl), GetInteger(m_heap_region_start), GetInteger(m_current_heap_end));
 
             // Set the output.
             *out = m_heap_region_start;
@@ -2298,6 +2311,8 @@ Result KPageTableBase::SetHeapSize(KProcessAddress* out, size_t size) {
 
         // Update the current heap end.
         m_current_heap_end = m_heap_region_start + size;
+        m_system.DeviceMemory().CpuMappings().AllowHeapRange(
+            std::addressof(m_impl), GetInteger(m_heap_region_start), GetInteger(m_current_heap_end));
 
         // Set the output.
         *out = m_heap_region_start;
@@ -3149,6 +3164,10 @@ Result KPageTableBase::ReadDebugMemory(KProcessAddress dst_address, KProcessAddr
     // Lightly validate the region is in range.
     R_UNLESS(this->Contains(src_address, size), ResultInvalidCurrentMemory);
 
+    const Common::GpuTransitionProfile::LegacyWriterScope legacy_profile{
+        Common::GpuTransitionProfile::LegacyWriterSite::ReadDebugMemory, size};
+    GetCurrentMemory(m_system.Kernel()).PrepareLegacyWrite(GetInteger(dst_address), size);
+
     // Lock the table.
     KScopedLightLock lk(m_general_lock);
 
@@ -3244,6 +3263,10 @@ Result KPageTableBase::WriteDebugMemory(KProcessAddress dst_address, KProcessAdd
                                         size_t size) {
     // Lightly validate the region is in range.
     R_UNLESS(this->Contains(dst_address, size), ResultInvalidCurrentMemory);
+
+    const Common::GpuTransitionProfile::LegacyWriterScope legacy_profile{
+        Common::GpuTransitionProfile::LegacyWriterSite::WriteDebugMemory, size};
+    GetMemory().PrepareLegacyWrite(GetInteger(dst_address), size);
 
     // Lock the table.
     KScopedLightLock lk(m_general_lock);
@@ -3417,8 +3440,14 @@ Result KPageTableBase::WriteIoMemoryImpl(KPhysicalAddress phys_addr, KProcessAdd
 
 Result KPageTableBase::ReadDebugIoMemory(KProcessAddress dst_address, KProcessAddress src_address,
                                          size_t size, KMemoryState state) {
+    Core::DeferredTransitionScope transition{
+        m_system, Common::GpuTransitionProfile::SuspensionSite::SvcMemory};
     // Lightly validate the range before doing anything else.
     R_UNLESS(this->Contains(src_address, size), ResultInvalidCurrentMemory);
+
+    const Common::GpuTransitionProfile::LegacyWriterScope legacy_profile{
+        Common::GpuTransitionProfile::LegacyWriterSite::ReadDebugIoMemory, size};
+    GetCurrentMemory(m_system.Kernel()).PrepareLegacyWrite(GetInteger(dst_address), size);
 
     // We need to lock both this table, and the current process's table, so set up some aliases.
     KPageTableBase& src_page_table = *this;
@@ -3459,6 +3488,8 @@ Result KPageTableBase::ReadDebugIoMemory(KProcessAddress dst_address, KProcessAd
 
 Result KPageTableBase::WriteDebugIoMemory(KProcessAddress dst_address, KProcessAddress src_address,
                                           size_t size, KMemoryState state) {
+    Core::DeferredTransitionScope transition{
+        m_system, Common::GpuTransitionProfile::SuspensionSite::SvcMemory};
     // Lightly validate the range before doing anything else.
     R_UNLESS(this->Contains(dst_address, size), ResultInvalidCurrentMemory);
 
@@ -3674,6 +3705,9 @@ Result KPageTableBase::OpenMemoryRangeForUnmapDeviceAddressSpace(MemoryRange* ou
 
 Result KPageTableBase::LockForIpcUserBuffer(KPhysicalAddress* out, KProcessAddress address,
                                             size_t size) {
+    const Common::GpuTransitionProfile::LegacyWriterScope legacy_profile{
+        Common::GpuTransitionProfile::LegacyWriterSite::IpcUserBuffer, size};
+    GetMemory().PrepareLegacyWrite(GetInteger(address), size);
     R_RETURN(this->LockMemoryAndOpen(
         nullptr, out, address, size, KMemoryState::FlagCanIpcUserBuffer,
         KMemoryState::FlagCanIpcUserBuffer, KMemoryPermission::All,
@@ -3693,10 +3727,19 @@ Result KPageTableBase::UnlockForIpcUserBuffer(KProcessAddress address, size_t si
 
 Result KPageTableBase::LockForTransferMemory(KPageGroup* out, KProcessAddress address, size_t size,
                                              KMemoryPermission perm) {
-    R_RETURN(this->LockMemoryAndOpen(out, nullptr, address, size, KMemoryState::FlagCanTransfer,
+    const Common::GpuTransitionProfile::LegacyWriterScope legacy_profile{
+        Common::GpuTransitionProfile::LegacyWriterSite::TransferMemory, size};
+    GetMemory().PrepareLegacyWrite(GetInteger(address), size);
+    R_TRY(this->LockMemoryAndOpen(out, nullptr, address, size, KMemoryState::FlagCanTransfer,
                                      KMemoryState::FlagCanTransfer, KMemoryPermission::All,
                                      KMemoryPermission::UserReadWrite, KMemoryAttribute::All,
                                      KMemoryAttribute::None, perm, KMemoryAttribute::Locked));
+    for (const auto& block : *out) {
+        m_system.DeviceMemory().CpuMappings().ExcludePhysical(
+            GetInteger(block.GetAddress()) - Core::DramMemoryMap::Base, block.GetSize(),
+            Core::DeferredCpuMappings::Status::Transfer);
+    }
+    R_SUCCEED();
 }
 
 Result KPageTableBase::UnlockForTransferMemory(KProcessAddress address, size_t size,
@@ -3709,13 +3752,22 @@ Result KPageTableBase::UnlockForTransferMemory(KProcessAddress address, size_t s
 }
 
 Result KPageTableBase::LockForCodeMemory(KPageGroup* out, KProcessAddress address, size_t size) {
-    R_RETURN(this->LockMemoryAndOpen(
+    const Common::GpuTransitionProfile::LegacyWriterScope legacy_profile{
+        Common::GpuTransitionProfile::LegacyWriterSite::CodeMemory, size};
+    GetMemory().PrepareLegacyWrite(GetInteger(address), size);
+    R_TRY(this->LockMemoryAndOpen(
         out, nullptr, address, size, KMemoryState::FlagCanCodeMemory,
         KMemoryState::FlagCanCodeMemory, KMemoryPermission::All, KMemoryPermission::UserReadWrite,
         KMemoryAttribute::All, KMemoryAttribute::None,
         static_cast<KMemoryPermission>(KMemoryPermission::NotMapped |
                                        KMemoryPermission::KernelReadWrite),
         KMemoryAttribute::Locked));
+    for (const auto& block : *out) {
+        m_system.DeviceMemory().CpuMappings().ExcludePhysical(
+            GetInteger(block.GetAddress()) - Core::DramMemoryMap::Base, block.GetSize(),
+            Core::DeferredCpuMappings::Status::Code);
+    }
+    R_SUCCEED();
 }
 
 Result KPageTableBase::UnlockForCodeMemory(KProcessAddress address, size_t size,
@@ -3754,6 +3806,9 @@ Result KPageTableBase::CopyMemoryFromLinearToUser(
 
     // Get the destination memory reference.
     auto& dst_memory = GetCurrentMemory(m_system.Kernel());
+    const Common::GpuTransitionProfile::LegacyWriterScope legacy_profile{
+        Common::GpuTransitionProfile::LegacyWriterSite::LinearToUser, size};
+    dst_memory.PrepareLegacyWrite(GetInteger(dst_addr), size);
 
     // Copy the memory.
     {
@@ -3926,6 +3981,10 @@ Result KPageTableBase::CopyMemoryFromUserToLinear(
     // Lightly validate the range before doing anything else.
     R_UNLESS(this->Contains(dst_addr, size), ResultInvalidCurrentMemory);
 
+    const Common::GpuTransitionProfile::LegacyWriterScope legacy_profile{
+        Common::GpuTransitionProfile::LegacyWriterSite::UserToLinear, size};
+    GetMemory().PrepareLegacyWrite(GetInteger(dst_addr), size);
+
     // Get the source memory reference.
     auto& src_memory = GetCurrentMemory(m_system.Kernel());
 
@@ -4024,6 +4083,10 @@ Result KPageTableBase::CopyMemoryFromKernelToLinear(KProcessAddress dst_addr, si
     // Lightly validate the range before doing anything else.
     R_UNLESS(this->Contains(dst_addr, size), ResultInvalidCurrentMemory);
 
+    const Common::GpuTransitionProfile::LegacyWriterScope legacy_profile{
+        Common::GpuTransitionProfile::LegacyWriterSite::KernelToLinear, size};
+    GetMemory().PrepareLegacyWrite(GetInteger(dst_addr), size);
+
     // Copy the memory.
     {
         // Lock the table.
@@ -4106,6 +4169,10 @@ Result KPageTableBase::CopyMemoryFromHeapToHeap(
     // Lightly validate the ranges before doing anything else.
     R_UNLESS(src_page_table.Contains(src_addr, size), ResultInvalidCurrentMemory);
     R_UNLESS(dst_page_table.Contains(dst_addr, size), ResultInvalidCurrentMemory);
+
+    const Common::GpuTransitionProfile::LegacyWriterScope legacy_profile{
+        Common::GpuTransitionProfile::LegacyWriterSite::HeapToHeap, size};
+    dst_page_table.GetMemory().PrepareLegacyWrite(GetInteger(dst_addr), size);
 
     // Copy the memory.
     {
@@ -4241,6 +4308,10 @@ Result KPageTableBase::CopyMemoryFromHeapToHeapWithoutCheckDestination(
     // Lightly validate the ranges before doing anything else.
     R_UNLESS(src_page_table.Contains(src_addr, size), ResultInvalidCurrentMemory);
     R_UNLESS(dst_page_table.Contains(dst_addr, size), ResultInvalidCurrentMemory);
+
+    const Common::GpuTransitionProfile::LegacyWriterScope legacy_profile{
+        Common::GpuTransitionProfile::LegacyWriterSite::HeapToHeapUnchecked, size};
+    dst_page_table.GetMemory().PrepareLegacyWrite(GetInteger(dst_addr), size);
 
     // Copy the memory.
     {

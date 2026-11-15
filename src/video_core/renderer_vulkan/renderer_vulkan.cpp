@@ -250,10 +250,10 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
 
     const size_t generated_frames = frame_gen.GeneratedFrameCount();
     for (size_t generation = 0; generation < generated_frames; ++generation) {
-        Frame* generated = present_manager.GetRenderFrame();
+        Frame* generated = present_manager.GetRenderFrame(true);
         blit_swapchain.PrepareFrame(device, generated, render_window.GetFramebufferLayout());
         frame_gen.GenerateInto(device, generated, generation);
-        scheduler.Flush(*generated->render_ready);
+        scheduler.FlushWithReason("generated-present", *generated->render_ready);
         present_manager.Present(generated);
     }
 #endif
@@ -261,7 +261,7 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     if (trace) {
         scheduler.MarkFrameEnd(++trace_frame);
     }
-    scheduler.Flush(*frame->render_ready);
+    scheduler.FlushWithReason("present", *frame->render_ready);
 
     const auto presenting = trace ? std::chrono::steady_clock::now()
                                   : std::chrono::steady_clock::time_point{};

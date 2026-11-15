@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -16,6 +17,7 @@
 #include <utility>
 #include <queue>
 #include <source_location>
+#include <string_view>
 #include <vector>
 
 #include "common/alignment.h"
@@ -51,9 +53,18 @@ public:
     explicit Scheduler(const Device& device, StateTracker& state_tracker);
     ~Scheduler();
 
+    bool IsOperationTraceEnabled() const {
+        return static_cast<bool>(trace_operation_pool);
+    }
+
     /// Sends the current execution context to the GPU.
     u64 Flush(VkSemaphore signal_semaphore = {}, VkSemaphore wait_semaphore = {},
               std::source_location location = std::source_location::current());
+
+    /// Diagnostic reasons must have static storage duration.
+    u64 FlushWithReason(std::string_view reason, VkSemaphore signal_semaphore = {},
+                        VkSemaphore wait_semaphore = {},
+                        std::source_location location = std::source_location::current());
 
     /// Sends the current execution context to the GPU and waits for it to complete.
     void Finish(VkSemaphore signal_semaphore = {}, VkSemaphore wait_semaphore = {},
@@ -63,13 +74,16 @@ public:
     /// submission is older than a window (EDEN_NX2_FENCE_FLUSH_US, default 500 us, 0 submits at
     /// once); otherwise it goes with the next one. The back submits deferred work before it
     /// sleeps and when another thread asks (WaitSubmitted). True when the flush was deferred.
-    bool DeferFlush();
+    bool DeferFlush(std::string_view reason = "caller",
+                    std::source_location location = std::source_location::current());
     /// Submits deferred work (the split's back, from its idle hook).
-    void FlushDeferred();
+    void FlushDeferred(std::string_view reason = "idle-hook",
+                       std::source_location location = std::source_location::current());
     /// Threads other than the split's back: waits until tick is submitted, asking the back to
     /// submit deferred work (logged every 2 s while it waits). False only when the back thread
     /// is not running, so nothing will submit it: the caller then submits it itself.
-    bool WaitSubmitted(u64 tick);
+    bool WaitSubmitted(u64 tick,
+                       std::source_location location = std::source_location::current());
     /// Whether everything up to tick has been handed to the worker for submission.
     [[nodiscard]] bool IsSubmitted(u64 tick) const noexcept {
         return tick < master_semaphore->CurrentTick();
@@ -232,13 +246,14 @@ public:
     /// into the current chunk while that thread does (corrupt command buffers, crashes). They
     /// wait for the recording thread to submit the tick instead, and give up after 20 ms (it may
     /// be waiting for them).
-    void Wait(u64 tick, double target_fps = 0.0, bool may_flush = true) {
+    void Wait(u64 tick, double target_fps = 0.0, bool may_flush = true,
+              std::source_location location = std::source_location::current()) {
         const bool trace = Common::DkbFrameTrace::Enabled() && target_fps > 0.0;
         const auto trace_start = trace ? std::chrono::steady_clock::now()
                                        : std::chrono::steady_clock::time_point{};
         if (tick > 0 && (may_flush || WaitForSubmission(tick))) {
             if (tick >= master_semaphore->CurrentTick()) {
-                Flush();
+                FlushWithReason("wait", {}, {}, location);
             }
             master_semaphore->Wait(tick);
         }
@@ -313,6 +328,7 @@ public:
 private:
     std::chrono::steady_clock::time_point last_flush{};
     bool flush_pending{};
+    std::atomic<u64> trace_submit_wait_tick{};
 
     class Command {
     public:
@@ -430,9 +446,15 @@ private:
 
     void TraceGpuSubmission();
     void ReportWorkTimes();
+    u32 BeginTraceOperation(VkCommandBuffer command, const VideoCommon::GpuOperationTrace::Info& info);
+    void EndTraceOperation(VkCommandBuffer command, u32 token);
+    bool ReportOperationTimes(u64 origin, double span_ms, double submission_sum_ms,
+                              const std::vector<std::pair<double, double>>& submission_intervals);
+    double TraceSignedMilliseconds(u64 begin, u64 end) const;
     void TraceShader(u64 hash, u32 stage);
 
-    u64 SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore);
+    u64 SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
+                        std::string_view reason, std::source_location location);
 
     void AllocateNewContext();
 
@@ -464,7 +486,12 @@ private:
         u32 dispatch_attempts{};
         u32 num_shaders{};
         u32 untracked_uses{};
+        u32 operations{}, non_barrier_operations{};
         std::array<ShaderUse, 32> shaders{};
+        std::string_view reason;
+        std::source_location caller;
+        std::chrono::steady_clock::time_point requested, worker, submit_begin, submit_end;
+        bool waits_semaphore{};
     };
     SubmissionTrace trace_work;
     std::vector<SubmissionTrace> trace_submissions;
@@ -478,6 +505,21 @@ private:
     vk::QueryPool trace_work_pool;
     std::vector<WorkTrace> trace_work_items;
     u32 trace_work_count{};
+    static constexpr u32 TraceMaxOperations = 16384;
+    static constexpr size_t TraceOperationKinds =
+        static_cast<size_t>(VideoCommon::GpuOperationTrace::Kind::Count);
+    struct OperationTrace {
+        VideoCommon::GpuOperationTrace::Info info;
+        u32 submission{};
+        bool upload_stream{};
+        bool staging_upload{};
+    };
+    vk::QueryPool trace_operation_pool;
+    std::vector<OperationTrace> trace_operations;
+    u32 trace_operation_count{};
+    std::array<u64, TraceOperationKinds> trace_operation_seen{}, trace_operation_dropped{};
+    u64 trace_barrier_all_commands{}, trace_barrier_full{}, trace_memory_barriers{};
+    u64 trace_buffer_barriers{}, trace_image_barriers{}, trace_staging_uploads{}, trace_staging_bytes{};
     Common::DkbFrameTrace::RateLimit trace_gpu_rate;
     u64 trace_gpu_tick{};
     u64 trace_frame_end{};

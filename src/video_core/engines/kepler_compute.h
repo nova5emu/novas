@@ -236,6 +236,10 @@ public:
         std::vector<u8> inner_buffer;
     } state{};
 
+    // Diagnostic identity follows the executed QMD, not merely the last scheduled address.
+    void SetTraceChannel(s32 channel) { trace_channel = channel; }
+    u64 TraceDispatch() const { return trace_dispatch; }
+
     static_assert(sizeof(Regs) == Regs::NUM_REGS * sizeof(u32),
                   "KeplerCompute Regs has wrong size");
 
@@ -262,6 +266,7 @@ public:
     /// dispatch of the game's network is skipped, or its output pass replaced by a copy of the
     /// tonemapped image.
     bool BypassOotNetwork(u64 program_id, u64 native_key);
+    void TraceOotCompute(u64 native_key, u64 shader_hash, bool lowered_native, u64 dropped);
     void TraceDlssContract(u64 native_key, bool warn_unvalidated = true);
 
     /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
@@ -288,8 +293,15 @@ private:
     bool front_macros{}; ///< The front owns the macro code and bindings (the back skips them)
 
     bool DispatchNativeCompute(Core::System& system, const NativeQmdScheduler::Descriptor& descriptor);
+    s32 trace_channel{-1};
+    u64 trace_qmd{};
+    u64 trace_program{};
+    bool trace_empty_pending{};
+    u64 trace_dispatch{};
     void ProcessNativeReportSemaphore(u32 argument);
     void DescribeNativeResources(const NativeQmdScheduler::Descriptor& qmd);
+    void RecordOotDispatchReplacement(u64 native_key);
+    std::optional<u64> oot_replaced_program;
     /// Texture descriptor that the handle at `offset` in constant buffer 0 selects.
     std::optional<Texture::TICEntry> ConstBuffer0Image(u32 offset) const;
     void RememberDlssMotionVectors();

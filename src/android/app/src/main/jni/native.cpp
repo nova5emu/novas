@@ -8,7 +8,9 @@
 #include "video_core/vulkan_common/vma.h"
 
 #include <codecvt>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <initializer_list>
 #include <cstring>
 #include <locale>
@@ -49,6 +51,7 @@ extern "C" {
 #include "common/dynamic_library.h"
 #include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
+#include "common/gpu_transition_profile.h"
 #include "frontend_common/nx2_switches.h"
 #include "common/logging.h"
 #include "common/scm_rev.h"
@@ -59,7 +62,11 @@ extern "C" {
 #include "frontend_common/play_time_manager.h"
 #include "core/constants.h"
 #include "core/core.h"
+#include "core/deferred_write_config.h"
 #include "core/device_memory.h"
+#include "core/arm/nce/nce_exact_store.h"
+#include "core/arm/nce/deferred_publication_budget.h"
+#include "core/arm/nce/nce_fault_stats.h"
 #include "video_core/cache_memory_stats.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "core/cpu_manager.h"
@@ -159,6 +166,8 @@ long ReadSysfsMiB(const std::string& path) {
 
 // NovaS: one line with the process and system memory, to see what grows before Android kills the app.
 void LogNovaSMemory() {
+    Common::GpuTransitionProfile::ReportWatchdog();
+    if (!Common::GpuTransitionProfile::enabled.load(std::memory_order_relaxed)) return;
     long rss = -1, anon = -1, file = -1, shmem = -1, swap = -1;
     ReadProcKb("/proc/self/status", {{"VmRSS", &rss}, {"RssAnon", &anon}, {"RssFile", &file},
                                      {"RssShmem", &shmem}, {"VmSwap", &swap}});
@@ -174,20 +183,145 @@ void LogNovaSMemory() {
     const u64 vulkan = Vulkan::PresentingDeviceMemoryUsage() >> 20;
     LOG_INFO(Frontend,
              "NovaS memory: rss {} MiB (anon {}, file {}, shmem {}, swapped {}) | guest RAM written {} MiB, "
-             "resident {} MiB | Vulkan {} MiB | kgsl mapped {} unmapped {} | phone available {} MiB, "
+             "resident {} MiB | Vulkan device_used {} MiB | kgsl mapped {} unmapped {} | phone available {} MiB, "
              "swap free {}/{} MiB",
              rss, anon, file, shmem, swap, guest_used, guest_resident, vulkan, gpu_mapped, gpu_unmapped,
              available, swap_free, swap_total);
+    {
+        // NovaS: NCE faults on the GPU's cached memory since the last line, by instruction kind.
+        namespace F = Core::NceFaultStats;
+        std::array<u64, F::Count> n{};
+        for (size_t i = 0; i < F::Count; ++i) {
+            n[i] = F::counts[i].exchange(0, std::memory_order_relaxed);
+        }
+        LOG_INFO(Frontend,
+                 "NovaS NCE faults on GPU pages: reads {}, stores single {}, pair {}, simd {}, "
+                 "exclusive/ordered {}, atomic {}, other {}",
+                 n[F::Read], n[F::StoreSingle], n[F::StorePair], n[F::StoreSimd],
+                 n[F::StoreExclusive], n[F::StoreAtomic], n[F::StoreOther]);
+        namespace E = Core::NceExactStore;
+        std::string fallbacks;
+        for (size_t i = 0; i < static_cast<size_t>(E::Result::Count); ++i) {
+            if (const u64 c = E::fallbacks[i].exchange(0, std::memory_order_relaxed); c != 0) {
+                fallbacks += fmt::format(" {} {}", E::fallback_names[i], c);
+            }
+        }
+        LOG_INFO(Frontend,
+                 "NovaS NCE exact stores: single {}, pair {}, simd single {}, simd pair {}; "
+                 "fallbacks:{}",
+                 E::emulated_single.exchange(0, std::memory_order_relaxed),
+                 E::emulated_pair.exchange(0, std::memory_order_relaxed),
+                 E::emulated_simd_single.exchange(0, std::memory_order_relaxed),
+                 E::emulated_simd_pair.exchange(0, std::memory_order_relaxed),
+                 fallbacks.empty() ? std::string{" none"} : fallbacks);
+        const auto timing = [](const char* name, E::Timing& t) {
+            const u64 count = t.count.exchange(0, std::memory_order_relaxed);
+            const u64 total = t.total_ns.exchange(0, std::memory_order_relaxed);
+            const u64 max = t.max_ns.exchange(0, std::memory_order_relaxed);
+            return fmt::format(" {} {}x avg {:.1f} us max {:.1f} us", name, count,
+                               count ? static_cast<double>(total) / count / 1000.0 : 0.0,
+                               static_cast<double>(max) / 1000.0);
+        };
+        LOG_INFO(Frontend, "NovaS NCE store timing:{}{}{}{}{}{}{} | resume skipped {}",
+                 timing("host", E::timing_host), timing("gpu queue", E::timing_gpu_queue),
+                 timing("gpu callback", E::timing_gpu_callback),
+                 timing("gpu wake", E::timing_gpu_wake),
+                 timing("gpu round trip", E::timing_gpu_round_trip),
+                 timing("resume", E::timing_resume), timing("total", E::timing_total),
+                 E::resume_skipped.exchange(0, std::memory_order_relaxed));
+        std::string opcodes;
+        for (auto& entry : E::other_opcodes) {
+            const u64 key = entry.key.load(std::memory_order_relaxed);
+            if (key == 0) {
+                break;
+            }
+            if (const u64 c = entry.count.exchange(0, std::memory_order_relaxed); c != 0) {
+                opcodes += fmt::format(" {:08x}:{}", key - 1, c);
+            }
+        }
+        std::string dczid;
+        for (size_t i = 0; i < E::dc_zva_dczid.size(); ++i) {
+            if (const u64 c = E::dc_zva_dczid[i].exchange(0, std::memory_order_relaxed)) {
+                dczid += fmt::format(" {:#x}:{}", i, c);
+            }
+        }
+        LOG_INFO(Frontend,
+                 "NovaS NCE other stores: seen {} (overflow {}, opcode read failed {}) opcodes:{} | "
+                 "DC ZVA detected {} emulated {} ({} bytes) dczid:{}",
+                 E::other_opcodes_seen.exchange(0, std::memory_order_relaxed),
+                 E::other_opcodes_overflow.exchange(0, std::memory_order_relaxed),
+                 E::opcode_read_failed.exchange(0, std::memory_order_relaxed), opcodes,
+                 E::dc_zva_detected.exchange(0, std::memory_order_relaxed),
+                 E::emulated_dc_zva.exchange(0, std::memory_order_relaxed),
+                 E::emulated_dc_zva_bytes.exchange(0, std::memory_order_relaxed), dczid);
+        std::string reasons;
+        for (size_t i = 0; i < E::fault_reason_names.size(); ++i) {
+            if (const u64 c = E::unsupported_reasons[i].exchange(0, std::memory_order_relaxed)) {
+                reasons += fmt::format(" {} {}", E::fault_reason_names[i], c);
+            }
+        }
+        std::string ecs, fscs;
+        for (size_t i = 0; i < 64; ++i) {
+            if (const u64 c = E::unsupported_ec[i].exchange(0, std::memory_order_relaxed)) {
+                ecs += fmt::format(" {:#x}:{}", i, c);
+            }
+            if (const u64 c = E::unsupported_fsc[i].exchange(0, std::memory_order_relaxed)) {
+                fscs += fmt::format(" {:#x}:{}", i, c);
+            }
+        }
+        LOG_INFO(Frontend,
+                 "NovaS NCE store detail: inline copies {} (upload {}, render pass ends {}); "
+                 "retry bypassed {} mismatch {}; unsupported faults:{} | ec{} | fsc{} | wnr_read={} wnr_write={} | "
+                 "si_code accerr {} maperr {} other {}",
+                 E::inline_copies.exchange(0, std::memory_order_relaxed),
+                 E::inline_upload_copies.exchange(0, std::memory_order_relaxed),
+                 E::inline_render_pass_ends.exchange(0, std::memory_order_relaxed),
+                 E::retry_bypassed.exchange(0, std::memory_order_relaxed),
+                 E::retry_mismatch.exchange(0, std::memory_order_relaxed), reasons, ecs, fscs,
+                 E::unsupported_wnr[0].exchange(0, std::memory_order_relaxed),
+                 E::unsupported_wnr[1].exchange(0, std::memory_order_relaxed),
+                 E::unsupported_si_code[0].exchange(0, std::memory_order_relaxed),
+                 E::unsupported_si_code[1].exchange(0, std::memory_order_relaxed),
+                 E::unsupported_si_code[2].exchange(0, std::memory_order_relaxed));
+    }
     namespace Stats = VideoCommon::CacheMemoryStats;
     const u64 created = Stats::texture_created.load(std::memory_order_relaxed);
     const u64 deleted = Stats::texture_deleted.load(std::memory_order_relaxed);
     LOG_INFO(Frontend,
-             "NovaS Vulkan memory: {}textures {} MiB ({} created, {} deleted), buffers {} MiB, "
+             "NovaS Vulkan memory: {}registered_images={} registered_base_estimate={} MiB registered_scaled_estimate={} MiB "
+             "retired_estimate={} MiB ({} created, {} deleted), buffer_cache={} MiB, "
              "staging {} MiB",
              Vulkan::PresentingDeviceMemoryBreakdown(),
-             Stats::texture_bytes.load(std::memory_order_relaxed) >> 20, created, deleted,
+             Stats::texture_images.load(std::memory_order_relaxed),
+             Stats::texture_registered_base_bytes.load(std::memory_order_relaxed) >> 20,
+             Stats::texture_registered_scaled_bytes.load(std::memory_order_relaxed) >> 20,
+             Stats::texture_deferred_bytes.load(std::memory_order_relaxed) >> 20, created, deleted,
              Stats::buffer_bytes.load(std::memory_order_relaxed) >> 20,
              Stats::staging_bytes.load(std::memory_order_relaxed) >> 20);
+    const u64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    LOG_INFO(Frontend,
+             "NovaS texture ages: tick_0={} tick_1_9={} tick_10_24={} tick_25_49={} tick_50_plus={} "
+             "deferred={} unit=MiB sample_age_ms={}",
+             Stats::texture_age_bytes[0].load(std::memory_order_relaxed) >> 20,
+             Stats::texture_age_bytes[1].load(std::memory_order_relaxed) >> 20,
+             Stats::texture_age_bytes[2].load(std::memory_order_relaxed) >> 20,
+             Stats::texture_age_bytes[3].load(std::memory_order_relaxed) >> 20,
+             Stats::texture_age_bytes[4].load(std::memory_order_relaxed) >> 20,
+             Stats::texture_deferred_bytes.load(std::memory_order_relaxed) >> 20,
+             (now - Stats::texture_snapshot_ns.load(std::memory_order_relaxed)) / 1'000'000);
+    constexpr std::array reasons{"current_frame", "decoding", "gpu_pending", "age_protected", "eligible", "policy"};
+    for (size_t i = 0; i < reasons.size(); ++i) {
+        LOG_INFO(Frontend, "NovaS texture state: reason={} images={} MiB={}", reasons[i],
+                 Stats::texture_blocked_images[i].load(std::memory_order_relaxed),
+                 Stats::texture_blocked_bytes[i].load(std::memory_order_relaxed) >> 20);
+    }
+    LOG_INFO(Frontend,
+             "NovaS staging state: free={} pending={} stream={} unit=MiB sample_age_ms={}",
+             Stats::staging_free_bytes.load(std::memory_order_relaxed) >> 20,
+             Stats::staging_pending_bytes.load(std::memory_order_relaxed) >> 20,
+             Stats::staging_stream_bytes.load(std::memory_order_relaxed) >> 20,
+             (now - Stats::staging_sample_ns.load(std::memory_order_relaxed)) / 1'000'000);
 }
 } // namespace
 
@@ -1140,7 +1274,33 @@ void Java_org_yuzu_yuzu_1emu_NativeLibrary_initializeSystem(JNIEnv* env, jclass 
     // config folder; a value already in the environment wins. The engine's own defaults cover the rest
     // (SPLIT=2, fence batching); the experiments read by static initializers stay off on Android.
     if (!reload) {
+#ifdef NOVAS_DEFERRED_TEST
+        // Test APK only (NOVAS_DEFERRED_TEST): deferred writes and the GPU profile always on.
+        setenv("EDEN_NX2_DEFERRED_WRITES", "1", 0);
+        setenv("EDEN_NX2_DEFERRED_PRODUCER", "1", 0);
+        setenv("EDEN_NX2_GPU_PROFILE", "1", 0);
+#endif
         FrontendCommon::LoadNx2Switches("", Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir));
+        const bool journal = Core::DeferredWritesConfig::IsEnabled(
+            std::getenv("EDEN_NX2_DEFERRED_WRITES"));
+        const bool producer = Core::DeferredWritesConfig::IsEnabled(
+            std::getenv("EDEN_NX2_DEFERRED_PRODUCER"));
+        const char* profile = std::getenv("EDEN_NX2_GPU_PROFILE");
+        LOG_INFO(Frontend,
+                 "GPU_DEFERRED_CONFIG switches={}/nx2_switches.txt journal={} producer={} "
+                 "producer_requested={} gpu_profile={} publication_budget_mean_us={} "
+                 "publication_budget_core_mean_us={} "
+                 "publication_budget_samples={} publication_budget_slow_samples={} publication_budget_faults={} "
+                 "publication_budget_window_ms={} publication_budget_cooldown_ms={} reload_requires_app_restart=1",
+                 Common::FS::GetEdenPathString(Common::FS::EdenPath::ConfigDir), journal, producer,
+                 journal && producer, profile && profile[0] != '\0' && profile[0] != '0',
+                 Core::DeferredPublicationBudget::MeanLimitNs / 1000,
+                 Core::DeferredPublicationBudget::CoreMeanLimitNs / 1000,
+                 Core::DeferredPublicationBudget::SampleCount,
+                 Core::DeferredPublicationBudget::SlowSampleLimit,
+                 Core::DeferredPublicationBudget::FaultLimit,
+                 Core::DeferredPublicationBudget::WindowNs / 1'000'000,
+                 Core::DeferredPublicationBudget::CooldownNs / 1'000'000);
     }
     // Initialize the emulated system.
     if (!reload) {

@@ -13,6 +13,7 @@
 
 #include <glad/glad.h>
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging.h"
 #include "common/math_util.h"
@@ -22,6 +23,7 @@
 #include "video_core/control/channel_state.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/renderer_opengl/gl_device.h"
 #include "video_core/renderer_opengl/gl_query_cache.h"
@@ -79,9 +81,23 @@ RasterizerOpenGL::RasterizerOpenGL(Core::Frontend::EmuWindow& emu_window_, Tegra
       buffer_cache(device_memory_, buffer_cache_runtime),
       shader_cache(device_memory_, emu_window_, device, texture_cache, buffer_cache,
                    program_manager, state_tracker, gpu.ShaderNotify()),
-      query_cache(*this, device_memory_), accelerate_dma(buffer_cache, texture_cache),
+      query_cache(gpu, *this, device_memory_), accelerate_dma(buffer_cache, texture_cache),
       fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache),
-      blit_image(program_manager_) {}
+      blit_image(program_manager_) {
+    const auto apply_deferred = [this](VideoCommon::DeferredWrites::Cut cut) {
+        gpu.OrderDeferredWriteCut(cut);
+    };
+    buffer_cache.SetDeferredWriteJournal(gpu.DeferredWriteJournal(), apply_deferred);
+    texture_cache.SetDeferredWriteJournal(gpu.DeferredWriteJournal(), apply_deferred,
+        [this](std::span<const VideoCommon::DeferredWrites::TransitionRange> ranges) {
+            std::scoped_lock lock{buffer_cache.mutex};
+            for (const auto& range : ranges) {
+                if (range.space == VideoCommon::DeferredWrites::TransitionSpace::Device) {
+                    buffer_cache.DownloadMemory(range.address, range.size);
+                }
+            }
+        });
+}
 
 RasterizerOpenGL::~RasterizerOpenGL() = default;
 
@@ -456,7 +472,16 @@ void RasterizerOpenGL::QueryFallback(GPUVAddr gpu_addr, VideoCommon::QueryType t
     if (type != VideoCommon::QueryType::Payload) {
         payload = 1u;
     }
-    std::function<void()> func([this, gpu_addr, flags, memory_manager = gpu_memory, payload]() {
+    std::shared_ptr<VideoCommon::DeferredWrites::Journal::WriterPermission> deferred_writer;
+    if (gpu.DeferredWriteJournal()) {
+        const auto address = gpu_memory->GpuToCpuAddress(gpu_addr);
+        ASSERT_OR_EXECUTE(address, return;);
+        deferred_writer = gpu.BeginDeferredQueryWrite(
+            *address, True(flags & VideoCommon::QueryPropertiesFlags::HasTimeout) ? 16 : 4);
+    }
+    std::function<void()> func([this, gpu_addr, flags, memory_manager = gpu_memory, payload,
+                               deferred_writer = std::move(deferred_writer)]() {
+        [[maybe_unused]] const auto& keep_writer = deferred_writer;
         if (True(flags & VideoCommon::QueryPropertiesFlags::HasTimeout)) {
             u64 ticks = gpu.GetTicks();
             memory_manager->Write<u64>(gpu_addr + 8, ticks);
@@ -611,6 +636,21 @@ void RasterizerOpenGL::InvalidateGPUCache() {
     gpu.InvalidateGPUCache();
 }
 
+bool RasterizerOpenGL::ApplyDeferredWrite(const VideoCommon::DeferredWrites::Write& write) {
+    if (!VideoCommon::GpuSplit::OwnsScheduler()) return false;
+    const DAddr page = Common::AlignDown(write.device_address, Core::DEVICE_PAGESIZE);
+    {
+        std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+        if (texture_cache.IsRegionGpuModified(page, Core::DEVICE_PAGESIZE) ||
+            !buffer_cache.ApplyDeferredWrite(write)) {
+            return false;
+        }
+        texture_cache.WriteMemory(write.device_address, write.size);
+    }
+    shader_cache.InvalidateRegion(write.device_address, write.size);
+    return true;
+}
+
 void RasterizerOpenGL::UnmapMemory(DAddr addr, u64 size) {
     {
         std::scoped_lock lock{texture_cache.mutex};
@@ -646,8 +686,13 @@ void RasterizerOpenGL::SignalReference() {
     fence_manager.SignalOrdering();
 }
 
-void RasterizerOpenGL::ReleaseFences(bool force) {
-    fence_manager.WaitPendingFences(force);
+void RasterizerOpenGL::ReleaseFences(bool force, std::source_location caller) {
+    fence_manager.WaitPendingFences(force, caller);
+}
+
+bool RasterizerOpenGL::ResolveDeferredWriteReadbacks() {
+    fence_manager.WaitPendingReadbacks();
+    return true;
 }
 
 void RasterizerOpenGL::FlushAndInvalidateRegion(DAddr addr, u64 size,
@@ -1447,7 +1492,8 @@ bool AccelerateDMA::DmaBufferImageCopy(const Tegra::DMA::ImageCopy& copy_info,
     const auto post_op = IS_IMAGE_UPLOAD ? VideoCommon::ObtainBufferOperation::DoNothing
                                          : VideoCommon::ObtainBufferOperation::MarkAsWritten;
     const auto [buffer, offset] =
-        buffer_cache.ObtainBuffer(buffer_operand.address, buffer_size, sync_info, post_op);
+        buffer_cache.ObtainBuffer(buffer_operand.address, buffer_size, sync_info, post_op,
+                                 VideoCommon::GpuWriteTrace::Origin::ImageToBuffer);
 
     const auto [image, copy] = texture_cache.DmaBufferImageCopy(
         copy_info, buffer_operand, image_operand, image_id, IS_IMAGE_UPLOAD);

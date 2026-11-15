@@ -130,6 +130,9 @@ struct ImageBase {
     /// Newest modification tick among this image's aliases.
     u64 alias_modification_tick = 0;
     size_t lru_index = SIZE_MAX;
+    u64 last_used_frame = 0;
+    u64 last_used_ns = 0;
+    u64 last_used_gpu_tick = 0;
 
     std::array<u32, MAX_MIP_LEVELS> mip_level_offsets{};
 

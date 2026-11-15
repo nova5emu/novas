@@ -8,6 +8,8 @@
 
 #include "common/host_memory.h"
 #include "common/typed_address.h"
+#include "core/deferred_cpu_mappings.h"
+#include "video_core/cpu_epoch_coordinator.h"
 
 namespace Core {
 
@@ -66,6 +68,13 @@ public:
     }
 
     Common::HostMemory buffer;
+
+    DeferredCpuMappings& CpuMappings() { return cpu_mappings; }
+    VideoCommon::CpuEpochs::Coordinator& CpuEpochs() const { return cpu_epochs; }
+
+private:
+    DeferredCpuMappings cpu_mappings;
+    mutable VideoCommon::CpuEpochs::Coordinator cpu_epochs;
 };
 
 } // namespace Core

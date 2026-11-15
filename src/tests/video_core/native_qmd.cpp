@@ -9,6 +9,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "video_core/fire_emblem_upscale.h"
 #include "video_core/native_qmd.h"
 
 using Tegra::NativeQmdScheduler;
@@ -148,4 +149,97 @@ TEST_CASE("Semaphore reductions follow the documented ops", "[video_core][native
     REQUIRE(ReduceSemaphore(5, false, 0b1100, 0b1010) == 0b1000);
     REQUIRE(ReduceSemaphore(6, false, 0b1100, 0b1010) == 0b1110);
     REQUIRE(ReduceSemaphore(7, false, 0b1100, 0b1010) == 0b0110);
+}
+
+TEST_CASE("A replaced compute dispatch preserves all QMD releases and dependent work",
+          "[video_core][native_qmd]") {
+    constexpr Address first = 0x400000;
+    constexpr Address second = 0x400100;
+    auto qmd = MakeQmd();
+    qmd[12] = qmd[13] = qmd[14] = 1;
+    qmd[15] = Word(second >> 8);
+    qmd[16] = 1 | (3U << 1);
+    SetRelease(qmd, 24, 0x3000, Enable | OneWord, 11);
+    SetRelease(qmd, 28, 0x3010, Enable | OneWord | Reduction, 12);
+    SetRelease(qmd, 52, 0x3020, Enable | OneWord | (1U << 19), 13);
+    auto dependent = MakeQmd();
+    SetRelease(dependent, 24, 0x3030, Enable | OneWord, 14);
+    const std::map<Address, Descriptor> memory{{first, qmd}, {second, dependent}};
+    NativeQmdScheduler scheduler;
+    std::vector<Released> released;
+    std::vector<Address> completed;
+    bool replaced{};
+    scheduler.release_trace = [&](Address address, const Descriptor& descriptor,
+                                  const NativeQmdScheduler::ReleaseStatuses& statuses) {
+        completed.push_back(address);
+        if (address == first) {
+            CHECK(replaced);
+            CHECK(released.size() == 3);
+            CHECK(descriptor == qmd);
+            CHECK(statuses == NativeQmdScheduler::ReleaseStatuses{
+                NativeQmdScheduler::ReleaseStatus::Queued,
+                NativeQmdScheduler::ReleaseStatus::Queued,
+                NativeQmdScheduler::ReleaseStatus::Queued});
+        } else {
+            CHECK(released.size() == 4);
+            CHECK(statuses == NativeQmdScheduler::ReleaseStatuses{
+                NativeQmdScheduler::ReleaseStatus::Queued,
+                NativeQmdScheduler::ReleaseStatus::Disabled,
+                NativeQmdScheduler::ReleaseStatus::Disabled});
+        }
+    };
+    const auto error = scheduler.Signal(first, 3,
+        [&](Address address, Descriptor& descriptor) {
+            descriptor = memory.at(address);
+            return true;
+        },
+        [&](Address address, Word payload, Word flags) {
+            CHECK(replaced);
+            released.push_back({address, payload, flags});
+            return true;
+        },
+        [&](const Descriptor&) {
+            try {
+                throw VideoCommon::FireEmblemUpscale::DispatchReplaced{};
+            } catch (const VideoCommon::FireEmblemUpscale::DispatchReplaced&) {
+                replaced = true;
+                return true;
+            }
+        });
+    CHECK(error.empty());
+    CHECK(completed == std::vector<Address>{first, second});
+    CHECK(released == std::vector<Released>{
+        {0x3000, 11, Enable | OneWord},
+        {0x3010, 12, Enable | OneWord | Reduction},
+        {0x3020, 13, Enable | OneWord | (1U << 19)},
+        {0x3030, 14, Enable | OneWord}});
+}
+
+TEST_CASE("QMD release diagnostics preserve unsupported unmapped and unreached slots",
+          "[video_core][native_qmd]") {
+    constexpr Address address = 0x500000;
+    auto qmd = MakeQmd();
+    SetRelease(qmd, 24, 0x4000, Enable | (2U << 30), 21);
+    SetRelease(qmd, 28, 0x4010, Enable | OneWord, 22);
+    SetRelease(qmd, 52, 0x4020, Enable | OneWord, 23);
+    NativeQmdScheduler scheduler;
+    size_t reports{};
+    scheduler.release_trace = [&](Address reported, const Descriptor& descriptor,
+                                  const NativeQmdScheduler::ReleaseStatuses& statuses) {
+        ++reports;
+        CHECK(reported == address);
+        CHECK(descriptor == qmd);
+        CHECK(statuses == NativeQmdScheduler::ReleaseStatuses{
+            NativeQmdScheduler::ReleaseStatus::Unsupported,
+            NativeQmdScheduler::ReleaseStatus::Unmapped,
+            NativeQmdScheduler::ReleaseStatus::NotReached});
+    };
+    const auto error = scheduler.Signal(address, 3,
+        [&](Address, Descriptor& descriptor) {
+            descriptor = qmd;
+            return true;
+        },
+        [&](Address, Word, Word) { return false; });
+    CHECK(error == "unmapped QMD release");
+    CHECK(reports == 1);
 }

@@ -159,12 +159,22 @@ SparseBuffer MultiRangeBufferCache::CreateSparse(const Device& device, Scheduler
     VkResult bind_result = VK_ERROR_UNKNOWN;
     {
         std::scoped_lock lock{scheduler.submit_mutex};
-        bind_result = device.GetGraphicsQueue().BindSparse(bind_info, *fence);
+        bind_result = device.GetGraphicsQueue().BindSparse(bind_info, *fence,
+            HangTrace::Enabled() ? scheduler.CurrentTick() : 0);
     }
     if (bind_result != VK_SUCCESS) {
         return SparseBuffer{};
     }
-    fence.Wait();
+    if (HangTrace::Enabled()) {
+        const u64 tick = scheduler.CurrentTick();
+        const auto call = HangTrace::Event("sparse-fence-enter fence", tick,
+            {HangTrace::Handle(*fence)});
+        const auto wait_result = fence.Wait();
+        HangTrace::Event("sparse-fence-return call,result,fence", tick,
+            {call, static_cast<u64>(wait_result), HangTrace::Handle(*fence)});
+    } else {
+        fence.Wait();
+    }
     return handle;
 }
 

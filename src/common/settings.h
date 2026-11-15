@@ -402,7 +402,12 @@ struct Values {
                                                   true};
     // The Legend of Zelda: Ocarina of Time's own anti-aliasing network and its sharpening output
     // pass, or the tonemapped image as the game renders it (video_core/oot_network.h).
-    SwitchableSetting<OotAntiAliasing> oot_anti_aliasing{linkage, OotAntiAliasing::Game,
+    SwitchableSetting<OotAntiAliasing> oot_anti_aliasing{linkage,
+#ifdef __ANDROID__
+                                                         OotAntiAliasing::NoSharpening,
+#else
+                                                         OotAntiAliasing::Game,
+#endif
                                                          "oot_anti_aliasing", Category::Renderer};
 
     SwitchableSetting<std::string> post_shader_chain{linkage,
@@ -1045,6 +1050,11 @@ bool CurrentProgramIsSwitch2();
 // for the running program (the configuration is left as is). The core clears it on load.
 AstcRecompression GetAstcRecompression();
 void SetAstcRecompressionOverride(std::optional<AstcRecompression> recompression);
+
+// The ASTC decode mode in effect: accelerate_astc, unless the renderer picked another one for the
+// running program (the configuration is left as is). The core clears it on load.
+AstcDecodeMode GetAstcDecodeMode();
+void SetAstcDecodeOverride(std::optional<AstcDecodeMode> mode);
 
 bool IsOpenGL();
 

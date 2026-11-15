@@ -6,7 +6,6 @@
 
 #include <boost/container/small_vector.hpp>
 
-#include "common/adpf.h"
 #include "common/assert.h"
 #include "common/logging.h"
 #include "core/core.h"
@@ -88,7 +87,6 @@ void nvdisp_disp0::Composite(std::span<const Nvnflinger::HwcLayer> sorted_layers
     }
 
     system.GPU().RequestComposite(std::move(output_layers), std::move(output_fences));
-    Common::ADPF::ReportFrameInterval();
     system.SpeedLimiter().DoSpeedLimiting(system.CoreTiming().GetGlobalTimeUs());
     system.GetPerfStats().EndSystemFrame();
     system.GetPerfStats().BeginSystemFrame();

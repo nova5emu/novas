@@ -532,6 +532,8 @@ PROLOGUE_CPP = """
 #include "core/core.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/svc.h"
+#include "core/hle/kernel/svc_deferred_transition.h"
+#include "video_core/deferred_write_journal.h"
 
 namespace Kernel::Svc {
 
@@ -571,6 +573,10 @@ void Call(Core::System& system, u32 imm) {
     auto& process = GetCurrentProcess(kernel);
     std::array<uint64_t, 8> args;
     kernel.CurrentPhysicalCore().SaveSvcArguments(process, args);
+    const auto deferred_transition = NeedsDeferredTransition(imm) ?
+        system.BeginDeferredTransition(Common::GpuTransitionProfile::SuspensionSite::SvcMemory) : nullptr;
+    Common::GpuTransitionProfile::RecordSvc(imm, NeedsDeferredTransition(imm),
+        deferred_transition != nullptr, deferred_transition && deferred_transition->CreatedEpoch());
     LOG_TRACE(Kernel_SVC, "#{:#x} [0]={:#x} [1]={:#x} [2]={:#x} [3]={:#x} [4]={:#x} [5]={:#x} [6]={:#x}",
         imm,
         GetArg32(args, 0), GetArg32(args, 1), GetArg32(args, 2),

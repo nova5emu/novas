@@ -3,8 +3,11 @@
 
 #pragma once
 
+#include <memory>
+
 #include "common/common_funcs.h"
 #include "common/common_types.h"
+#include "video_core/deferred_write_journal.h"
 
 namespace VideoCommon {
 
@@ -26,6 +29,8 @@ public:
     DAddr guest_address{};
     QueryFlagBits flags{};
     u64 value{};
+    u64 compute_release_trace{};
+    std::shared_ptr<DeferredWrites::Journal::WriterPermission> deferred_writer;
 
 protected:
     // Default constructor

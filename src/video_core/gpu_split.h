@@ -84,6 +84,9 @@ public:
     [[nodiscard]] static bool OnBackThread() {
         return on_back_thread;
     }
+    [[nodiscard]] static bool OnGpuThread() {
+        return on_gpu_thread;
+    }
     /// Marks the calling thread as the GPU thread (the front, or the only one without the split).
     static void MarkGpuThread() {
         on_gpu_thread = true;
@@ -104,14 +107,22 @@ public:
     [[nodiscard]] static bool OwnsScheduler() {
         return Get().BackRunning() ? on_back_thread : on_gpu_thread;
     }
-    /// Called on the back before it sleeps waiting for work (the rasterizer submits deferred work).
-    void SetIdleHook(void (*hook)(void*), void* argument) {
+    /// Back-owned service hook: idle=true only when the published command ring is empty.
+    void SetIdleHook(void (*hook)(void*, bool), void* argument) {
         idle_hook = hook;
         idle_argument = argument;
     }
     /// Any thread: whether the back thread runs (false before it starts and once it stopped).
     [[nodiscard]] bool BackRunning() const {
         return back_running.load(std::memory_order_acquire);
+    }
+
+    void SetFrontPendingChannels(bool pending) {
+        front_pending_channels.store(pending, std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] bool FrontHasPendingChannels() const {
+        return front_pending_channels.load(std::memory_order_relaxed);
     }
     /// Any thread: has the back call the idle hook soon, between entries or at once if it sleeps.
     void RequestIdleHook() {
@@ -473,10 +484,11 @@ private:
     static inline thread_local bool on_back_thread{};
     static inline thread_local bool on_gpu_thread{};
     static inline std::atomic<u32> gpu_threads{};
-    void (*idle_hook)(void*){};
+    void (*idle_hook)(void*, bool){};
     void* idle_argument{};
     alignas(64) std::atomic<bool> hook_requested{};
     std::atomic<bool> back_running{};
+    std::atomic<bool> front_pending_channels{};
     std::atomic<bool> back_quiet{true};
 
     // 128 bytes: x86 spatial prefetchers pull 64-byte lines in pairs. back_waiting and wake are

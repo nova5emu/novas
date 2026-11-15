@@ -12,6 +12,8 @@ enum class Session {
     Background,
 };
 
+void Configure();
+
 bool IsSessionSupported(Session session);
 
 bool AddCurrentThread(Session session);
@@ -20,6 +22,7 @@ void RemoveCurrentThread();
 void SetTargetWorkDuration(std::chrono::nanoseconds target);
 
 void ReportFrameInterval();
+void ResetFrameInterval();
 
 void Shutdown();
 

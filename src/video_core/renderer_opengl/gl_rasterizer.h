@@ -102,6 +102,7 @@ public:
     void PrepareRegionWrite(DAddr addr, u64 size, VideoCommon::CacheType which) override;
     void OnCacheInvalidation(PAddr addr, u64 size) override;
     bool OnCPUWrite(PAddr addr, u64 size) override;
+    bool ApplyDeferredWrite(const VideoCommon::DeferredWrites::Write& write) override;
     void InvalidateGPUCache() override;
     void UnmapMemory(DAddr addr, u64 size) override;
     void ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) override;
@@ -109,7 +110,9 @@ public:
     void SyncOperation(std::function<void()>&& func) override;
     void SignalSyncPoint(u32 value) override;
     void SignalReference() override;
-    void ReleaseFences(bool force = true) override;
+    void ReleaseFences(
+        bool force = true, std::source_location caller = std::source_location::current()) override;
+    bool ResolveDeferredWriteReadbacks() override;
     void FlushAndInvalidateRegion(
         DAddr addr, u64 size, VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     void WaitForIdle() override;

@@ -17,6 +17,7 @@
 #include "common/bit_util.h"
 #include "common/common_types.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/gpu_write_trace.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/query_cache/frame_trace.h"
 #include "video_core/query_cache/query_cache.h"
@@ -1709,6 +1710,8 @@ void QueryCacheRuntime::SyncValues(std::span<SyncValuesType> values, VkBuffer ba
     impl->little_cache.clear();
     size_t total_size = 0;
     for (auto& sync_val : values) {
+        VideoCommon::GpuWriteTrace::Operation(VideoCommon::GpuWriteTrace::Origin::Query,
+                                              sync_val.size);
         total_size += sync_val.size;
         bool found = false;
         DAddr base = Common::AlignDown(sync_val.address, Core::DEVICE_PAGESIZE);

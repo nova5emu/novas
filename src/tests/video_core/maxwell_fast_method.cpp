@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <functional>
@@ -72,6 +73,10 @@ struct GpuSplitTestAccess {
         Initialize(split, system);
         split.active = true;
         split.back_thread = std::jthread([&split](std::stop_token stop) { split.BackLoop(stop); });
+    }
+
+    static bool IsParked(const GpuSplit& split) {
+        return split.back_waiting.load(std::memory_order_acquire);
     }
 
     static u64 NearWrap() {
@@ -1277,6 +1282,50 @@ TEST_CASE("Loop skip initializes lazily and preserves live overrides including z
     REQUIRE(VideoCore::Nx2Debug::LoopSkipMode() == 0);
     setting->store(1);
     REQUIRE(VideoCore::Nx2Debug::LoopSkipMode() == 1);
+}
+
+TEST_CASE("Split idle requests wake a quiet back and survive a running hook",
+          "[video_core][gpu_split_dependencies][split_fence_wait]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    struct HookState {
+        VideoCommon::GpuSplit* split;
+        std::atomic<u32> calls{};
+        std::atomic<bool> wrong_context{};
+        std::atomic<bool> request_again{};
+    } state{&split};
+    split.SetIdleHook([](void* argument, bool idle) {
+        auto& state = *static_cast<HookState*>(argument);
+        if (!idle || !VideoCommon::GpuSplit::OnBackThread()) {
+            state.wrong_context.store(true);
+        }
+        state.calls.fetch_add(1);
+        if (state.request_again.exchange(false)) {
+            state.split->RequestIdleHook();
+        }
+    }, &state);
+    Access::Start(split, f.system);
+    SCOPE_EXIT { split.Stop(); };
+    const auto wait_until = [](auto&& predicate) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+        while (!predicate()) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return false;
+            }
+            std::this_thread::yield();
+        }
+        return true;
+    };
+    REQUIRE(wait_until([&] { return Access::IsParked(split); }));
+    REQUIRE(state.calls.load() == 1);
+    state.request_again.store(true);
+    split.RequestIdleHook();
+    REQUIRE(wait_until([&] { return state.calls.load() == 3 && Access::IsParked(split); }));
+    split.RequestIdleHook();
+    REQUIRE(wait_until([&] { return state.calls.load() == 4 && Access::IsParked(split); }));
+    REQUIRE_FALSE(state.wrong_context.load());
 }
 
 TEST_CASE("Maxwell3D keeps state written after the split stops over the front's shadow RAM",

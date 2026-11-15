@@ -10,11 +10,13 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "common/logging.h"
+#include "core/device_memory_manager.h"
 #include "core/hle/service/nvdrv/devices/nvdevice.h"
 
 namespace Service::Nvidia::Devices {
@@ -43,8 +45,9 @@ public:
     using ReleaseListener = std::function<void(u64 cpu_address, u64 size)>;
     /// A sparse region is created (true) or destroyed (false).
     using SparseListener = std::function<void(u64 gpu_address, u64 size, bool create)>;
-    /// A block of a sparse region gets memory [cpu_address, +size).
-    using BackListener = std::function<void(u64 gpu_address, u64 cpu_address, u64 size)>;
+    /// A block gets GPU-only physical backing, with no guest virtual mapping.
+    using BackListener =
+        std::function<void(u64 gpu_address, std::span<const Core::DeviceMemoryPhysicalSpan> spans)>;
     /// A tile of a sparse region shows process memory [cpu_address, +size), or reads zero again
     /// (cpu_address 0).
     using TileListener = std::function<void(u64 gpu_address, u64 cpu_address, u64 size)>;
@@ -96,7 +99,7 @@ public:
     }
 
     // Sparse regions (nx2:gpu 214 with the sparse flag): the GPU range reaches device memory of its
-    // own from the start, and each block gets memory when the GPU first writes it (BackSparse).
+    // own from the start, and each block gets physical memory when the GPU first writes it.
     // The GPU mapping never changes, so the texture cache doesn't rebuild the images over it as
     // blocks get memory; unbacked blocks read zero.
     void CreateSparse(u64 gpu_address, u64 size) {
@@ -119,11 +122,11 @@ public:
         }
     }
 
-    void BackSparse(u64 gpu_address, u64 cpu_address, u64 size) {
+    void BackSparsePhysical(u64 gpu_address, std::span<const Core::DeviceMemoryPhysicalSpan> spans) {
         std::scoped_lock lk{mutex};
         for (auto& [owner, listener] : listeners) {
             if (listener.back) {
-                listener.back(gpu_address, cpu_address, size);
+                listener.back(gpu_address, spans);
             }
         }
     }

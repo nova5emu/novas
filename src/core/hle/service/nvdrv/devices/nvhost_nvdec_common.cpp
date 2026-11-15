@@ -11,6 +11,7 @@
 #include "common/common_types.h"
 #include "common/logging.h"
 #include "core/core.h"
+#include "core/deferred_transition.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/service/nvdrv/core/container.h"
 #include "core/hle/service/nvdrv/core/nvmap.h"
@@ -99,7 +100,10 @@ NvResult nvhost_nvdec_common::Submit(IoctlSubmit& params, std::span<u8> data, De
     offset += SliceVectors(data, syncpt_increments, params.syncpoint_count, offset);
     offset += SliceVectors(data, fence_thresholds, params.fence_count, offset);
 
-    auto* session = core.GetSession(sessions[fd]);
+    const auto session = core.GetSessionLifetime(sessions[fd]);
+    if (!session) {
+        return NvResult::InvalidState;
+    }
 
     for (std::size_t i = 0; i < syncpt_increments.size(); i++) {
         const SyncptIncr& syncpt_incr = syncpt_increments[i];
@@ -142,6 +146,8 @@ NvResult nvhost_nvdec_common::GetWaitbase(IoctlGetWaitbase& params) {
 
 NvResult nvhost_nvdec_common::MapBuffer(IoctlMapBuffer& params, std::span<MapBufferEntry> entries,
                                         DeviceFD fd) {
+    Core::DeferredTransitionScope transition{system,
+        Common::GpuTransitionProfile::SuspensionSite::Nvdrv};
     const size_t num_entries = (std::min)(params.num_entries, static_cast<u32>(entries.size()));
     for (size_t i = 0; i < num_entries; i++) {
         DAddr pin_address = nvmap.PinHandle(entries[i].map_handle, true);

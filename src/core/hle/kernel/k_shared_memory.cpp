@@ -6,6 +6,7 @@
 
 #include "common/assert.h"
 #include "core/core.h"
+#include "core/device_memory.h"
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_scoped_resource_reservation.h"
 #include "core/hle/kernel/k_shared_memory.h"
@@ -44,6 +45,9 @@ Result KSharedMemory::Initialize(KernelCore& kernel, Core::DeviceMemory& device_
                                                KMemoryManager::Direction::FromBack);
     m_physical_address = kernel.MemoryManager().AllocateAndOpenContinuous(num_pages, 1, option);
     R_UNLESS(m_physical_address != 0, ResultOutOfMemory);
+    device_memory.CpuMappings().ExcludePhysical(
+        GetInteger(m_physical_address) - Core::DramMemoryMap::Base, num_pages * PageSize,
+        Core::DeferredCpuMappings::Status::Shared);
 
     //! Insert the result into our page group.
     m_page_group.emplace(kernel, std::addressof(kernel.GetSystemSystemResource().GetBlockInfoManager()));

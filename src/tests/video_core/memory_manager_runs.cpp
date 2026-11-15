@@ -30,7 +30,7 @@ public:
     void SyncOperation(std::function<void()>&&) override {}
     void SignalSyncPoint(u32) override {}
     void SignalReference() override {}
-    void ReleaseFences(bool) override {}
+    void ReleaseFences(bool, std::source_location) override {}
     void FlushAll() override {}
     void FlushRegion(DAddr, u64, VideoCommon::CacheType) override {}
     bool MustFlushRegion(DAddr, u64, VideoCommon::CacheType) override {

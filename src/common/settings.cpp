@@ -260,6 +260,16 @@ void SetAstcRecompressionOverride(std::optional<AstcRecompression> recompression
     astc_recompression_override = recompression;
 }
 
+static std::optional<AstcDecodeMode> astc_decode_override;
+
+AstcDecodeMode GetAstcDecodeMode() {
+    return astc_decode_override.value_or(values.accelerate_astc.GetValue());
+}
+
+void SetAstcDecodeOverride(std::optional<AstcDecodeMode> mode) {
+    astc_decode_override = mode;
+}
+
 bool IsDockedMode() {
     return values.use_docked_mode.GetValue() == Settings::ConsoleMode::Docked;
 }

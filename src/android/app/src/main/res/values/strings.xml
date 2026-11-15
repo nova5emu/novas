@@ -555,6 +555,10 @@
     <string name="fsr_sharpness">FSR/SGSR sharpness</string>
     <string name="fsr_sharpness_description">Determines how sharpened the image will look while using FSR or SGSR filters</string>
     <string name="renderer_anti_aliasing">Anti-aliasing method</string>
+    <string name="renderer_oot_anti_aliasing">Ocarina of Time anti-aliasing</string>
+    <string name="renderer_oot_anti_aliasing_description">Controls Ocarina of Time\'s anti-aliasing network and sharpening pass.</string>
+    <string name="oot_anti_aliasing_game">Game</string>
+    <string name="oot_anti_aliasing_no_sharpening">No sharpening (skip network)</string>
 
 
     <string name="advanced">Advanced</string>

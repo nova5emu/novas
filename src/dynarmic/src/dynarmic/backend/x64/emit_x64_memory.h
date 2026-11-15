@@ -8,12 +8,16 @@
 
 #pragma once
 
+#include <atomic>
 #include <bit>
+#include <climits>
+#include <type_traits>
 #include <utility>
 #include "dynarmic/backend/x64/xbyak.h"
 
 #include "dynarmic/backend/x64/a32_emit_x64.h"
 #include "dynarmic/backend/x64/a64_emit_x64.h"
+#include "dynarmic/backend/x64/abi.h"
 #include "dynarmic/backend/x64/exclusive_monitor_friend.h"
 #include "dynarmic/common/spin_lock_x64.h"
 #include "dynarmic/interface/exclusive_monitor.h"
@@ -28,6 +32,58 @@ using namespace Xbyak::util;
 constexpr size_t page_table_const_bits = 12;
 constexpr size_t page_table_const_size = 1 << page_table_const_bits;
 constexpr size_t page_table_const_mask = (1 << page_table_const_bits) - 1;
+
+template<size_t bitsize, typename Address, typename EmitContext>
+void EmitExclusivePreparation(BlockOfCode& code, EmitContext& ctx, Xbyak::Reg64 vaddr,
+                              Xbyak::Reg64 tmp, Xbyak::Reg64 tmp2) {
+    auto& conf = ctx.conf;
+    if (!conf.prepare_exclusive_memory) return;
+    static_assert(sizeof(std::atomic<u64>) == sizeof(u64));
+    static_assert(std::atomic<u64>::is_always_lock_free);
+    using Config = std::remove_cvref_t<decltype(conf)>;
+    SharedLabel slow = ctx.GenSharedLabel(), ready = ctx.GenSharedLabel();
+    if (conf.exclusive_prepare_table) {
+        // Misaligned accesses may span two pages; prepare the full range on the host.
+        if constexpr (bitsize > 8) {
+            code.test(vaddr, bitsize / CHAR_BIT - 1);
+            code.jnz(*slow, code.T_NEAR);
+        }
+        code.mov(tmp, vaddr);
+        code.shr(tmp, 12);
+        code.and_(tmp, conf.exclusive_prepare_table_mask);
+        code.mov(tmp2, reinterpret_cast<u64>(conf.exclusive_prepare_table));
+        code.mov(tmp2, qword[tmp2 + tmp * 8]);
+        code.mov(tmp, vaddr);
+        code.shl(tmp, 16);
+        code.shr(tmp, 28);
+        code.inc(tmp);
+        code.cmp(tmp, tmp2);
+        code.jne(*slow, code.T_NEAR);
+        if (conf.exclusive_prepare_fast_hits) {
+            code.mov(tmp2, reinterpret_cast<u64>(conf.exclusive_prepare_fast_hits));
+            code.inc(qword[tmp2]);
+        }
+    } else {
+        code.jmp(*slow, code.T_NEAR);
+    }
+    code.L(*ready);
+    ctx.deferred_emits.emplace_back([=, &code, &conf] {
+        Xbyak::Label stub;
+        code.L(*slow);
+        code.call(stub);
+        code.jmp(*ready, code.T_NEAR);
+        code.L(stub);
+        // A real call supplies the return-address alignment required by the ABI helpers.
+        ABI_PushCallerSaveRegistersAndAdjustStack(code);
+        code.mov(code.ABI_PARAM2, vaddr);
+        code.mov(code.ABI_PARAM1, reinterpret_cast<u64>(&conf));
+        code.CallLambda([](const Config& config, Address address) {
+            config.callbacks->MemoryPrepareExclusive(address, bitsize / CHAR_BIT);
+        });
+        ABI_PopCallerSaveRegistersAndAdjustStack(code);
+        code.ret();
+    });
+}
 
 template<typename EmitContext>
 void EmitDetectMisalignedVAddr(BlockOfCode& code, EmitContext& ctx, size_t bitsize, Xbyak::Label& abort, Xbyak::Reg64 vaddr, Xbyak::Reg64 tmp) {

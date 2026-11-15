@@ -22,6 +22,7 @@
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/ir_opt/passes.h"
+#include "shader_recompiler/ir_opt/storage_write_footprint.h"
 
 namespace Shader::Maxwell {
 namespace {
@@ -481,6 +482,7 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
     CollectInterpolationInfo(env, program);
     AddNVNStorageBuffers(program, normalized_host_info);
     Optimization::LimitSampledTextureArrays(program, normalized_host_info);
+    Optimization::CollectStorageWriteFootprintsIfEnabled(program);
     return program;
 }
 

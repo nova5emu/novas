@@ -13,6 +13,7 @@
 
 #include "common/assert.h"
 #include "common/common_types.h"
+#include "common/gpu_transition_profile.h"
 #include "common/logging.h"
 #include "common/scope_exit.h"
 #include "common/scratch_buffer.h"
@@ -1111,12 +1112,28 @@ Result KServerSession::ReceiveRequest(KernelCore& kernel, uintptr_t server_messa
                                       KPhysicalAddress server_message_paddr,
                                       std::shared_ptr<Service::HLERequestContext>* out_context,
                                       std::weak_ptr<Service::SessionRequestManager> manager) {
+    // HLE parses descriptors without creating aliases. Final references must be released
+    // after m_lock, so their destructors can prepare a transition only when needed.
+    [[maybe_unused]] auto transition = out_context == nullptr
+        ? kernel.System().BeginDeferredTransition(
+              Common::GpuTransitionProfile::SuspensionSite::IpcReceive)
+        : nullptr;
+    std::shared_ptr<Service::HLERequestContext> previous_context;
+    KThread* client_thread{};
+    KSessionRequest* failed_request{};
+    SCOPE_EXIT {
+        if (failed_request != nullptr) {
+            failed_request->Close(kernel);
+        }
+        if (client_thread != nullptr) {
+            client_thread->Close(kernel);
+        }
+    };
     // Lock the session.
     KScopedLightLock lk{m_lock};
 
     // Get the request and client thread.
     KSessionRequest* request;
-    KThread* client_thread;
 
     {
         KScopedSchedulerLock sl{kernel};
@@ -1142,10 +1159,6 @@ Result KServerSession::ReceiveRequest(KernelCore& kernel, uintptr_t server_messa
         client_thread->Open(kernel);
     }
 
-    SCOPE_EXIT {
-        client_thread->Close(kernel);
-    };
-
     // Set the request as our current.
     m_current_request = request;
 
@@ -1164,8 +1177,8 @@ Result KServerSession::ReceiveRequest(KernelCore& kernel, uintptr_t server_messa
         }
         Core::Memory::Memory& memory{client_thread->GetOwnerProcess()->GetMemory()};
         u32* cmd_buf{reinterpret_cast<u32*>(memory.GetPointer(client_message))};
-        *out_context =
-            std::make_shared<Service::HLERequestContext>(kernel, memory, this, client_thread);
+        previous_context = std::exchange(*out_context,
+            std::make_shared<Service::HLERequestContext>(kernel, memory, this, client_thread));
         (*out_context)->SetSessionRequestManager(manager);
         (*out_context)->PopulateFromIncomingCommandBuffer(cmd_buf);
         // We succeeded.
@@ -1193,10 +1206,8 @@ Result KServerSession::ReceiveRequest(KernelCore& kernel, uintptr_t server_messa
 
         // Reply to the client.
         {
-            // After we reply, close our reference to the request.
-            SCOPE_EXIT {
-                request->Close(kernel);
-            };
+            // Keep the request alive through the reply, then close it outside m_lock.
+            failed_request = request;
 
             // Get the event to check whether the request is async.
             if (KEvent* event = request->GetEvent(); event != nullptr) {
@@ -1237,6 +1248,18 @@ Result KServerSession::ReceiveRequest(KernelCore& kernel, uintptr_t server_messa
 }
 
 namespace {
+void CompleteAsyncReply(KernelCore& kernel, KThread* client_thread, KEvent* event,
+                        uint64_t client_message, size_t client_buffer_size, Result result) {
+    KProcess* client_process = client_thread->GetOwnerProcess();
+    auto& client_page_table = client_process->GetPageTable();
+    if (R_FAILED(result)) {
+        ReplyAsyncError(client_process, client_message, client_buffer_size, result);
+    }
+    // NOTE: Nintendo does not check the result of this.
+    client_page_table.UnlockForIpcUserBuffer(client_message, client_buffer_size);
+    event->Signal(kernel);
+}
+
 // On hardware a synchronous request to a service takes microseconds to answer, and while the
 // client waits its core runs the next ready thread. HLE services answer almost at once, so that
 // thread gets preempted before it executes anything. Mario Tennis Fever relies on the hardware
@@ -1272,11 +1295,33 @@ void HoldHleReply(KernelCore& kernel, KThread* client_thread) {
 
 Result KServerSession::SendReply(KernelCore& kernel, uintptr_t server_message, uintptr_t server_buffer_size,
                                  KPhysicalAddress server_message_paddr, bool is_hle, bool session_closed) {
+    [[maybe_unused]] auto transition = !is_hle
+        ? kernel.System().BeginDeferredTransition(
+              Common::GpuTransitionProfile::SuspensionSite::IpcReceive)
+        : nullptr;
+    KSessionRequest* request{};
+    SCOPE_EXIT {
+        if (request != nullptr) {
+            request->Close(kernel);
+        }
+    };
+    KThread* async_thread{};
+    KEvent* async_event{};
+    Result async_result = ResultSuccess;
+    SCOPE_EXIT {
+        if (async_thread != nullptr) {
+            // The detached request retains thread/event until after this scope. Prepare
+            // without m_lock, then unlock the user buffer before notifying its client.
+            [[maybe_unused]] auto async_transition = kernel.System().BeginDeferredTransition(
+                Common::GpuTransitionProfile::SuspensionSite::IpcAsync);
+            CompleteAsyncReply(kernel, async_thread, async_event, request->GetAddress(),
+                               request->GetSize(), async_result);
+        }
+    };
     // Lock the session.
     KScopedLightLock lk{m_lock};
 
     // Get the request.
-    KSessionRequest* request;
     {
         KScopedSchedulerLock sl{kernel};
 
@@ -1290,11 +1335,6 @@ Result KServerSession::SendReply(KernelCore& kernel, uintptr_t server_message, u
             this->NotifyAvailable(kernel);
         }
     }
-
-    // Close reference to the request once we're done processing it.
-    SCOPE_EXIT {
-        request->Close(kernel);
-    };
 
     // Extract relevant information from the request.
     const uint64_t client_message = request->GetAddress();
@@ -1348,21 +1388,14 @@ Result KServerSession::SendReply(KernelCore& kernel, uintptr_t server_message, u
     // If there's a client thread, update it.
     if (client_thread != nullptr) {
         if (event != nullptr) {
-            // Get the client process/page table.
-            KProcess* client_process = client_thread->GetOwnerProcess();
-            KProcessPageTable* client_page_table = std::addressof(client_process->GetPageTable());
-
-            // If we need to, reply with an async error.
-            if (R_FAILED(client_result)) {
-                ReplyAsyncError(client_process, client_message, client_buffer_size, client_result);
+            if (is_hle) {
+                async_thread = client_thread;
+                async_event = event;
+                async_result = client_result;
+            } else {
+                CompleteAsyncReply(kernel, client_thread, event, client_message, client_buffer_size,
+                                   client_result);
             }
-
-            // Unlock the client buffer.
-            // NOTE: Nintendo does not check the result of this.
-            client_page_table->UnlockForIpcUserBuffer(client_message, client_buffer_size);
-
-            // Signal the event.
-            event->Signal(kernel);
         } else {
             if (is_hle) {
                 HoldHleReply(kernel, client_thread);
@@ -1412,6 +1445,7 @@ Result KServerSession::OnRequest(KernelCore& kernel, KSessionRequest* request) {
         // This is a synchronous request, so we should wait for our request to complete.
         GetCurrentThread(kernel).SetWaitReasonForDebugging(ThreadWaitReasonForDebugging::IPC);
         GetCurrentThread(kernel).BeginWait(kernel, std::addressof(wait_queue));
+        GetCurrentThread(kernel).ProfileWait("ipc_reply", reinterpret_cast<uintptr_t>(this));
     }
 
     return GetCurrentThread(kernel).GetWaitResult();
@@ -1430,6 +1464,8 @@ bool KServerSession::IsSignaled(KernelCore& kernel) const {
 }
 
 void KServerSession::CleanupRequests(KernelCore& kernel) {
+    [[maybe_unused]] auto transition = kernel.System().BeginDeferredTransition(
+        Common::GpuTransitionProfile::SuspensionSite::IpcCleanup);
     KScopedLightLock lk(m_lock);
 
     // Clean up any pending requests.
@@ -1501,6 +1537,8 @@ void KServerSession::CleanupRequests(KernelCore& kernel) {
 }
 
 void KServerSession::OnClientClosed(KernelCore& kernel) {
+    [[maybe_unused]] auto transition = kernel.System().BeginDeferredTransition(
+        Common::GpuTransitionProfile::SuspensionSite::IpcCleanup);
     KScopedLightLock lk{m_lock};
 
     // Handle any pending requests.

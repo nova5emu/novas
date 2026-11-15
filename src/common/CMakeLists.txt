@@ -32,12 +32,22 @@ add_library(
     bit_field.h
     bit_util.h
     bounded_threadsafe_queue.h
+    caller_stacks.cpp
+    caller_stacks.h
     cityhash.cpp
     cityhash.h
     common_funcs.h
     common_types.h
+    gpu_transition_profile.cpp
+    gpu_transition_profile.h
+    guest_handoff_profile.cpp
+    guest_handoff_profile.h
+    guest_thread_profile.cpp
+    guest_thread_profile.h
     concepts.h
     container_hash.h
+    cpu_epoch_memory_barrier.cpp
+    cpu_epoch_memory_barrier.h
     core_pinning.cpp
     core_pinning.h
     demangle.cpp

@@ -7,6 +7,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -22,6 +23,7 @@
 #include "common/settings.h"
 #include "common/thread.h"
 #include "video_core/delayed_destruction_ring.h"
+#include "video_core/fence_wait_trace.h"
 #include "video_core/gpu.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/syncpoint_manager.h"
@@ -71,12 +73,44 @@ public:
         SignalFence(std::move(do_nothing));
     }
 
-    void SyncOperation(std::function<void()>&& func) {
+    bool SyncOperation(std::function<void()>&& func) {
         // Not only the GPU thread queues these (query cache work runs elsewhere too), while
         // SignalFence moves the list into pending_operations: unguarded, the list was corrupted
         // and the fencing thread crashed walking it. Its own lock, held for no callbacks.
         std::scoped_lock lock{uncommitted_guard};
+        const bool was_empty = uncommitted_operations.empty();
         uncommitted_operations.emplace_back(std::move(func));
+        uncommitted_count.store(uncommitted_operations.size(), std::memory_order_release);
+        return was_empty;
+    }
+
+    bool HasPendingOperations() const {
+        return uncommitted_count.load(std::memory_order_acquire) != 0;
+    }
+
+    // Scheduler owner only, outside cache/map locks. A drain or Vulkan submit alone does not
+    // attach SyncOperation callbacks to a fence when no later guest work arrives.
+    bool CommitPendingOperations() {
+        if (!HasPendingOperations()) {
+            return false;
+        }
+        idle_promotions.fetch_add(1, std::memory_order_relaxed);
+        SignalFence([] {});
+        SubmitDeferredWork("idle-pending-operations");
+        return true;
+    }
+
+    VideoCore::FenceProgress GetFenceProgress() const {
+        return {
+            .supported = true,
+            .uncommitted_operations = uncommitted_count.load(std::memory_order_relaxed),
+            .queued_fences = queued_fence_count.load(std::memory_order_relaxed),
+            .queued_operations = queued_operation_count.load(std::memory_order_relaxed),
+            .retiring_fences = retiring_fence_count.load(std::memory_order_relaxed),
+            .retiring_operations = retiring_operation_count.load(std::memory_order_relaxed),
+            .idle_promotions = idle_promotions.load(std::memory_order_relaxed),
+            .completed_operations = completed_operation_count.load(std::memory_order_relaxed),
+        };
     }
 
     void SignalFence(std::function<void()>&& func) {
@@ -112,8 +146,10 @@ public:
             if (delay_fence) {
                 uncommitted_operations.emplace_back(std::move(func));
             }
+            queued_operation_count.fetch_add(uncommitted_operations.size(), std::memory_order_relaxed);
             pending_operations.emplace_back(std::move(uncommitted_operations));
             uncommitted_operations.clear(); // moved-from: make it empty explicitly
+            uncommitted_count.store(0, std::memory_order_release);
         }
         pending_flushes.push_back(committed_flushes);
         QueueFence(new_fence);
@@ -121,6 +157,7 @@ public:
             func();
         }
         fences.push(std::move(new_fence));
+        queued_fence_count.fetch_add(1, std::memory_order_relaxed);
         if (should_flush) {
             rasterizer.FlushCommands();
         }
@@ -129,7 +166,8 @@ public:
             cv.notify_all();
         }
         if (delay_fence) {
-            SubmitDeferredWork();
+            SubmitDeferredWork(VideoCore::g_signaling_query_report_fence ? "query-report-delay"
+                                                                        : "accuracy-fence-delay");
         }
         rasterizer.InvalidateGPUCache();
     }
@@ -147,7 +185,9 @@ public:
         SignalFence(std::move(func));
     }
 
-    void WaitPendingFences([[maybe_unused]] bool force) {
+    void WaitPendingFences([[maybe_unused]] bool force,
+                           std::source_location caller = std::source_location::current()) {
+        FenceWaitTrace::Scope trace{FenceWaitTrace::Op::PendingFences, force, caller};
         if constexpr (!can_async_check) {
             TryReleasePendingFences<true>();
         } else {
@@ -163,14 +203,39 @@ public:
                 wait_cv.notify_all();
             });
             SignalFence(std::move(func));
+            trace.Prepared(wait_finished.load(std::memory_order_relaxed));
             // The fence's commands can be held back by a deferred flush that only this thread
             // submits. The fencing thread waits for that submission before releasing the fence,
             // so waiting here without submitting deadlocks (Ocarina of Time entering gameplay).
-            SubmitDeferredWork();
+            SubmitDeferredWork("wait-pending-fences");
+            trace.Submitted(wait_finished.load(std::memory_order_relaxed));
             std::unique_lock lk(wait_mutex);
             wait_cv.wait(
                 lk, [&wait_finished] { return wait_finished.load(std::memory_order_relaxed); });
         }
+    }
+
+    // Wait for cache pops, not SignalFence's own callback (which can run immediately at Low).
+    // Called by the scheduler owner without cache or mapping locks held.
+    void WaitPendingReadbacks(std::source_location caller = std::source_location::current()) {
+        FenceWaitTrace::Scope trace{FenceWaitTrace::Op::PendingReadbacks, true, caller};
+        std::mutex wait_mutex;
+        std::condition_variable wait_cv;
+        std::atomic<bool> finished{};
+        SyncOperation([&] {
+            std::scoped_lock lock{wait_mutex};
+            finished.store(true, std::memory_order_relaxed);
+            wait_cv.notify_all();
+        });
+        SignalFence([] {});
+        trace.Prepared(finished.load(std::memory_order_relaxed));
+        SubmitDeferredWork("wait-pending-readbacks");
+        if constexpr (!can_async_check) {
+            TryReleasePendingFences<true>();
+        }
+        trace.Submitted(finished.load(std::memory_order_relaxed));
+        std::unique_lock lock{wait_mutex};
+        wait_cv.wait(lock, [&] { return finished.load(std::memory_order_relaxed); });
     }
 
 protected:
@@ -203,7 +268,7 @@ protected:
     /// Waits until a fence has been signalled by the host GPU.
     virtual void WaitFence(TFence& fence) = 0;
     /// Submits work whose submission the backend deferred (called before blocking on a fence).
-    virtual void SubmitDeferredWork() {}
+    virtual void SubmitDeferredWork(const char*) {}
 
     VideoCore::RasterizerInterface& rasterizer;
     Tegra::GPU& gpu;
@@ -224,18 +289,26 @@ private:
                     return;
                 }
             }
+            retiring_fence_count.fetch_add(1, std::memory_order_relaxed);
+            queued_fence_count.fetch_sub(1, std::memory_order_relaxed);
+            const auto operation_count = pending_operations.front().size();
+            retiring_operation_count.fetch_add(operation_count, std::memory_order_relaxed);
+            queued_operation_count.fetch_sub(operation_count, std::memory_order_relaxed);
             PopAsyncFlushes(pending_flushes.front());
             pending_flushes.pop_front();
             auto operations = std::move(pending_operations.front());
             pending_operations.pop_front();
             for (auto& operation : operations) {
                 operation();
+                completed_operation_count.fetch_add(1, std::memory_order_relaxed);
+                retiring_operation_count.fetch_sub(1, std::memory_order_relaxed);
             }
             {
                 std::unique_lock lock(ring_guard);
                 delayed_destruction_ring.Push(std::move(current_fence));
             }
             fences.pop();
+            retiring_fence_count.fetch_sub(1, std::memory_order_relaxed);
         }
     }
 
@@ -261,6 +334,11 @@ private:
         std::vector<Released> batch;
         batch.reserve(MaxBatch);
         const auto take_front = [&] {
+            retiring_fence_count.fetch_add(1, std::memory_order_relaxed);
+            queued_fence_count.fetch_sub(1, std::memory_order_relaxed);
+            const auto operation_count = pending_operations.front().size();
+            retiring_operation_count.fetch_add(operation_count, std::memory_order_relaxed);
+            queued_operation_count.fetch_sub(operation_count, std::memory_order_relaxed);
             batch.push_back({std::move(fences.front()), std::move(pending_operations.front()),
                              pending_flushes.front()});
             fences.pop();
@@ -309,6 +387,8 @@ private:
                 query_cache.PopAsyncFlushes();
                 for (auto& operation : released.operations) {
                     operation();
+                    completed_operation_count.fetch_add(1, std::memory_order_relaxed);
+                    retiring_operation_count.fetch_sub(1, std::memory_order_relaxed);
                 }
             }
             {
@@ -317,6 +397,7 @@ private:
                     delayed_destruction_ring.Push(std::move(released.fence));
                 }
             }
+            retiring_fence_count.fetch_sub(batch.size(), std::memory_order_relaxed);
             batch.clear();
         }
     }
@@ -403,6 +484,14 @@ private:
     std::deque<std::deque<std::function<void()>>> pending_operations;
     std::deque<u8> pending_flushes; ///< Per fence: the caches that committed downloads
     u32 skipped_fences{}; ///< Empty fences skipped since the last one made (GPU thread only)
+
+    std::atomic<u64> uncommitted_count{};
+    std::atomic<u64> queued_fence_count{};
+    std::atomic<u64> queued_operation_count{};
+    std::atomic<u64> retiring_fence_count{};
+    std::atomic<u64> retiring_operation_count{};
+    std::atomic<u64> idle_promotions{};
+    std::atomic<u64> completed_operation_count{};
 
     std::mutex guard;
     std::mutex ring_guard;

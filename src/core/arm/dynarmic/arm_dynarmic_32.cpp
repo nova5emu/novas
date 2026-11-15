@@ -4,12 +4,14 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/gpu_transition_profile.h"
 #include "common/settings.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_32.h"
 #include "core/arm/dynarmic/dynarmic_cp15.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
 #include "core/core_timing.h"
+#include "core/deferred_write_config.h"
 #include "core/hle/kernel/k_process.h"
 
 namespace Core {
@@ -55,6 +57,10 @@ void DynarmicCallbacks32::MemoryWrite(Dynarmic::A32::VAddr vaddr, u64 value, siz
         }
     }
 }
+void DynarmicCallbacks32::MemoryPrepareExclusive(u32 vaddr, size_t size) {
+    m_memory.PrepareExclusiveAccess(vaddr, size);
+}
+
 bool DynarmicCallbacks32::MemoryWriteExclusive8(u32 vaddr, u8 value, u8 expected) {
     return CheckMemoryAccess(vaddr, 1, Kernel::DebugWatchpointType::Write) &&
             m_memory.WriteExclusive8(vaddr, value, expected);
@@ -292,6 +298,18 @@ void ArmDynarmic32::MakeJit(Common::PageTable* page_table) {
         config.fastmem_pointer = std::nullopt;
         config.fastmem_exclusive_access = false;
     }
+#if defined(_M_X64) || defined(__x86_64__)
+    if (DeferredWritesConfig::ProducerRequested()) {
+        config.prepare_exclusive_memory = true;
+        config.exclusive_prepare_table = m_cb->m_memory.GetExclusiveFastTable();
+        config.exclusive_prepare_table_mask = static_cast<u32>(Memory::Memory::ExclusiveFastTableMask);
+        m_cb->m_exclusive_inline_counter = Common::GpuTransitionProfile::RegisterExclusiveInlineCounter();
+        if (m_cb->m_exclusive_inline_counter) {
+            config.exclusive_prepare_fast_hits = &m_cb->m_exclusive_inline_counter->hits;
+        }
+        config.optimizations &= ~Dynarmic::OptimizationFlag::Unsafe_IgnoreGlobalMonitor;
+    }
+#endif
     m_jit.emplace(config);
 }
 

@@ -158,6 +158,61 @@ void HeapTracker::Protect(size_t virtual_offset, size_t size, MemoryPermission p
     }
 }
 
+bool HeapTracker::TryReprotectCpuEpoch(size_t virtual_offset, size_t length) {
+#if defined(__linux__)
+    if (length != 0x1000 || virtual_offset % 0x1000 != 0 ||
+        virtual_offset > m_buffer.VirtualSize() || length > m_buffer.VirtualSize() - virtual_offset) {
+        return false;
+    }
+    std::shared_lock rebuild{m_rebuild_lock};
+    std::unique_lock mappings{m_lock};
+    const auto it = GetNearestHeapMapLocked(virtual_offset);
+    if (it != m_mappings.end()) {
+        if (it->vaddr != virtual_offset || it->size != length) {
+            return false;
+        }
+        // Keep this conservative permission even if mprotect fails: no RW rollback on close.
+        it->perm = MemoryPermission{};
+    }
+    return m_buffer.TryReprotectCpuEpoch(virtual_offset, length);
+#else
+    static_cast<void>(virtual_offset);
+    static_cast<void>(length);
+    return false;
+#endif
+}
+bool HeapTracker::TryGrantCpuEpoch(size_t virtual_offset, size_t length) {
+#if defined(__linux__)
+    if (length != 0x1000 || virtual_offset % 0x1000 != 0 ||
+        virtual_offset > m_buffer.VirtualSize() ||
+        length > m_buffer.VirtualSize() - virtual_offset) {
+        return false;
+    }
+    std::shared_lock rebuild{m_rebuild_lock, std::try_to_lock};
+    if (!rebuild.owns_lock()) {
+        return false;
+    }
+    std::unique_lock mappings{m_lock, std::try_to_lock};
+    if (!mappings.owns_lock()) {
+        return false;
+    }
+    const auto it = GetNearestHeapMapLocked(virtual_offset);
+    if (it != m_mappings.end()) {
+        if (it->vaddr != virtual_offset || it->size != length || !it->is_resident) {
+            return false;
+        }
+    }
+    if (!m_buffer.TryGrantCpuEpoch(virtual_offset, length))
+        return false;
+    if (it != m_mappings.end())
+        it->perm = MemoryPermission::ReadWrite;
+    return true;
+#else
+    static_cast<void>(virtual_offset);
+    static_cast<void>(length);
+    return false;
+#endif
+}
 bool HeapTracker::DeferredMapSeparateHeap(u8* fault_address) {
     if (m_buffer.IsInVirtualRange(fault_address)) {
         return this->DeferredMapSeparateHeap(fault_address - m_buffer.VirtualBasePointer());

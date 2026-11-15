@@ -5,7 +5,14 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 add_executable(tests
+    common/cpu_epoch_memory_barrier.cpp
     common/addon_config.cpp
+    common/gpu_transition_profile.cpp
+    video_core/cpu_epoch_admission.cpp
+    video_core/cpu_epoch_barrier.cpp
+    video_core/cpu_epoch_coordinator.cpp
+    video_core/sync_request_queue.cpp
+    video_core/nce_page_usage_profile.cpp
     video_core/buffer_cache_ports.cpp
     video_core/virtual_range_cache.cpp
     video_core/nx2_draw_experiments.cpp
@@ -78,6 +85,17 @@ add_executable(tests
     video_core/spirv_fragment_shuffle.cpp
     video_core/multi_range_refresh.cpp
     video_core/command_fetch_order.cpp
+    video_core/deferred_write_journal.cpp
+    video_core/query_writer_lifetime.cpp
+    core/nx2_release_batch.cpp
+    core/deferred_transition.cpp
+    core/deferred_kernel_writes.cpp
+    core/deferred_cpu_mappings.cpp
+    core/deferred_nce_publication.cpp
+    core/deferred_write_config.cpp
+    core/nce_store_backing.cpp
+    core/nce_fault_policy.cpp
+    video_core/semaphore_acquire.cpp
     video_core/gpu_written_pages.cpp
     video_core/command_writer.cpp
     video_core/split_fence_wait.cpp
@@ -144,6 +162,9 @@ add_executable(tests
     core/priority_queue.cpp
     core/internal_network/network.cpp
     video_core/memory_tracker.cpp
+    video_core/gpu_write_trace.cpp
+    video_core/gpu_write_footprint_profile.cpp
+    video_core/storage_write_footprint.cpp
     video_core/memory_manager_runs.cpp
     video_core/nx2_perf_draw_binds.cpp
     video_core/nx2_perf_texture_writes.cpp
@@ -184,6 +205,9 @@ target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain
 if (TARGET dynarmic::dynarmic)
     target_sources(tests PRIVATE core/window_trace.cpp)
     target_link_libraries(tests PRIVATE dynarmic::dynarmic)
+    if (ARCHITECTURE_x86_64)
+        target_sources(tests PRIVATE core/deferred_exclusive_jit.cpp)
+    endif()
 endif()
 
 add_test(NAME tests COMMAND tests)

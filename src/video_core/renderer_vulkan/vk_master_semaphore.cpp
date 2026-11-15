@@ -76,6 +76,9 @@ void MasterSemaphore::Refresh() {
         }
     } while (!gpu_tick.compare_exchange_weak(this_tick, counter, std::memory_order_release,
                                              std::memory_order_relaxed));
+    if (auto* markers = device.GetDispatchLoader().hang_markers) {
+        markers->Retire(counter);
+    }
 }
 
 void MasterSemaphore::Wait(u64 tick) {
@@ -111,7 +114,10 @@ void MasterSemaphore::Wait(u64 tick) {
         // driver or the system may kill the app during a long hang, and nothing else would say where it was).
         using Clock = std::chrono::steady_clock;
         const auto wait_start = Clock::now();
+        auto last_progress = wait_start;
+        u64 last_gpu_tick = semaphore.GetCounter();
         int reported_seconds = 0;
+        bool stall_reported = false;
         while (!semaphore.Wait(tick, 1'000'000'000ULL)) {
             const auto waited = std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - wait_start);
             if (waited.count() >= reported_seconds + 1) {
@@ -119,7 +125,18 @@ void MasterSemaphore::Wait(u64 tick) {
                 const u64 gpu_at = semaphore.GetCounter();
                 LOG_ERROR(Render_Vulkan, "GPU stall: waiting {} s for GPU tick {} (GPU is at {})",
                           reported_seconds, tick, gpu_at);
-                if (reported_seconds == 3) {
+                const auto now = Clock::now();
+                if (gpu_at != last_gpu_tick) {
+                    last_gpu_tick = gpu_at;
+                    last_progress = now;
+                }
+                // Capture a slow submission early, and separately a timeline that stops advancing.
+                HangTrace::OnStall(gpu_at, tick);
+                if (now - last_progress >= std::chrono::seconds{5}) {
+                    HangTrace::OnStall(gpu_at, tick, true);
+                }
+                if (reported_seconds >= 3 && !stall_reported) {
+                    stall_reported = true;
                     HangGuard::OnStall(gpu_at, tick);
                 }
             }
@@ -141,12 +158,16 @@ void MasterSemaphore::Wait(u64 tick) {
 VkResult MasterSemaphore::SubmitQueue(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,
                                       VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                                       u64 host_tick) {
-    if (semaphore) {
-        return SubmitQueueTimeline(cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore,
-                                   host_tick);
-    } else {
-        return SubmitQueueFence(cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, host_tick);
-    }
+    HangTrace::Event("submit-enter queue,wait,signal,timeline,wait_count,signal_count,sync2", host_tick,
+        {HangTrace::Handle(device.GetGraphicsQueue().Handle()), HangTrace::Handle(wait_semaphore),
+         HangTrace::Handle(signal_semaphore), semaphore ? HangTrace::Handle(*semaphore) : 0,
+         wait_semaphore ? 1ULL : 0ULL, (semaphore ? 1ULL : 0ULL) + (signal_semaphore ? 1ULL : 0ULL),
+         device.HasSynchronization2() ? 1ULL : 0ULL});
+    const VkResult result = semaphore
+        ? SubmitQueueTimeline(cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, host_tick)
+        : SubmitQueueFence(cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, host_tick);
+    HangTrace::Event("submit-return result", host_tick, {static_cast<u64>(result)});
+    return result;
 }
 
 static constexpr VkPipelineStageFlags wait_stage_mask = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
@@ -380,6 +401,9 @@ void MasterSemaphore::WaitThread(std::stop_token token) {
             std::scoped_lock lock{free_mutex};
             free_queue.push_front(std::move(fence));
             gpu_tick.store(host_tick, std::memory_order_release);
+        }
+        if (auto* markers = device.GetDispatchLoader().hang_markers) {
+            markers->Retire(host_tick);
         }
         gpu_tick.notify_one();
     }

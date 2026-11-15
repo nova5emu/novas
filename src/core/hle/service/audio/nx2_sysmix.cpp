@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include "common/gpu_transition_profile.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -122,7 +123,12 @@ struct SysmixOutput::Impl {
 SysmixOutput::SysmixOutput(Core::System& system, Kernel::KProcess& process,
                            AudioCore::Sink::Sink& sink, u32 id, u64 buffer, u64 size,
                            u32 creation_flags)
-    : impl{std::make_unique<Impl>(system, process, sink, id, buffer, size, creation_flags)} {}
+    : impl{std::make_unique<Impl>(system, process, sink, id, buffer, size, creation_flags)} {
+    // Pump writes the captured ring with atomics under its mutex.
+    const Common::GpuTransitionProfile::LegacyWriterScope legacy_profile{
+        Common::GpuTransitionProfile::LegacyWriterSite::Audio, size};
+    process.GetMemory().PrepareLegacyWrite(buffer, size);
+}
 
 SysmixOutput::~SysmixOutput() = default;
 

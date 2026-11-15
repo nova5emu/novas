@@ -46,6 +46,9 @@ public:
 
     void TickFrame();
 
+    /// Diagnostic classification, called only with operation tracing enabled.
+    bool IsUploadBuffer(VkBuffer buffer) const;
+
 private:
     struct StreamBufferCommit {
         size_t upper_bound;
@@ -124,6 +127,8 @@ private:
     StagingBuffersCache download_cache;
 
     size_t current_delete_level = 0;
+    u64 last_memory_sample_ns{};
+    u64 last_mobile_release_ns{};
     u64 buffer_index = 0;
     u64 unique_ids{};
 };

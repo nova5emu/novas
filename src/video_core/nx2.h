@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "video_core/semaphore_acquire.h"
 
 namespace Tegra {
 
@@ -383,9 +384,9 @@ inline bool Nx2SparseUnwritten(u64 gpu_address, u64 size) {
 class Nx2SemaphoreWaiters {
 public:
     // Puller GpuSemaphoreOperation values.
-    static constexpr u32 AcquireEqual = 0x1;
-    static constexpr u32 AcquireGequal = 0x4;
-    static constexpr u32 AcquireMask = 0x8;
+    static constexpr u32 AcquireEqual = SemaphoreAcquire::Equal;
+    static constexpr u32 AcquireGequal = SemaphoreAcquire::Gequal;
+    static constexpr u32 AcquireMask = SemaphoreAcquire::MaskNonzero;
 
     static Nx2SemaphoreWaiters& Get() {
         static Nx2SemaphoreWaiters waiters;
@@ -440,16 +441,7 @@ private:
     };
 
     static bool Matches(const Waiter& w, u32 current) {
-        switch (w.operation) {
-        case AcquireEqual:
-            return current == w.value;
-        case AcquireGequal:
-            return current >= w.value;
-        case AcquireMask:
-            return (current & w.value) != 0;
-        default:
-            return false;
-        }
+        return SemaphoreAcquire::Matches(w.operation, w.value, current);
     }
 
     std::mutex mutex;

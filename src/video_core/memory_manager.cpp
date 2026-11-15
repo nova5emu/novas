@@ -18,6 +18,8 @@
 #include "memory_manager.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/guest_memory.h"
+#include "video_core/deferred_consumer.h"
+#include "video_core/gpu.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_perf.h"
@@ -382,6 +384,7 @@ u8* MemoryManager::GetPointer(GPUVAddr gpu_addr) {
         return {};
     }
 
+    memory.ExcludeCpuEpochExport(*address, 1);
     return memory.GetPointer<u8>(*address);
 }
 
@@ -391,6 +394,7 @@ const u8* MemoryManager::GetPointer(GPUVAddr gpu_addr) const {
         return {};
     }
 
+    memory.ExcludeCpuEpochExport(*address, 1);
     return memory.GetPointer<u8>(*address);
 }
 
@@ -481,6 +485,7 @@ void MemoryManager::ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std:
         if (!unsafe) {
             rasterizer->FlushRegion(dev_addr_base, copy_amount, which);
         }
+        memory.ExcludeCpuEpochExport(dev_addr_base, copy_amount);
         // A device page without memory (a sparse block nobody wrote yet) reads zero.
         if (const u8* physical = memory.GetPointer<u8>(dev_addr_base)) [[likely]] {
             std::memcpy(dest_buffer, physical, copy_amount);
@@ -494,6 +499,7 @@ void MemoryManager::ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std:
         if (!unsafe) {
             rasterizer->FlushRegion(dev_addr_base, copy_amount, which);
         }
+        memory.ExcludeCpuEpochExport(dev_addr_base, copy_amount);
         // A continuous big page may still have no host memory (a Switch 2 region backed as it is
         // written, while its backing is pending): the per-page copy handles that.
         u8* const physical = IsBigPageContinuous(page_index) ? memory.GetPointer<u8>(dev_addr_base)
@@ -587,6 +593,7 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
 }
 
 void MemoryManager::WriteBlock(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, VideoCommon::CacheType which) {
+    auto deferred_write = BeginDeferredBackingWrite(gpu_dest_addr, size);
     WriteBlockImpl(gpu_dest_addr, src_buffer, size, which, false);
 }
 
@@ -595,12 +602,15 @@ void MemoryManager::WriteBlockUnsafe(GPUVAddr gpu_dest_addr, const void* src_buf
 }
 
 void MemoryManager::WriteBlockCached(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size) {
+    auto deferred_write = BeginDeferredBackingWrite(gpu_dest_addr, size);
     WriteBlockImpl(gpu_dest_addr, src_buffer, size, VideoCommon::CacheType::None, true);
     accumulator.Add(gpu_dest_addr, size);
+    if (deferred_write) FlushCaching();
 }
 
 void MemoryManager::WriteWordsCached(GPUVAddr gpu_dest_addr, const u32* words, std::size_t count) {
     const std::size_t size = count * sizeof(u32);
+    auto deferred_write = BeginDeferredBackingWrite(gpu_dest_addr, size);
     // Words on Switch 2 sparse memory go one at a time, as Nx2BackSparseWrite saw them.
     if (gpu_dest_addr + size > Tegra::g_nx2_sparse_low.load(std::memory_order_relaxed) &&
         gpu_dest_addr < Tegra::g_nx2_sparse_high.load(std::memory_order_relaxed)) {
@@ -614,6 +624,21 @@ void MemoryManager::WriteWordsCached(GPUVAddr gpu_dest_addr, const u32* words, s
     for (std::size_t i = 0; i < count; ++i) {
         accumulator.Add(gpu_dest_addr + i * sizeof(u32), sizeof(u32));
     }
+    if (deferred_write) FlushCaching();
+}
+
+std::shared_ptr<VideoCommon::DeferredWrites::Journal::WriterPermission>
+MemoryManager::BeginDeferredBackingWrite(GPUVAddr address, std::size_t size) {
+    if (size == 0 || !system.DeferredWriteJournal()) return {};
+    auto& gpu = system.GPU();
+    boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> segments;
+    GetSubmappedRangeImpl<false>(address, size, segments);
+    std::vector<VideoCommon::DeferredWrites::TransitionRange> ranges;
+    for (const auto& [device, length] : segments) {
+        VideoCommon::DeferredWrites::AddConsumerDeviceRange(ranges, memory, device, length);
+    }
+    if (ranges.empty()) return {};
+    return gpu.BeginDeferredWriterPermission(ranges);
 }
 
 void MemoryManager::FlushRegion(GPUVAddr gpu_addr, size_t size,

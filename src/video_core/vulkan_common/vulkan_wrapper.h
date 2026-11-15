@@ -20,6 +20,9 @@
 
 #include "common/common_types.h"
 #include "video_core/vulkan_common/vulkan.h"
+#include "video_core/vulkan_common/gpu_operation_trace.h"
+#include "video_core/vulkan_common/vulkan_hang_trace.h"
+#include "video_core/vulkan_common/vulkan_gpu_markers.h"
 
 #ifdef _MSC_VER
 #pragma warning(disable : 26812) // Disable prefer enum class over enum
@@ -29,6 +32,8 @@ VK_DEFINE_HANDLE(VmaAllocator)
 VK_DEFINE_HANDLE(VmaAllocation)
 
 namespace Vulkan::vk {
+
+namespace OpTrace = VideoCommon::GpuOperationTrace;
 
 /**
  * Span for Vulkan arrays.
@@ -197,6 +202,7 @@ struct InstanceDispatch {
 
 /// Table holding Vulkan device function pointers.
 struct DeviceDispatch : InstanceDispatch {
+    Vulkan::HangTrace::GpuMarkers* hang_markers{};
     PFN_vkAcquireNextImageKHR vkAcquireNextImageKHR{};
     PFN_vkAllocateCommandBuffers vkAllocateCommandBuffers{};
     PFN_vkAllocateDescriptorSets vkAllocateDescriptorSets{};
@@ -856,6 +862,10 @@ private:
 
 class Queue {
 public:
+    VkQueue Handle() const noexcept {
+        return queue;
+    }
+
     /// Construct an empty queue handle.
     constexpr Queue() noexcept = default;
 
@@ -863,24 +873,113 @@ public:
     constexpr Queue(VkQueue queue_, const DeviceDispatch& dld_) noexcept
         : queue{queue_}, dld{&dld_} {}
 
-    VkResult Submit(Span<VkSubmitInfo> submit_infos,
-                    VkFence fence = VK_NULL_HANDLE) const noexcept {
-        return dld->vkQueueSubmit(queue, submit_infos.size(), submit_infos.data(), fence);
+    VkResult Submit(Span<VkSubmitInfo> submit_infos, VkFence fence = VK_NULL_HANDLE,
+                    std::source_location site = std::source_location::current()) const noexcept {
+        if (!Vulkan::HangTrace::Enabled()) {
+            return dld->vkQueueSubmit(queue, submit_infos.size(), submit_infos.data(), fence);
+        }
+        const u64 tick = Vulkan::HangTrace::Enabled() ? Vulkan::HangTrace::QueueTick() : 0;
+        const u64 call = Vulkan::HangTrace::Event("queue-submit-enter queue,batches,fence,worker_tick",
+            tick, {Vulkan::HangTrace::Handle(queue), submit_infos.size(),
+                   Vulkan::HangTrace::Handle(fence), Vulkan::HangTrace::context.tick}, site);
+        if (Vulkan::HangTrace::Enabled()) {
+            for (const auto& info : submit_infos) {
+                for (u32 i = 0; i < info.commandBufferCount; ++i) {
+                    Vulkan::HangTrace::Event("queue-command call,cmd,index", tick,
+                        {call, Vulkan::HangTrace::Handle(info.pCommandBuffers[i]), i});
+                }
+                for (u32 i = 0; i < info.waitSemaphoreCount; ++i) {
+                    Vulkan::HangTrace::Event("queue-wait call,semaphore,stage", tick,
+                        {call, Vulkan::HangTrace::Handle(info.pWaitSemaphores[i]), info.pWaitDstStageMask[i]});
+                }
+                for (u32 i = 0; i < info.signalSemaphoreCount; ++i) {
+                    Vulkan::HangTrace::Event("queue-signal call,semaphore", tick,
+                        {call, Vulkan::HangTrace::Handle(info.pSignalSemaphores[i])});
+                }
+            }
+        }
+        const auto result = dld->vkQueueSubmit(queue, submit_infos.size(), submit_infos.data(), fence);
+        Vulkan::HangTrace::Event("queue-submit-return call,result", tick,
+            {call, static_cast<u64>(result)}, site);
+        return result;
     }
 
-    /// Submits using VK_KHR_synchronization2 / Vulkan 1.3 vkQueueSubmit2.
-    VkResult Submit2(Span<VkSubmitInfo2> submit_infos,
-                     VkFence fence = VK_NULL_HANDLE) const noexcept {
-        return dld->vkQueueSubmit2(queue, submit_infos.size(), submit_infos.data(), fence);
+    VkResult Submit2(Span<VkSubmitInfo2> submit_infos, VkFence fence = VK_NULL_HANDLE,
+                     std::source_location site = std::source_location::current()) const noexcept {
+        if (!Vulkan::HangTrace::Enabled()) {
+            return dld->vkQueueSubmit2(queue, submit_infos.size(), submit_infos.data(), fence);
+        }
+        const u64 tick = Vulkan::HangTrace::Enabled() ? Vulkan::HangTrace::QueueTick() : 0;
+        const u64 call = Vulkan::HangTrace::Event("queue-submit2-enter queue,batches,fence,worker_tick",
+            tick, {Vulkan::HangTrace::Handle(queue), submit_infos.size(),
+                   Vulkan::HangTrace::Handle(fence), Vulkan::HangTrace::context.tick}, site);
+        if (Vulkan::HangTrace::Enabled()) {
+            for (const auto& info : submit_infos) {
+                for (u32 i = 0; i < info.commandBufferInfoCount; ++i) {
+                    Vulkan::HangTrace::Event("queue-command call,cmd,index", tick,
+                        {call, Vulkan::HangTrace::Handle(info.pCommandBufferInfos[i].commandBuffer), i});
+                }
+                for (u32 i = 0; i < info.waitSemaphoreInfoCount; ++i) {
+                    const auto& s = info.pWaitSemaphoreInfos[i];
+                    Vulkan::HangTrace::Event("queue-wait2 call,semaphore,value,stage", tick,
+                        {call, Vulkan::HangTrace::Handle(s.semaphore), s.value, s.stageMask});
+                }
+                for (u32 i = 0; i < info.signalSemaphoreInfoCount; ++i) {
+                    const auto& s = info.pSignalSemaphoreInfos[i];
+                    Vulkan::HangTrace::Event("queue-signal2 call,semaphore,value,stage", tick,
+                        {call, Vulkan::HangTrace::Handle(s.semaphore), s.value, s.stageMask});
+                }
+            }
+        }
+        const auto result = dld->vkQueueSubmit2(queue, submit_infos.size(), submit_infos.data(), fence);
+        Vulkan::HangTrace::Event("queue-submit2-return call,result", tick,
+            {call, static_cast<u64>(result)}, site);
+        return result;
     }
 
-    VkResult BindSparse(Span<VkBindSparseInfo> bind_infos,
-                        VkFence fence = VK_NULL_HANDLE) const noexcept {
-        return dld->vkQueueBindSparse(queue, bind_infos.size(), bind_infos.data(), fence);
+    VkResult BindSparse(Span<VkBindSparseInfo> bind_infos, VkFence fence = VK_NULL_HANDLE,
+                        u64 tick = 0,
+                        std::source_location site = std::source_location::current()) const noexcept {
+        if (!Vulkan::HangTrace::Enabled()) {
+            return dld->vkQueueBindSparse(queue, bind_infos.size(), bind_infos.data(), fence);
+        }
+        u64 buffers{}, opaque{}, images{}, waits{}, signals{};
+        if (Vulkan::HangTrace::Enabled()) {
+            for (const auto& info : bind_infos) {
+                for (u32 i = 0; i < info.bufferBindCount; ++i) buffers += info.pBufferBinds[i].bindCount;
+                for (u32 i = 0; i < info.imageOpaqueBindCount; ++i) opaque += info.pImageOpaqueBinds[i].bindCount;
+                for (u32 i = 0; i < info.imageBindCount; ++i) images += info.pImageBinds[i].bindCount;
+                waits += info.waitSemaphoreCount;
+                signals += info.signalSemaphoreCount;
+            }
+        }
+        const auto call = Vulkan::HangTrace::Event("queue-sparse-enter queue,fence,batches,buffer_binds,opaque_binds,image_binds,waits,signals",
+            tick, {Vulkan::HangTrace::Handle(queue), Vulkan::HangTrace::Handle(fence),
+                   bind_infos.size(), buffers, opaque, images, waits, signals}, site);
+        const auto result = dld->vkQueueBindSparse(queue, bind_infos.size(), bind_infos.data(), fence);
+        Vulkan::HangTrace::Event("queue-sparse-return call,result", tick,
+            {call, static_cast<u64>(result)}, site);
+        return result;
     }
 
-    VkResult Present(const VkPresentInfoKHR& present_info) const noexcept {
-        return dld->vkQueuePresentKHR(queue, &present_info);
+    VkResult Present(const VkPresentInfoKHR& present_info,
+                     std::source_location site = std::source_location::current()) const noexcept {
+        if (!Vulkan::HangTrace::Enabled()) {
+            return dld->vkQueuePresentKHR(queue, &present_info);
+        }
+        const u64 tick = Vulkan::HangTrace::Enabled() ? Vulkan::HangTrace::QueueTick() : 0;
+        const auto call = Vulkan::HangTrace::Event("queue-present-enter queue,swapchains,waits", tick,
+            {Vulkan::HangTrace::Handle(queue), present_info.swapchainCount, present_info.waitSemaphoreCount}, site);
+        if (Vulkan::HangTrace::Enabled()) {
+            for (u32 i = 0; i < present_info.waitSemaphoreCount; ++i) {
+                Vulkan::HangTrace::Event("queue-present-wait call,semaphore", tick,
+                    {call, Vulkan::HangTrace::Handle(present_info.pWaitSemaphores[i])});
+            }
+        }
+        const auto result = dld->vkQueuePresentKHR(queue, &present_info);
+        Vulkan::HangTrace::Event("queue-present-return call,result", tick,
+            {call, static_cast<u64>(result)}, site);
+        return result;
     }
 
 private:
@@ -1175,7 +1274,15 @@ public:
     }
 
     VkResult WaitIdle() const noexcept {
-        return dld->vkDeviceWaitIdle(handle);
+        if (!Vulkan::HangTrace::Enabled()) {
+            return dld->vkDeviceWaitIdle(handle);
+        }
+        const u64 tick = Vulkan::HangTrace::Enabled() ? Vulkan::HangTrace::QueueTick() : 0;
+        const auto call = Vulkan::HangTrace::Event("device-idle-enter device", tick,
+            {Vulkan::HangTrace::Handle(handle)});
+        const auto result = dld->vkDeviceWaitIdle(handle);
+        Vulkan::HangTrace::Event("device-idle-return call,result", tick, {call, static_cast<u64>(result)});
+        return result;
     }
 
     void ResetQueryPool(VkQueryPool query_pool, u32 first, u32 count) const noexcept {
@@ -1250,6 +1357,14 @@ public:
     VkCommandBuffer operator*() const noexcept {
         return handle;
     }
+    void TraceBoundary(const char* kind) const {
+        if (!Vulkan::HangTrace::Enabled()) {
+            return;
+        }
+        const auto trace_seq = Vulkan::HangTrace::Work(kind, false, Vulkan::HangTrace::Handle(handle));
+        const Vulkan::HangTrace::MarkerScope marker{dld->hang_markers, handle, trace_seq};
+    }
+
     void Begin(const VkCommandBufferBeginInfo& begin_info) const {
         Check(dld->vkBeginCommandBuffer(handle, &begin_info));
     }
@@ -1259,28 +1374,99 @@ public:
     }
 
     void BeginRenderPass(const VkRenderPassBeginInfo& renderpass_bi,
-                         VkSubpassContents contents) const noexcept {
+                         VkSubpassContents contents,
+                         std::source_location location = std::source_location::current()) const noexcept {
+        if (!Vulkan::HangTrace::Enabled()) {
+            const OpTrace::Scope op_trace{handle, [&] {
+                return OpTrace::Info{
+                    .kind = OpTrace::Kind::RenderPassBegin,
+                    .name = "renderpass-begin",
+                    .caller = location,
+                };
+            }};
+            dld->vkCmdBeginRenderPass(handle, &renderpass_bi, contents);
+            return;
+        }
+        const auto trace_seq = Vulkan::HangTrace::Work("renderpass-begin", false,
+            Vulkan::HangTrace::Handle(handle), Vulkan::HangTrace::Handle(renderpass_bi.renderPass), Vulkan::HangTrace::Handle(renderpass_bi.framebuffer));
+        const Vulkan::HangTrace::MarkerScope marker{dld->hang_markers, handle, trace_seq};
+        const OpTrace::Scope op_trace{handle, [&] {
+            return OpTrace::Info{
+                .kind = OpTrace::Kind::RenderPassBegin,
+                .name = "renderpass-begin",
+                .caller = location,
+            };
+        }};
         dld->vkCmdBeginRenderPass(handle, &renderpass_bi, contents);
     }
 
-    void EndRenderPass() const noexcept {
+    void EndRenderPass(std::source_location location = std::source_location::current()) const noexcept {
+        if (!Vulkan::HangTrace::Enabled()) {
+            const OpTrace::Scope op_trace{handle, [&] {
+                return OpTrace::Info{
+                    .kind = OpTrace::Kind::RenderPassEnd,
+                    .name = "renderpass-end",
+                    .caller = location,
+                };
+            }};
+            dld->vkCmdEndRenderPass(handle);
+            return;
+        }
+        const auto trace_seq = Vulkan::HangTrace::Work("renderpass-end", false,
+            Vulkan::HangTrace::Handle(handle));
+        const Vulkan::HangTrace::MarkerScope marker{dld->hang_markers, handle, trace_seq};
+        const OpTrace::Scope op_trace{handle, [&] {
+            return OpTrace::Info{
+                .kind = OpTrace::Kind::RenderPassEnd,
+                .name = "renderpass-end",
+                .caller = location,
+            };
+        }};
         dld->vkCmdEndRenderPass(handle);
     }
 
     void BeginQuery(VkQueryPool query_pool, u32 query, VkQueryControlFlags flags) const noexcept {
+        if (!Vulkan::HangTrace::Enabled()) {
+            dld->vkCmdBeginQuery(handle, query_pool, query, flags);
+            return;
+        }
+        const auto trace_seq = Vulkan::HangTrace::Work("query-begin", false,
+            Vulkan::HangTrace::Handle(handle), Vulkan::HangTrace::Handle(query_pool), query, flags);
+        const Vulkan::HangTrace::MarkerScope marker{dld->hang_markers, handle, trace_seq};
         dld->vkCmdBeginQuery(handle, query_pool, query, flags);
     }
 
     void EndQuery(VkQueryPool query_pool, u32 query) const noexcept {
+        if (!Vulkan::HangTrace::Enabled()) {
+            dld->vkCmdEndQuery(handle, query_pool, query);
+            return;
+        }
+        const auto trace_seq = Vulkan::HangTrace::Work("query-end", false,
+            Vulkan::HangTrace::Handle(handle), Vulkan::HangTrace::Handle(query_pool), query);
+        const Vulkan::HangTrace::MarkerScope marker{dld->hang_markers, handle, trace_seq};
         dld->vkCmdEndQuery(handle, query_pool, query);
     }
 
     void ResetQueryPool(VkQueryPool query_pool, u32 first, u32 count) const noexcept {
+        if (!Vulkan::HangTrace::Enabled()) {
+            dld->vkCmdResetQueryPool(handle, query_pool, first, count);
+            return;
+        }
+        const auto trace_seq = Vulkan::HangTrace::Work("query-reset", false,
+            Vulkan::HangTrace::Handle(handle), Vulkan::HangTrace::Handle(query_pool), first, count);
+        const Vulkan::HangTrace::MarkerScope marker{dld->hang_markers, handle, trace_seq};
         dld->vkCmdResetQueryPool(handle, query_pool, first, count);
     }
 
     void WriteTimestamp(VkPipelineStageFlagBits stage, VkQueryPool query_pool,
                         u32 query) const noexcept {
+        if (!Vulkan::HangTrace::Enabled()) {
+            dld->vkCmdWriteTimestamp(handle, stage, query_pool, query);
+            return;
+        }
+        const auto trace_seq = Vulkan::HangTrace::Work("timestamp", false,
+            Vulkan::HangTrace::Handle(handle), Vulkan::HangTrace::Handle(query_pool), query, stage);
+        const Vulkan::HangTrace::MarkerScope marker{dld->hang_markers, handle, trace_seq};
         dld->vkCmdWriteTimestamp(handle, stage, query_pool, query);
     }
 
@@ -1297,6 +1483,8 @@ public:
     }
 
     void BindPipeline(VkPipelineBindPoint bind_point, VkPipeline pipeline) const noexcept {
+        Vulkan::HangTrace::Bind(bind_point == VK_PIPELINE_BIND_POINT_COMPUTE,
+                                Vulkan::HangTrace::Handle(pipeline));
         dld->vkCmdBindPipeline(handle, bind_point, pipeline);
     }
 
@@ -1315,86 +1503,445 @@ public:
     }
 
     void Draw(u32 vertex_count, u32 instance_count, u32 first_vertex,
-              u32 first_instance) const noexcept {
+              u32 first_instance,
+              std::source_location location = std::source_location::current()) const noexcept {
+        if (!Vulkan::HangTrace::Enabled()) {
+            const OpTrace::Scope op_trace{handle, [&] {
+                return OpTrace::Info{
+                    .kind = OpTrace::Kind::Draw,
+                    .name = "draw",
+                    .caller = location,
+                };
+            }};
+            dld->vkCmdDraw(handle, vertex_count, instance_count, first_vertex, first_instance);
+            return;
+        }
+        const auto trace_seq = Vulkan::HangTrace::Work("draw", false, Vulkan::HangTrace::Handle(handle),
+                                vertex_count, instance_count, first_vertex);
+        const Vulkan::HangTrace::MarkerScope marker{dld->hang_markers, handle, trace_seq};
+        const OpTrace::Scope op_trace{handle, [&] {
+            return OpTrace::Info{
+                .kind = OpTrace::Kind::Draw,
+                .name = "draw",
+                .caller = location,
+            };
+        }};
         dld->vkCmdDraw(handle, vertex_count, instance_count, first_vertex, first_instance);
     }
 
     void DrawIndexed(u32 index_count, u32 instance_count, u32 first_index, u32 vertex_offset,
-                     u32 first_instance) const noexcept {
+                     u32 first_instance,
+                     std::source_location location = std::source_location::current()) const noexcept {
+        if (!Vulkan::HangTrace::Enabled()) {
+            const OpTrace::Scope op_trace{handle, [&] {
+                return OpTrace::Info{
+                    .kind = OpTrace::Kind::Draw,
+                    .name = "draw-indexed",
+                    .caller = location,
+                };
+            }};
+            dld->vkCmdDrawIndexed(handle, index_count, instance_count, first_index, vertex_offset,
+                              first_instance);
+            return;
+        }
+        const auto trace_seq = Vulkan::HangTrace::Work("draw-indexed", false, Vulkan::HangTrace::Handle(handle),
+                                index_count, instance_count, first_index);
+        const Vulkan::HangTrace::MarkerScope marker{dld->hang_markers, handle, trace_seq};
+        const OpTrace::Scope op_trace{handle, [&] {
+            return OpTrace::Info{
+                .kind = OpTrace::Kind::Draw,
+                .name = "draw-indexed",
+                .caller = location,
+            };
+        }};
         dld->vkCmdDrawIndexed(handle, index_count, instance_count, first_index, vertex_offset,
                               first_instance);
     }
 
     void DrawIndirect(VkBuffer src_buffer, VkDeviceSize src_offset, u32 draw_count,
-                      u32 stride) const noexcept {
+                      u32 stride,
+                      std::source_location location = std::source_location::current()) const noexcept {
+        if (!Vulkan::HangTrace::Enabled()) {
+            const OpTrace::Scope op_trace{handle, [&] {
+                return OpTrace::Info{
+                    .kind = OpTrace::Kind::Draw,
+                    .name = "draw-indirect",
+                    .caller = location,
+                    .regions = draw_count,
+                };
+            }};
+            dld->vkCmdDrawIndirect(handle, src_buffer, src_offset, draw_count, stride);
+            return;
+        }
+        const auto trace_seq = Vulkan::HangTrace::Work("draw-indirect", false, Vulkan::HangTrace::Handle(handle),
+                                src_offset, draw_count, stride, Vulkan::HangTrace::Handle(src_buffer));
+        const Vulkan::HangTrace::MarkerScope marker{dld->hang_markers, handle, trace_seq};
+        const OpTrace::Scope op_trace{handle, [&] {
+            return OpTrace::Info{
+                .kind = OpTrace::Kind::Draw,
+                .name = "draw-indirect",
+                .caller = location,
+                .regions = draw_count,
+            };
+        }};
         dld->vkCmdDrawIndirect(handle, src_buffer, src_offset, draw_count, stride);
     }
 
     void DrawIndexedIndirect(VkBuffer src_buffer, VkDeviceSize src_offset, u32 draw_count,
-                             u32 stride) const noexcept {
+                             u32 stride,
+                             std::source_location location = std::source_location::current()) const noexcept {
+        if (!Vulkan::HangTrace::Enabled()) {
+            const OpTrace::Scope op_trace{handle, [&] {
+                return OpTrace::Info{
+                    .kind = OpTrace::Kind::Draw,
+                    .name = "draw-indexed-indirect",
+                    .caller = location,
+                    .regions = draw_count,
+                };
+            }};
+            dld->vkCmdDrawIndexedIndirect(handle, src_buffer, src_offset, draw_count, stride);
+            return;
+        }
+        const auto trace_seq = Vulkan::HangTrace::Work("draw-indexed-indirect", false, Vulkan::HangTrace::Handle(handle),
+                                src_offset, draw_count, stride, Vulkan::HangTrace::Handle(src_buffer));
+        const Vulkan::HangTrace::MarkerScope marker{dld->hang_markers, handle, trace_seq};
+        const OpTrace::Scope op_trace{handle, [&] {
+            return OpTrace::Info{
+                .kind = OpTrace::Kind::Draw,
+                .name = "draw-indexed-indirect",
+                .caller = location,
+                .regions = draw_count,
+            };
+        }};
         dld->vkCmdDrawIndexedIndirect(handle, src_buffer, src_offset, draw_count, stride);
     }
 
-    void DrawMeshTasksEXT(u32 group_count_x, u32 group_count_y, u32 group_count_z) const noexcept {
+    void DrawMeshTasksEXT(u32 group_count_x, u32 group_count_y, u32 group_count_z,
+                          std::source_location location = std::source_location::current()) const noexcept {
+        if (!Vulkan::HangTrace::Enabled()) {
+            const OpTrace::Scope op_trace{handle, [&] {
+                return OpTrace::Info{
+                    .kind = OpTrace::Kind::Draw,
+                    .name = "draw-mesh",
+                    .caller = location,
+                };
+            }};
+            dld->vkCmdDrawMeshTasksEXT(handle, group_count_x, group_count_y, group_count_z);
+            return;
+        }
+        const auto trace_seq = Vulkan::HangTrace::Work("draw-mesh", false, Vulkan::HangTrace::Handle(handle),
+                                group_count_x, group_count_y, group_count_z);
+        const Vulkan::HangTrace::MarkerScope marker{dld->hang_markers, handle, trace_seq};
+        const OpTrace::Scope op_trace{handle, [&] {
+            return OpTrace::Info{
+                .kind = OpTrace::Kind::Draw,
+                .name = "draw-mesh",
+                .caller = location,
+            };
+        }};
         dld->vkCmdDrawMeshTasksEXT(handle, group_count_x, group_count_y, group_count_z);
     }
 
     void DrawIndirectCount(VkBuffer src_buffer, VkDeviceSize src_offset, VkBuffer count_buffer,
-                           VkDeviceSize count_offset, u32 draw_count, u32 stride) const noexcept {
+                           VkDeviceSize count_offset, u32 draw_count, u32 stride,
+                           std::source_location location = std::source_location::current()) const noexcept {
+        if (!Vulkan::HangTrace::Enabled()) {
+            const OpTrace::Scope op_trace{handle, [&] {
+                return OpTrace::Info{
+                    .kind = OpTrace::Kind::Draw,
+                    .name = "draw-indirect-count",
+                    .caller = location,
+                    .regions = draw_count,
+                };
+            }};
+            dld->vkCmdDrawIndirectCount(handle, src_buffer, src_offset, count_buffer, count_offset,
+                                    draw_count, stride);
+            return;
+        }
+        const auto trace_seq = Vulkan::HangTrace::Work("draw-indirect-count", false, Vulkan::HangTrace::Handle(handle),
+                                src_offset, draw_count, stride, Vulkan::HangTrace::Handle(src_buffer));
+        const Vulkan::HangTrace::MarkerScope marker{dld->hang_markers, handle, trace_seq};
+        const OpTrace::Scope op_trace{handle, [&] {
+            return OpTrace::Info{
+                .kind = OpTrace::Kind::Draw,
+                .name = "draw-indirect-count",
+                .caller = location,
+                .regions = draw_count,
+            };
+        }};
         dld->vkCmdDrawIndirectCount(handle, src_buffer, src_offset, count_buffer, count_offset,
                                     draw_count, stride);
     }
 
     void DrawIndexedIndirectCount(VkBuffer src_buffer, VkDeviceSize src_offset,
                                   VkBuffer count_buffer, VkDeviceSize count_offset, u32 draw_count,
-                                  u32 stride) const noexcept {
+                                  u32 stride,
+                                  std::source_location location = std::source_location::current()) const noexcept {
+        if (!Vulkan::HangTrace::Enabled()) {
+            const OpTrace::Scope op_trace{handle, [&] {
+                return OpTrace::Info{
+                    .kind = OpTrace::Kind::Draw,
+                    .name = "draw-indexed-indirect-count",
+                    .caller = location,
+                    .regions = draw_count,
+                };
+            }};
+            dld->vkCmdDrawIndexedIndirectCount(handle, src_buffer, src_offset, count_buffer,
+                                           count_offset, draw_count, stride);
+            return;
+        }
+        const auto trace_seq = Vulkan::HangTrace::Work("draw-indexed-indirect-count", false, Vulkan::HangTrace::Handle(handle),
+                                src_offset, draw_count, stride, Vulkan::HangTrace::Handle(src_buffer));
+        const Vulkan::HangTrace::MarkerScope marker{dld->hang_markers, handle, trace_seq};
+        const OpTrace::Scope op_trace{handle, [&] {
+            return OpTrace::Info{
+                .kind = OpTrace::Kind::Draw,
+                .name = "draw-indexed-indirect-count",
+                .caller = location,
+                .regions = draw_count,
+            };
+        }};
         dld->vkCmdDrawIndexedIndirectCount(handle, src_buffer, src_offset, count_buffer,
                                            count_offset, draw_count, stride);
     }
 
     void DrawIndirectByteCountEXT(u32 instance_count, u32 first_instance, VkBuffer counter_buffer,
                                   VkDeviceSize counter_buffer_offset, u32 counter_offset,
-                                  u32 stride) {
+                                  u32 stride,
+                                  std::source_location location = std::source_location::current()) {
+        if (!Vulkan::HangTrace::Enabled()) {
+            const OpTrace::Scope op_trace{handle, [&] {
+                return OpTrace::Info{
+                    .kind = OpTrace::Kind::Draw,
+                    .name = "draw-byte-count",
+                    .caller = location,
+                };
+            }};
+            dld->vkCmdDrawIndirectByteCountEXT(handle, instance_count, first_instance, counter_buffer,
+                                           counter_buffer_offset, counter_offset, stride);
+            return;
+        }
+        const auto trace_seq = Vulkan::HangTrace::Work("draw-byte-count", false, Vulkan::HangTrace::Handle(handle),
+                                counter_buffer_offset, instance_count, stride, Vulkan::HangTrace::Handle(counter_buffer));
+        const Vulkan::HangTrace::MarkerScope marker{dld->hang_markers, handle, trace_seq};
+        const OpTrace::Scope op_trace{handle, [&] {
+            return OpTrace::Info{
+                .kind = OpTrace::Kind::Draw,
+                .name = "draw-byte-count",
+                .caller = location,
+            };
+        }};
         dld->vkCmdDrawIndirectByteCountEXT(handle, instance_count, first_instance, counter_buffer,
                                            counter_buffer_offset, counter_offset, stride);
     }
 
     void ClearAttachments(Span<VkClearAttachment> attachments,
-                          Span<VkClearRect> rects) const noexcept {
+                          Span<VkClearRect> rects,
+                          std::source_location location = std::source_location::current()) const noexcept {
+        if (!Vulkan::HangTrace::Enabled()) {
+            const OpTrace::Scope op_trace{handle, [&] {
+                return OpTrace::Info{
+                    .kind = OpTrace::Kind::Clear,
+                    .name = "clear-attachments",
+                    .caller = location,
+                    .regions = rects.size(),
+                };
+            }};
+            dld->vkCmdClearAttachments(handle, attachments.size(), attachments.data(), rects.size(),
+                                   rects.data());
+            return;
+        }
+        const auto trace_seq = Vulkan::HangTrace::Work("clear-attachments", false,
+            Vulkan::HangTrace::Handle(handle), attachments.size(), rects.size());
+        const Vulkan::HangTrace::MarkerScope marker{dld->hang_markers, handle, trace_seq};
+        const OpTrace::Scope op_trace{handle, [&] {
+            return OpTrace::Info{
+                .kind = OpTrace::Kind::Clear,
+                .name = "clear-attachments",
+                .caller = location,
+                .regions = rects.size(),
+            };
+        }};
         dld->vkCmdClearAttachments(handle, attachments.size(), attachments.data(), rects.size(),
                                    rects.data());
     }
 
     void ClearColorImage(VkImage image, VkImageLayout layout, VkClearColorValue color,
-                         Span<VkImageSubresourceRange> ranges) {
+                         Span<VkImageSubresourceRange> ranges,
+                         std::source_location location = std::source_location::current()) {
+        if (!Vulkan::HangTrace::Enabled()) {
+            const OpTrace::Scope op_trace{handle, [&] {
+                return OpTrace::Info{
+                    .kind = OpTrace::Kind::Clear,
+                    .name = "clear-color",
+                    .caller = location,
+                    .regions = ranges.size(),
+                };
+            }};
+            dld->vkCmdClearColorImage(handle, image, layout, &color, ranges.size(), ranges.data());
+            return;
+        }
+        const auto trace_seq = Vulkan::HangTrace::Work("clear-color", false,
+            Vulkan::HangTrace::Handle(handle), Vulkan::HangTrace::Handle(image), layout, ranges.size());
+        const Vulkan::HangTrace::MarkerScope marker{dld->hang_markers, handle, trace_seq};
+        const OpTrace::Scope op_trace{handle, [&] {
+            return OpTrace::Info{
+                .kind = OpTrace::Kind::Clear,
+                .name = "clear-color",
+                .caller = location,
+                .regions = ranges.size(),
+            };
+        }};
         dld->vkCmdClearColorImage(handle, image, layout, &color, ranges.size(), ranges.data());
     }
 
     void BlitImage(VkImage src_image, VkImageLayout src_layout, VkImage dst_image,
                    VkImageLayout dst_layout, Span<VkImageBlit> regions,
-                   VkFilter filter) const noexcept {
+                   VkFilter filter,
+                   std::source_location location = std::source_location::current()) const noexcept {
+        if (!Vulkan::HangTrace::Enabled()) {
+            const OpTrace::Scope op_trace{handle, [&] {
+                return OpTrace::Info{
+                    .kind = OpTrace::Kind::Blit,
+                    .name = "blit-image",
+                    .caller = location,
+                    .regions = regions.size(),
+                };
+            }};
+            dld->vkCmdBlitImage(handle, src_image, src_layout, dst_image, dst_layout, regions.size(),
+                            regions.data(), filter);
+            return;
+        }
+        const auto trace_seq = Vulkan::HangTrace::Work("blit", false, Vulkan::HangTrace::Handle(handle),
+                                Vulkan::HangTrace::Handle(src_image), Vulkan::HangTrace::Handle(dst_image), regions.size());
+        const Vulkan::HangTrace::MarkerScope marker{dld->hang_markers, handle, trace_seq};
+        const OpTrace::Scope op_trace{handle, [&] {
+            return OpTrace::Info{
+                .kind = OpTrace::Kind::Blit,
+                .name = "blit-image",
+                .caller = location,
+                .regions = regions.size(),
+            };
+        }};
         dld->vkCmdBlitImage(handle, src_image, src_layout, dst_image, dst_layout, regions.size(),
                             regions.data(), filter);
     }
 
     void ResolveImage(VkImage src_image, VkImageLayout src_layout, VkImage dst_image,
-                      VkImageLayout dst_layout, Span<VkImageResolve> regions) {
+                      VkImageLayout dst_layout, Span<VkImageResolve> regions,
+                      std::source_location location = std::source_location::current()) {
+        if (!Vulkan::HangTrace::Enabled()) {
+            const OpTrace::Scope op_trace{handle, [&] {
+                return OpTrace::Info{
+                    .kind = OpTrace::Kind::Resolve,
+                    .name = "resolve-image",
+                    .caller = location,
+                    .regions = regions.size(),
+                };
+            }};
+            dld->vkCmdResolveImage(handle, src_image, src_layout, dst_image, dst_layout, regions.size(),
+                               regions.data());
+            return;
+        }
+        const auto trace_seq = Vulkan::HangTrace::Work("resolve-image", false,
+            Vulkan::HangTrace::Handle(handle), Vulkan::HangTrace::Handle(src_image), Vulkan::HangTrace::Handle(dst_image), regions.size());
+        const Vulkan::HangTrace::MarkerScope marker{dld->hang_markers, handle, trace_seq};
+        const OpTrace::Scope op_trace{handle, [&] {
+            return OpTrace::Info{
+                .kind = OpTrace::Kind::Resolve,
+                .name = "resolve-image",
+                .caller = location,
+                .regions = regions.size(),
+            };
+        }};
         dld->vkCmdResolveImage(handle, src_image, src_layout, dst_image, dst_layout, regions.size(),
                                regions.data());
     }
 
-    void Dispatch(u32 x, u32 y, u32 z) const noexcept {
+    void Dispatch(u32 x, u32 y, u32 z,
+                  std::source_location location = std::source_location::current()) const noexcept {
+        if (!Vulkan::HangTrace::Enabled()) {
+            const OpTrace::Scope op_trace{handle, [&] {
+                return OpTrace::Info{
+                    .kind = OpTrace::Kind::Dispatch,
+                    .name = "dispatch",
+                    .caller = location,
+                };
+            }};
+            dld->vkCmdDispatch(handle, x, y, z);
+            return;
+        }
+        const auto trace_seq = Vulkan::HangTrace::Work("dispatch", true, Vulkan::HangTrace::Handle(handle),
+                                x, y, z, 0, location);
+        const Vulkan::HangTrace::MarkerScope marker{dld->hang_markers, handle, trace_seq};
+        const OpTrace::Scope op_trace{handle, [&] {
+            return OpTrace::Info{
+                .kind = OpTrace::Kind::Dispatch,
+                .name = "dispatch",
+                .caller = location,
+            };
+        }};
         dld->vkCmdDispatch(handle, x, y, z);
     }
 
-    void DispatchIndirect(VkBuffer indirect_buffer, VkDeviceSize offset) const noexcept {
+    void DispatchIndirect(VkBuffer indirect_buffer, VkDeviceSize offset,
+                          std::source_location location =
+                              std::source_location::current()) const noexcept {
+        if (!Vulkan::HangTrace::Enabled()) {
+            const OpTrace::Scope op_trace{handle, [&] {
+                return OpTrace::Info{
+                    .kind = OpTrace::Kind::Dispatch,
+                    .name = "dispatch-indirect",
+                    .caller = location,
+                };
+            }};
+            dld->vkCmdDispatchIndirect(handle, indirect_buffer, offset);
+            return;
+        }
+        const auto trace_seq = Vulkan::HangTrace::Work("dispatch-indirect", true, Vulkan::HangTrace::Handle(handle),
+                                offset, 0, 0, Vulkan::HangTrace::Handle(indirect_buffer), location);
+        const Vulkan::HangTrace::MarkerScope marker{dld->hang_markers, handle, trace_seq};
+        const OpTrace::Scope op_trace{handle, [&] {
+            return OpTrace::Info{
+                .kind = OpTrace::Kind::Dispatch,
+                .name = "dispatch-indirect",
+                .caller = location,
+            };
+        }};
         dld->vkCmdDispatchIndirect(handle, indirect_buffer, offset);
     }
 
     void PipelineBarrier(VkPipelineStageFlags src_stage_mask, VkPipelineStageFlags dst_stage_mask,
                          VkDependencyFlags dependency_flags, Span<VkMemoryBarrier> memory_barriers,
                          Span<VkBufferMemoryBarrier> buffer_barriers,
-                         Span<VkImageMemoryBarrier> image_barriers) const noexcept {
+                         Span<VkImageMemoryBarrier> image_barriers,
+                         std::source_location location = std::source_location::current()) const noexcept {
+        if (Vulkan::HangTrace::ResourcesEnabled()) {
+            Vulkan::HangTrace::Resource("barrier cmd,src_stage,dst_stage,flags,memory_count,buffer_count,image_count",
+                {Vulkan::HangTrace::Handle(handle), src_stage_mask, dst_stage_mask,
+                 dependency_flags, memory_barriers.size(), buffer_barriers.size(), image_barriers.size()});
+            for (const auto& b : memory_barriers) {
+                Vulkan::HangTrace::Resource("barrier-memory cmd,src_access,dst_access",
+                    {Vulkan::HangTrace::Handle(handle), b.srcAccessMask, b.dstAccessMask});
+            }
+            for (const auto& b : buffer_barriers) {
+                Vulkan::HangTrace::Resource("barrier-buffer cmd,buffer,offset,size,src_access,dst_access,src_queue,dst_queue",
+                    {Vulkan::HangTrace::Handle(handle), Vulkan::HangTrace::Handle(b.buffer),
+                     b.offset, b.size, b.srcAccessMask, b.dstAccessMask,
+                     b.srcQueueFamilyIndex, b.dstQueueFamilyIndex});
+            }
+            for (const auto& b : image_barriers) {
+                Vulkan::HangTrace::Resource("barrier-image cmd,image,old_layout,new_layout,src_access,dst_access,src_queue,dst_queue",
+                    {Vulkan::HangTrace::Handle(handle), Vulkan::HangTrace::Handle(b.image),
+                     static_cast<u64>(b.oldLayout), static_cast<u64>(b.newLayout),
+                     b.srcAccessMask, b.dstAccessMask,
+                     b.srcQueueFamilyIndex, b.dstQueueFamilyIndex});
+                const auto& r = b.subresourceRange;
+                Vulkan::HangTrace::Resource("barrier-image-range cmd,image,aspect,base_mip,levels,base_layer,layers",
+                    {Vulkan::HangTrace::Handle(handle), Vulkan::HangTrace::Handle(b.image),
+                     r.aspectMask, r.baseMipLevel, r.levelCount, r.baseArrayLayer, r.layerCount});
+            }
+        }
         static constexpr u32 MaxBarriers = 16;
         if (dld->vkCmdPipelineBarrier2 && memory_barriers.size() <= MaxBarriers &&
             buffer_barriers.size() <= MaxBarriers && image_barriers.size() <= MaxBarriers) {
@@ -1458,9 +2005,33 @@ public:
                 .imageMemoryBarrierCount = image_barriers.size(),
                 .pImageMemoryBarriers = image_barriers2.data(),
             };
+            const OpTrace::Scope op_trace{handle, [&] {
+                return OpTrace::Info{
+                    .kind = OpTrace::Kind::Barrier,
+                    .name = "pipeline-barrier",
+                    .caller = location,
+                    .src_stage = src_stage_mask,
+                    .dst_stage = dst_stage_mask,
+                    .memory_barriers = memory_barriers.size(),
+                    .buffer_barriers = buffer_barriers.size(),
+                    .image_barriers = image_barriers.size(),
+                };
+            }};
             dld->vkCmdPipelineBarrier2(handle, &dependency_info);
             return;
         }
+        const OpTrace::Scope op_trace{handle, [&] {
+            return OpTrace::Info{
+                .kind = OpTrace::Kind::Barrier,
+                .name = "pipeline-barrier",
+                .caller = location,
+                .src_stage = src_stage_mask,
+                .dst_stage = dst_stage_mask,
+                .memory_barriers = memory_barriers.size(),
+                .buffer_barriers = buffer_barriers.size(),
+                .image_barriers = image_barriers.size(),
+            };
+        }};
         dld->vkCmdPipelineBarrier(handle, src_stage_mask, dst_stage_mask, dependency_flags,
                                   memory_barriers.size(), memory_barriers.data(),
                                   buffer_barriers.size(), buffer_barriers.data(),
@@ -1468,26 +2039,30 @@ public:
     }
 
     void PipelineBarrier(VkPipelineStageFlags src_stage_mask, VkPipelineStageFlags dst_stage_mask,
-                         VkDependencyFlags dependency_flags = 0) const noexcept {
-        PipelineBarrier(src_stage_mask, dst_stage_mask, dependency_flags, {}, {}, {});
+                         VkDependencyFlags dependency_flags = 0,
+                         std::source_location location = std::source_location::current()) const noexcept {
+        PipelineBarrier(src_stage_mask, dst_stage_mask, dependency_flags, {}, {}, {}, location);
     }
 
     void PipelineBarrier(VkPipelineStageFlags src_stage_mask, VkPipelineStageFlags dst_stage_mask,
                          VkDependencyFlags dependency_flags,
-                         const VkMemoryBarrier& memory_barrier) const noexcept {
-        PipelineBarrier(src_stage_mask, dst_stage_mask, dependency_flags, memory_barrier, {}, {});
+                         const VkMemoryBarrier& memory_barrier,
+                         std::source_location location = std::source_location::current()) const noexcept {
+        PipelineBarrier(src_stage_mask, dst_stage_mask, dependency_flags, memory_barrier, {}, {}, location);
     }
 
     void PipelineBarrier(VkPipelineStageFlags src_stage_mask, VkPipelineStageFlags dst_stage_mask,
                          VkDependencyFlags dependency_flags,
-                         const VkBufferMemoryBarrier& buffer_barrier) const noexcept {
-        PipelineBarrier(src_stage_mask, dst_stage_mask, dependency_flags, {}, buffer_barrier, {});
+                         const VkBufferMemoryBarrier& buffer_barrier,
+                         std::source_location location = std::source_location::current()) const noexcept {
+        PipelineBarrier(src_stage_mask, dst_stage_mask, dependency_flags, {}, buffer_barrier, {}, location);
     }
 
     void PipelineBarrier(VkPipelineStageFlags src_stage_mask, VkPipelineStageFlags dst_stage_mask,
                          VkDependencyFlags dependency_flags,
-                         const VkImageMemoryBarrier& image_barrier) const noexcept {
-        PipelineBarrier(src_stage_mask, dst_stage_mask, dependency_flags, {}, {}, image_barrier);
+                         const VkImageMemoryBarrier& image_barrier,
+                         std::source_location location = std::source_location::current()) const noexcept {
+        PipelineBarrier(src_stage_mask, dst_stage_mask, dependency_flags, {}, {}, image_barrier, location);
     }
 
     void BindDescriptorBuffersEXT(Span<VkDescriptorBufferBindingInfoEXT> bindings) const noexcept {
@@ -1503,37 +2078,200 @@ public:
     }
 
     void CopyBufferToImage(VkBuffer src_buffer, VkImage dst_image, VkImageLayout dst_image_layout,
-                           Span<VkBufferImageCopy> regions) const noexcept {
+                           Span<VkBufferImageCopy> regions,
+                           std::source_location location = std::source_location::current()) const noexcept {
+        if (!Vulkan::HangTrace::Enabled()) {
+            const OpTrace::Scope op_trace{handle, [&] {
+                return OpTrace::Info{
+                    .kind = OpTrace::Kind::Copy,
+                    .name = "copy-buffer-image",
+                    .caller = location,
+                    .regions = regions.size(),
+                };
+            }};
+            dld->vkCmdCopyBufferToImage(handle, src_buffer, dst_image, dst_image_layout, regions.size(),
+                                    regions.data());
+            return;
+        }
+        const auto trace_seq = Vulkan::HangTrace::Work("copy-buffer-image", false,
+            Vulkan::HangTrace::Handle(handle), Vulkan::HangTrace::Handle(src_buffer), Vulkan::HangTrace::Handle(dst_image), regions.size());
+        const Vulkan::HangTrace::MarkerScope marker{dld->hang_markers, handle, trace_seq};
+        const OpTrace::Scope op_trace{handle, [&] {
+            return OpTrace::Info{
+                .kind = OpTrace::Kind::Copy,
+                .name = "copy-buffer-image",
+                .caller = location,
+                .regions = regions.size(),
+            };
+        }};
         dld->vkCmdCopyBufferToImage(handle, src_buffer, dst_image, dst_image_layout, regions.size(),
                                     regions.data());
     }
 
     void CopyBuffer(VkBuffer src_buffer, VkBuffer dst_buffer,
-                    Span<VkBufferCopy> regions) const noexcept {
+                    Span<VkBufferCopy> regions,
+                    std::source_location location = std::source_location::current()) const noexcept {
+        if (!Vulkan::HangTrace::Enabled()) {
+            const OpTrace::Scope op_trace{handle, [&] {
+                u64 bytes{};
+                for (const auto& region : regions) bytes += region.size;
+                return OpTrace::Info{
+                    .kind = OpTrace::Kind::Copy,
+                    .name = "copy-buffer",
+                    .caller = location,
+                    .regions = regions.size(),
+                    .bytes = bytes,
+                };
+            }};
+            dld->vkCmdCopyBuffer(handle, src_buffer, dst_buffer, regions.size(), regions.data());
+            return;
+        }
+        const auto trace_seq = Vulkan::HangTrace::Work("copy", false, Vulkan::HangTrace::Handle(handle),
+            Vulkan::HangTrace::Handle(src_buffer), Vulkan::HangTrace::Handle(dst_buffer), regions.size());
+        const Vulkan::HangTrace::MarkerScope marker{dld->hang_markers, handle, trace_seq};
+        if (Vulkan::HangTrace::ResourcesEnabled()) {
+            for (const auto& r : regions) {
+                Vulkan::HangTrace::Resource("copy-buffer cmd,src,dst,src_offset,dst_offset,size",
+                    {Vulkan::HangTrace::Handle(handle), Vulkan::HangTrace::Handle(src_buffer),
+                     Vulkan::HangTrace::Handle(dst_buffer), r.srcOffset, r.dstOffset, r.size});
+            }
+        }
+        const OpTrace::Scope op_trace{handle, [&] {
+            u64 bytes{};
+            for (const auto& region : regions) bytes += region.size;
+            return OpTrace::Info{
+                .kind = OpTrace::Kind::Copy,
+                .name = "copy-buffer",
+                .caller = location,
+                .regions = regions.size(),
+                .bytes = bytes,
+            };
+        }};
         dld->vkCmdCopyBuffer(handle, src_buffer, dst_buffer, regions.size(), regions.data());
     }
 
     void CopyImage(VkImage src_image, VkImageLayout src_layout, VkImage dst_image,
-                   VkImageLayout dst_layout, Span<VkImageCopy> regions) const noexcept {
+                   VkImageLayout dst_layout, Span<VkImageCopy> regions,
+                   std::source_location location = std::source_location::current()) const noexcept {
+        if (!Vulkan::HangTrace::Enabled()) {
+            const OpTrace::Scope op_trace{handle, [&] {
+                return OpTrace::Info{
+                    .kind = OpTrace::Kind::Copy,
+                    .name = "copy-image",
+                    .caller = location,
+                    .regions = regions.size(),
+                };
+            }};
+            dld->vkCmdCopyImage(handle, src_image, src_layout, dst_image, dst_layout, regions.size(),
+                            regions.data());
+            return;
+        }
+        const auto trace_seq = Vulkan::HangTrace::Work("copy-image", false,
+            Vulkan::HangTrace::Handle(handle), Vulkan::HangTrace::Handle(src_image), Vulkan::HangTrace::Handle(dst_image), regions.size());
+        const Vulkan::HangTrace::MarkerScope marker{dld->hang_markers, handle, trace_seq};
+        const OpTrace::Scope op_trace{handle, [&] {
+            return OpTrace::Info{
+                .kind = OpTrace::Kind::Copy,
+                .name = "copy-image",
+                .caller = location,
+                .regions = regions.size(),
+            };
+        }};
         dld->vkCmdCopyImage(handle, src_image, src_layout, dst_image, dst_layout, regions.size(),
                             regions.data());
     }
 
     void CopyImageToBuffer(VkImage src_image, VkImageLayout src_layout, VkBuffer dst_buffer,
-                           Span<VkBufferImageCopy> regions) const noexcept {
+                           Span<VkBufferImageCopy> regions,
+                           std::source_location location = std::source_location::current()) const noexcept {
+        if (!Vulkan::HangTrace::Enabled()) {
+            const OpTrace::Scope op_trace{handle, [&] {
+                return OpTrace::Info{
+                    .kind = OpTrace::Kind::Copy,
+                    .name = "copy-image-buffer",
+                    .caller = location,
+                    .regions = regions.size(),
+                };
+            }};
+            dld->vkCmdCopyImageToBuffer(handle, src_image, src_layout, dst_buffer, regions.size(),
+                                    regions.data());
+            return;
+        }
+        const auto trace_seq = Vulkan::HangTrace::Work("copy-image-buffer", false,
+            Vulkan::HangTrace::Handle(handle), Vulkan::HangTrace::Handle(src_image), Vulkan::HangTrace::Handle(dst_buffer), regions.size());
+        const Vulkan::HangTrace::MarkerScope marker{dld->hang_markers, handle, trace_seq};
+        const OpTrace::Scope op_trace{handle, [&] {
+            return OpTrace::Info{
+                .kind = OpTrace::Kind::Copy,
+                .name = "copy-image-buffer",
+                .caller = location,
+                .regions = regions.size(),
+            };
+        }};
         dld->vkCmdCopyImageToBuffer(handle, src_image, src_layout, dst_buffer, regions.size(),
                                     regions.data());
     }
 
     void CopyQueryPoolResults(VkQueryPool query_pool, u32 first_query, u32 query_count,
                               VkBuffer dst_buffer, VkDeviceSize dst_offset, VkDeviceSize stride,
-                              VkQueryResultFlags flags) const noexcept {
+                              VkQueryResultFlags flags,
+                              std::source_location location = std::source_location::current()) const noexcept {
+        if (!Vulkan::HangTrace::Enabled()) {
+            const OpTrace::Scope op_trace{handle, [&] {
+                return OpTrace::Info{
+                    .kind = OpTrace::Kind::Copy,
+                    .name = "query-results",
+                    .caller = location,
+                    .regions = query_count,
+                };
+            }};
+            dld->vkCmdCopyQueryPoolResults(handle, query_pool, first_query, query_count, dst_buffer,
+                                       dst_offset, stride, flags);
+            return;
+        }
+        const auto trace_seq = Vulkan::HangTrace::Work("query-copy", false,
+            Vulkan::HangTrace::Handle(handle), Vulkan::HangTrace::Handle(query_pool), first_query, query_count, Vulkan::HangTrace::Handle(dst_buffer));
+        const Vulkan::HangTrace::MarkerScope marker{dld->hang_markers, handle, trace_seq};
+        const OpTrace::Scope op_trace{handle, [&] {
+            return OpTrace::Info{
+                .kind = OpTrace::Kind::Copy,
+                .name = "query-results",
+                .caller = location,
+                .regions = query_count,
+            };
+        }};
         dld->vkCmdCopyQueryPoolResults(handle, query_pool, first_query, query_count, dst_buffer,
                                        dst_offset, stride, flags);
     }
 
     void FillBuffer(VkBuffer dst_buffer, VkDeviceSize dst_offset, VkDeviceSize size,
-                    u32 data) const noexcept {
+                    u32 data,
+                    std::source_location location = std::source_location::current()) const noexcept {
+        if (!Vulkan::HangTrace::Enabled()) {
+            const OpTrace::Scope op_trace{handle, [&] {
+                return OpTrace::Info{
+                    .kind = OpTrace::Kind::Clear,
+                    .name = "fill-buffer",
+                    .caller = location,
+                    .regions = 1,
+                    .bytes = size == VK_WHOLE_SIZE ? 0 : size,
+                };
+            }};
+            dld->vkCmdFillBuffer(handle, dst_buffer, dst_offset, size, data);
+            return;
+        }
+        const auto trace_seq = Vulkan::HangTrace::Work("fill-buffer", false,
+            Vulkan::HangTrace::Handle(handle), Vulkan::HangTrace::Handle(dst_buffer), dst_offset, size);
+        const Vulkan::HangTrace::MarkerScope marker{dld->hang_markers, handle, trace_seq};
+        const OpTrace::Scope op_trace{handle, [&] {
+            return OpTrace::Info{
+                .kind = OpTrace::Kind::Clear,
+                .name = "fill-buffer",
+                .caller = location,
+                .regions = 1,
+                .bytes = size == VK_WHOLE_SIZE ? 0 : size,
+            };
+        }};
         dld->vkCmdFillBuffer(handle, dst_buffer, dst_offset, size, data);
     }
 

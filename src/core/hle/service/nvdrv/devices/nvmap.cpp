@@ -12,6 +12,7 @@
 #include "common/assert.h"
 #include "common/logging.h"
 #include "core/core.h"
+#include "core/deferred_transition.h"
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/service/nvdrv/core/container.h"
@@ -98,6 +99,8 @@ NvResult nvmap::IocCreate(IocCreateParams& params) {
 }
 
 NvResult nvmap::IocAlloc(IocAllocParams& params, DeviceFD fd) {
+    Core::DeferredTransitionScope transition{system,
+        Common::GpuTransitionProfile::SuspensionSite::Nvdrv};
     LOG_DEBUG(Service_NVDRV, "called, addr={:X}", params.address);
 
     if (!params.handle) {
@@ -126,14 +129,18 @@ NvResult nvmap::IocAlloc(IocAllocParams& params, DeviceFD fd) {
         return NvResult::InsufficientMemory;
     }
 
+    const auto lifetime = container.GetSessionLifetime(sessions[fd]);
+    if (!lifetime) {
+        return NvResult::InvalidState;
+    }
     const auto result = handle_description->Alloc(params.flags, params.align, params.kind,
-                                                  params.address, sessions[fd]);
+                                                  params.address, sessions[fd], lifetime);
     if (result != NvResult::Success) {
         LOG_CRITICAL(Service_NVDRV, "Object failed to allocate, handle={:08X}", params.handle);
         return result;
     }
     bool is_out_io{};
-    auto process = container.GetSession(sessions[fd])->process;
+    auto process = lifetime->process;
     ASSERT(process->GetPageTable()
                .LockForMapDeviceAddressSpace(&is_out_io, handle_description->address,
                                              handle_description->size,
@@ -235,6 +242,8 @@ NvResult nvmap::IocParam(IocParamParams& params) {
 }
 
 NvResult nvmap::IocFree(IocFreeParams& params, DeviceFD fd) {
+    Core::DeferredTransitionScope transition{system,
+        Common::GpuTransitionProfile::SuspensionSite::Nvdrv};
     LOG_DEBUG(Service_NVDRV, "called");
 
     if (!params.handle) {
@@ -242,8 +251,12 @@ NvResult nvmap::IocFree(IocFreeParams& params, DeviceFD fd) {
         return NvResult::Success;
     }
 
+    const auto lifetime = container.GetSessionLifetime(sessions[fd]);
+    if (!lifetime) {
+        return NvResult::InvalidState;
+    }
     if (auto freeInfo{file.FreeHandle(params.handle, false)}) {
-        auto process = container.GetSession(sessions[fd])->process;
+        auto process = lifetime->process;
         if (freeInfo->can_unlock) {
             ASSERT(process->GetPageTable()
                        .UnlockForDeviceAddressSpace(freeInfo->address, freeInfo->size)

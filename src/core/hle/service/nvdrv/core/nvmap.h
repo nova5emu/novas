@@ -76,6 +76,7 @@ public:
         bool allocated{}; //!< If the handle has been allocated with `Alloc`
         bool in_heap{};
         NvCore::SessionId session_id{};
+        std::shared_ptr<SessionLifetime> session_lifetime;
 
         DAddr d_address{}; //!< The memory location in the device's AS that this handle corresponds
                            //!< to, this can also be in the nvdrv tmem
@@ -87,7 +88,8 @@ public:
          * if a 0 address is passed
          */
         [[nodiscard]] NvResult Alloc(Flags pFlags, u32 pAlign, u8 pKind, u64 pAddress,
-                                     NvCore::SessionId pSessionId);
+                                     NvCore::SessionId pSessionId,
+                                     std::shared_ptr<SessionLifetime> lifetime);
 
         /**
          * @brief Increases the dupe counter of the handle for the given session
@@ -155,7 +157,8 @@ public:
      */
     std::optional<FreeInfo> FreeHandle(Handle::Id handle, bool internal_session);
 
-    void UnmapAllHandles(NvCore::SessionId session_id);
+    void UnmapAllHandles(NvCore::SessionId session_id,
+                         const std::shared_ptr<SessionLifetime>& lifetime);
 
 private:
     std::list<std::shared_ptr<Handle>> unmap_queue{};

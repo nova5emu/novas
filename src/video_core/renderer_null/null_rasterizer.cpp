@@ -75,7 +75,7 @@ void RasterizerNull::SignalSyncPoint(u32 value) {
     syncpoint_manager.IncrementHost(value);
 }
 void RasterizerNull::SignalReference() {}
-void RasterizerNull::ReleaseFences(bool) {}
+void RasterizerNull::ReleaseFences(bool, std::source_location) {}
 void RasterizerNull::FlushAndInvalidateRegion(DAddr addr, u64 size, VideoCommon::CacheType) {}
 void RasterizerNull::WaitForIdle() {}
 void RasterizerNull::FragmentBarrier() {}

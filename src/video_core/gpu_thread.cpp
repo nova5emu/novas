@@ -16,18 +16,24 @@
 #include "common/windows/timer_resolution.h"
 #endif
 #include "common/dkb_cpu_trace.h"
+#include "common/gpu_transition_profile.h"
+#include "common/guest_handoff_profile.h"
+#include "common/guest_thread_profile.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
+#include "core/device_memory.h"
 #include "core/frontend/graphics_context.h"
 #include "video_core/control/scheduler.h"
 #include "video_core/dma_pusher.h"
 #include "video_core/gpu.h"
-#include "video_core/gpu_thread.h"
 #include "video_core/gpu_split.h"
-#include "video_core/nx2_profile.h"
+#include "video_core/gpu_thread.h"
+#include "video_core/gpu_write_trace.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/nce_page_usage_profile.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/renderer_base.h"
 
 namespace VideoCommon::GPUThread {
@@ -62,11 +68,13 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
         const Common::DkbCpuTrace::Registration cpu_trace{Common::DkbCpuTrace::Role::GpuCommand};
         Common::SetCurrentThreadName("GPU");
         VideoCommon::GpuSplit::MarkGpuThread();
+        VideoCommon::GpuSplit::Get().SetFrontPendingChannels(false);
 #ifdef __linux__
         // The pending-channel polls below sleep 50 us; the default timer slack adds up to 50 more.
         prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0);
 #endif
         SCOPE_EXIT {
+            VideoCommon::GpuSplit::Get().SetFrontPendingChannels(false);
             VideoCommon::GpuSplit::UnmarkGpuThread();
         };
         Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
@@ -84,14 +92,41 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
         auto& split = VideoCommon::GpuSplit::Get();
         while (!stop_token.stop_requested()) {
             Profile::Report();
+            Common::GuestThreadProfile::Report();
+            Common::GuestHandoffProfile::Report();
+            VideoCommon::NcePageUsageProfile::Report(&system.DeviceMemory().CpuEpochs());
+            if (Common::GpuTransitionProfile::Report()) {
+                if (auto* journal = system.DeferredWriteJournal()) {
+                    const auto state = journal->GetRetentionSnapshot();
+                    LOG_INFO(HW_GPU, "GPU_DEFERRED_STATE snapshot_complete={} fixed_ring_index_bytes={} live_records={} "
+                                    "pending_records={} leases={} writer_permissions={} readbacks={} "
+                                    "suspension_state={} participants={}",
+                             state.diagnostic_complete, state.fixed_bytes, state.live_records, state.pending_records, state.leases,
+                             state.writer_permissions, state.readbacks, static_cast<u32>(state.state),
+                             state.suspension_participants);
+                    for (size_t i = 0; i < state.writers_by_origin.size(); ++i) {
+                        const auto& origin = state.writers_by_origin[i];
+                        LOG_INFO(HW_GPU, "GPU_DEFERRED_STATE writer_origin_semantics=first_registration writer_origin={} writer_permissions={} "
+                                         "physical_pages_known={} device_only_permissions={}",
+                                 VideoCommon::DeferredWrites::writer_origin_names[i], origin.permissions,
+                                 origin.physical_pages_known, origin.device_only_permissions);
+                    }
+                }
+            }
+            if (GpuWriteTrace::enabled || GpuWriteTrace::profile_footprints) {
+                GpuWriteTrace::Report();
+            }
             split.MaybeStart(system);
-            if (scheduler.HasPendingChannels()) {
+            const bool pending_channels = scheduler.HasPendingChannels();
+            split.SetFrontPendingChannels(pending_channels);
+            if (pending_channels) {
                 // Suspended channels wait on semaphores the CPU releases: poll them meanwhile.
                 {
                     Profile::Scope scope{Profile::Zone::ResumePending};
                     scheduler.ResumePending(system.GPU());
                 }
                 if (!state.queue.TryPop(next)) {
+                    rasterizer->FlushPendingOperations();
                     // The CPU usually releases the semaphore soon after: poll for half a
                     // millisecond, then in short sleeps. Ocarina of Time waits here ~330 times a
                     // second and its present waits for the work behind them: with 1 ms sleeps the
@@ -113,12 +148,20 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 }
             } else {
                 Profile::Scope scope{Profile::Zone::Idle};
-                state.queue.PopWait(next, stop_token);
+                if (!state.queue.TryPop(next)) {
+                    rasterizer->FlushPendingOperations();
+                    state.queue.PopWait(next, stop_token);
+                }
             }
             if (stop_token.stop_requested()) {
                 break;
             }
             last_progress = std::chrono::steady_clock::now();
+            if (const auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
+                system.GPU().OrderDeferredWriteCut(
+                    submit_list->deferred_write_cut,
+                    Common::GpuTransitionProfile::DeferredDrainSite::SubmitList);
+            }
             if (split.Active()) {
                 // Only command lists are parsed here; everything else runs on the back thread
                 // in order, and so does the signal that the command ran.
@@ -220,6 +263,9 @@ u64 ThreadManager::PushCommand(CommandData&& command_data, bool block, bool is_a
     }
 
     std::unique_lock lk(state.write_lock);
+    if (auto* submit_list = std::get_if<SubmitListCommand>(&command_data)) {
+        submit_list->deferred_write_cut = system.GPU().CaptureDeferredWriteCut();
+    }
     const u64 fence{++state.last_fence};
     state.queue.EmplaceWait(std::move(command_data), fence, block);
 

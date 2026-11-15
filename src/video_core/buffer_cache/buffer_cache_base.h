@@ -40,6 +40,10 @@
 #include "video_core/buffer_cache/virtual_range_cache.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/delayed_destruction_ring.h"
+#include "video_core/deferred_write_journal.h"
+#include "video_core/deferred_consumer.h"
+#include "video_core/gpu_write_trace.h"
+#include "video_core/nce_page_usage_profile.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/kepler_compute.h"
@@ -49,6 +53,10 @@
 #include "video_core/nx2_draw_experiments.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/types.h"
+
+#ifdef HAS_NCE
+#include "core/arm/nce/nce_exact_store.h"
+#endif
 
 namespace VideoCommon {
 
@@ -242,7 +250,9 @@ public:
     void TickFrame();
 
     bool BindMultiRangeStorage(const Binding& binding, bool is_written,
-                               std::span<const MultiRangeSegment> pool);
+                               std::span<const MultiRangeSegment> pool,
+                               GpuWriteTrace::Origin origin = GpuWriteTrace::Origin::Other,
+                               const GpuWriteTrace::Attribution* attribution = nullptr);
 
     void ResolveMultiRangeStorage(Binding& binding, bool is_written,
                                   std::vector<MultiRangeSegment>& pool);
@@ -259,15 +269,43 @@ public:
     /// otherwise behaves as WriteMemory.
     void CachedWriteMemory(DAddr device_addr, u64 size);
 
+    Common::GpuTransitionProfile::DeferredFallbackReason ValidateDeferredWritePage(DAddr page);
+
+#ifdef HAS_NCE
+    Core::NceExactStore::Result GrantDeferredWriteLease(
+        DAddr page, PAddr physical, u64 mapping_generation, DeferredWrites::Journal::Lease& lease);
+    Core::NceExactStore::Result WriteNceStore(DAddr addr, std::span<const u8> bytes,
+                                            const Core::NceExactStore::Backing& backing);
+#endif
+
     /// Cancels pending downloads over the range, so a fence can't write them over newer bytes.
     void ClearDownload(DAddr base_addr, u64 size);
 
     /// CPU writes collected but not yet applied (SetPendingCpuWrites).
     [[nodiscard]] Common::RangeSet<DAddr> PendingCpuWriteRanges();
 
-    /// Writes downloaded bytes to guest memory, except over `cpu_written`.
+    /// Excludes legacy CPU writes and exact stores newer than the copy's applied watermark.
     void WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_written, DAddr device_addr,
-                               const u8* data, u64 size);
+                               const u8* data, u64 size,
+                               const DeferredWrites::Journal::Readback* readback);
+
+    using DeferredReadback = std::unique_ptr<DeferredWrites::Journal::Readback>;
+    DeferredReadback BeginDeferredReadback() {
+        return deferred_writes ? deferred_writes->BeginReadback() : nullptr;
+    }
+    void EndDeferredReadback(DeferredReadback& token) {
+        token.reset();
+        if (deferred_writes) {
+            const bool retired =
+                deferred_writes->RetireThrough(deferred_writes->ReclaimableThrough());
+            ASSERT(retired);
+        }
+    }
+    void SetDeferredWriteJournal(DeferredWrites::Journal* journal,
+                                 std::function<void(DeferredWrites::Cut)> apply = {}) {
+        deferred_writes = journal;
+        apply_deferred_write_cut = std::move(apply);
+    }
 
     bool OnCPUWrite(DAddr device_addr, u64 size);
 
@@ -290,6 +328,12 @@ public:
     }
 
     bool InlineMemory(DAddr dest_address, size_t copy_size, std::span<const u8> inlined_buffer);
+
+    // Accepted journal record; leases keep the existing buffer and mapping alive until applied.
+    bool ApplyDeferredWrite(const DeferredWrites::Write& write);
+    bool UploadCpuEpochPage(DAddr device, PAddr physical, std::span<const u8> bytes);
+    bool IsCpuEpochPageEligible(DAddr device, PAddr physical);
+    bool PrepareCpuEpochPage(DAddr device, PAddr physical, u64& downloaded_bytes);
 
     void BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr, u32 size);
 
@@ -324,6 +368,27 @@ public:
 
     void UnbindComputeStorageBuffers();
 
+    struct ComputeWriteTrace {
+        GpuWriteTrace::Attribution attribution;
+        const Shader::StorageWriteFootprint* recipe{};
+        std::optional<u32> snapshot_base;
+        Shader::Optimization::EvaluatedStorageWriteFootprint footprint;
+        Shader::StorageWriteReason snapshot_reason{Shader::StorageWriteReason::BaseRequired};
+    };
+
+    void SetComputeWriteTrace(size_t index, GpuWriteTrace::Attribution attribution,
+                              const Shader::StorageWriteFootprint* recipe, bool writes_images = false) {
+        compute_write_trace_image_writes = writes_images;
+        if (!compute_write_trace) {
+            compute_write_trace = std::make_unique<std::array<ComputeWriteTrace, 64>>();
+        }
+        if (index < compute_write_trace->size()) {
+            attribution.size_source = GpuWriteTrace::last_size_source;
+            (*compute_write_trace)[index] = {std::move(attribution), recipe, std::nullopt, {},
+                                           Shader::StorageWriteReason::BaseRequired};
+        }
+    }
+
     void BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
                                   bool is_written, u32 indirect_offset = ~0U);
 
@@ -336,12 +401,14 @@ public:
     /// `sync_info` asks; the null buffer when the address is unmapped.
     [[nodiscard]] std::pair<Buffer*, u32> ObtainBuffer(GPUVAddr gpu_addr, u32 size,
                                                        ObtainBufferSynchronize sync_info,
-                                                       ObtainBufferOperation post_op);
+                                                       ObtainBufferOperation post_op,
+                                                       GpuWriteTrace::Origin origin = GpuWriteTrace::Origin::Other);
 
     /// ObtainBuffer for a device address.
     [[nodiscard]] std::pair<Buffer*, u32> ObtainCPUBuffer(DAddr gpu_addr, u32 size,
                                                           ObtainBufferSynchronize sync_info,
-                                                          ObtainBufferOperation post_op);
+                                                          ObtainBufferOperation post_op,
+                                                          GpuWriteTrace::Origin origin = GpuWriteTrace::Origin::Other);
     void FlushCachedWrites();
 
     /// Where the CPU writes into GPU-written memory that were collected but not applied yet
@@ -576,7 +643,15 @@ private:
 
     void UpdateComputeTextureBuffers();
 
-    void MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u32 size, bool needs_sync = false);
+    void MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u32 size, bool needs_sync = false,
+                           GpuWriteTrace::Origin origin = GpuWriteTrace::Origin::Other,
+                           const GpuWriteTrace::Attribution* attribution = nullptr,
+                           std::span<const Shader::Optimization::StorageWriteInterval> written_ranges = {});
+
+    void SubtractGpuModifiedRange(DAddr address, u64 size, GpuWriteTrace::Removal reason) {
+        gpu_modified_ranges.Subtract(address, size);
+        GpuWriteTrace::Clear(address, size, reason);
+    }
 
     /// Counts a GPU write to the command list pages in the range (invalidating their copies) and,
     /// while collecting, asks for new copies.
@@ -665,6 +740,8 @@ private:
     /// Re-dirties repacked vertex buffers whose source data was written since they were bound.
     void RefreshRepackedVertexBuffers();
 
+    void UploadInlineMemory(Buffer& buffer, DAddr dest_address, size_t copy_size,
+                            std::span<const u8> inlined_buffer);
     void InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
                                     std::span<const u8> inlined_buffer);
 
@@ -690,6 +767,8 @@ private:
     boost::container::small_vector<BufferCopy, 4> upload_copies;
 
     MemoryTracker memory_tracker;
+    std::unique_ptr<std::array<ComputeWriteTrace, 64>> compute_write_trace;
+    bool compute_write_trace_image_writes{};
     Common::RangeSet<DAddr> uncommitted_gpu_modified_ranges;
 
     /// Whether GPU-written buffer ranges are copied back to guest memory at the next fence;
@@ -792,6 +871,15 @@ private:
     /// fence pops. A write to a range after a download was taken removes it from that download
     /// (and every other pending one): its bytes are older than the write.
     std::deque<Common::RangeSet<DAddr>> pending_download_ranges;
+    std::deque<DeferredReadback> pending_readbacks;
+    DeferredWrites::Journal* deferred_writes{};
+    std::function<void(DeferredWrites::Cut)> apply_deferred_write_cut;
+    void ApplyDeferredConsumerCut(DeferredWrites::Cut cut) {
+        if (!apply_deferred_write_cut) {
+            UNREACHABLE_MSG("Deferred consumer transition requires its scheduler-owned write sink");
+        }
+        apply_deferred_write_cut(cut);
+    }
     PendingCpuWrites pending_cpu_writes;
     std::optional<Async_Buffer> current_buffer;
 
@@ -830,6 +918,11 @@ private:
     /// A command list page (Nx2CopyListPages): the GPU writes noted to it and the last copy.
     using Nx2Staging = decltype(std::declval<Runtime&>().DownloadStagingBuffer(size_t{}, true));
     struct Nx2ListPage {
+        struct CpuStamp {
+            PAddr physical{};
+            DeferredWrites::Cut applied{};
+            bool valid{};
+        };
         u64 writes{};      ///< GPU writes noted to the page
         u64 copy_writes{}; ///< `writes` when the copy was made: the copy is current while equal
         u64 copy_tick{};   ///< GPU tick that completes the copy
@@ -843,6 +936,8 @@ private:
         /// the page's lists read guest memory once the back ran the work before the last such
         /// wait and no write came since the front flushed the page (Nx2ReadListCopy).
         bool draw_written{};
+        CpuStamp copy_cpu;
+        CpuStamp synced_cpu;
         std::optional<Nx2Staging> copy;
     };
     std::mutex nx2_list_mutex; ///< nx2_list_pages: the split's front reads the copies

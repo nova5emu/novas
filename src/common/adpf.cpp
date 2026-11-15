@@ -9,10 +9,14 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <mutex>
+#include <string>
+#include <string_view>
 #include <vector>
 
 #include <dlfcn.h>
+#include <pthread.h>
 #include <unistd.h>
 
 #include "common/logging.h"
@@ -96,15 +100,18 @@ struct SessionState {
     AHintSession* handle = nullptr;
     std::vector<pid_t> threads;
     bool unsupported = false;
+    std::chrono::steady_clock::time_point last_frame{};
+    int last_report_result = -1;
 };
 
 std::mutex g_mutex;
 std::array<SessionState, 2> g_sessions;
-
-constexpr s64 MAX_REPORTED_TARGETS = 4;
-
+std::atomic<bool> g_enabled{false};
 std::atomic<s64> g_target_ns{DEFAULT_TARGET.count()};
-thread_local std::chrono::steady_clock::time_point t_last_frame{};
+
+const char* SessionName(Session session) {
+    return session == Session::Render ? "render" : "background";
+}
 
 SessionState& StateOf(Session session) {
     return g_sessions[static_cast<size_t>(session)];
@@ -119,11 +126,13 @@ void CloseLocked(SessionState& state) {
         Resolve().close_session(state.handle);
         state.handle = nullptr;
     }
+    state.last_frame = {};
+    state.last_report_result = -1;
 }
 
 AHintSession* CreateSessionFor(Session session, const std::vector<pid_t>& threads) {
     const Api& api = Resolve();
-    const s64 target = session == Session::Render ? g_target_ns.load(std::memory_order_relaxed) : 0;
+    s64 target = session == Session::Render ? g_target_ns.load(std::memory_order_relaxed) : 0;
 
     std::vector<s32> ids;
     ids.reserve(threads.size());
@@ -133,14 +142,20 @@ AHintSession* CreateSessionFor(Session session, const std::vector<pid_t>& thread
 
     AHintSession* handle = api.create_session(api.manager, ids.data(), ids.size(), target);
     if (handle == nullptr && target == 0) {
-        handle = api.create_session(api.manager, ids.data(), ids.size(), DEFAULT_TARGET.count());
+        target = DEFAULT_TARGET.count();
+        handle = api.create_session(api.manager, ids.data(), ids.size(), target);
     }
-    if (handle == nullptr) {
-        return nullptr;
+    std::string preference_result = "unavailable";
+    if (handle != nullptr && api.set_power_efficiency != nullptr) {
+        preference_result = std::to_string(
+            api.set_power_efficiency(handle, session == Session::Background));
     }
-    if (session == Session::Background && api.set_power_efficiency != nullptr) {
-        api.set_power_efficiency(handle, true);
-    }
+    LOG_INFO(Common,
+             "ADPF session_create kind={} tids=[{}] target_ns={} result={} "
+             "prefer_power_efficiency={} preference_result={}",
+             SessionName(session), fmt::join(threads, ","), target,
+             handle != nullptr ? "created" : "failed",
+             session == Session::Background, preference_result);
     return handle;
 }
 
@@ -153,7 +168,10 @@ bool SyncLocked(Session session, SessionState& state) {
     const Api& api = Resolve();
     if (state.handle != nullptr && api.set_threads != nullptr) {
         std::vector<pid_t> ids = state.threads;
-        if (api.set_threads(state.handle, ids.data(), ids.size()) == 0) {
+        const int result = api.set_threads(state.handle, ids.data(), ids.size());
+        LOG_INFO(Common, "ADPF session_threads kind={} tids=[{}] result={}", SessionName(session),
+                 fmt::join(ids, ","), result);
+        if (result == 0) {
             return true;
         }
     }
@@ -165,6 +183,7 @@ bool SyncLocked(Session session, SessionState& state) {
         }
         LOG_WARNING(Common, "Could not open a performance hint session for {} threads, falling back",
                     state.threads.size());
+        CloseLocked(state);
         return false;
     }
     CloseLocked(state);
@@ -174,7 +193,30 @@ bool SyncLocked(Session session, SessionState& state) {
 
 } // Anonymous namespace
 
+void Configure() {
+    const char* value = std::getenv("EDEN_NX2_ADPF");
+    const bool enabled = value == nullptr || std::string_view{value} != "0";
+    std::scoped_lock lock{g_mutex};
+    for (SessionState& state : g_sessions) {
+        CloseLocked(state);
+        state.threads.clear();
+        state.unsupported = false;
+    }
+    g_target_ns.store(DEFAULT_TARGET.count(), std::memory_order_relaxed);
+    g_enabled.store(enabled, std::memory_order_release);
+    LOG_INFO(Common,
+             "ADPF config enabled={} target_ns={} frame_source=renderer_frame_end "
+             "actual_duration_clamped=false app_restart_required=1",
+             enabled, DEFAULT_TARGET.count());
+    if (enabled) {
+        Resolve();
+    }
+}
+
 bool IsSessionSupported(Session session) {
+    if (!g_enabled.load(std::memory_order_acquire)) {
+        return false;
+    }
     const Api& api = Resolve();
     if (!api.usable) {
         return false;
@@ -183,7 +225,7 @@ bool IsSessionSupported(Session session) {
         return false;
     }
     std::scoped_lock lock{g_mutex};
-    return !StateOf(session).unsupported;
+    return g_enabled.load(std::memory_order_relaxed) && !StateOf(session).unsupported;
 }
 
 bool AddCurrentThread(Session session) {
@@ -193,6 +235,9 @@ bool AddCurrentThread(Session session) {
 
     const pid_t tid = gettid();
     std::scoped_lock lock{g_mutex};
+    if (!g_enabled.load(std::memory_order_relaxed)) {
+        return false;
+    }
 
     for (size_t i = 0; i < g_sessions.size(); ++i) {
         SessionState& state = g_sessions[i];
@@ -218,11 +263,15 @@ bool AddCurrentThread(Session session) {
         }
         return false;
     }
+    char name[16]{};
+    pthread_getname_np(pthread_self(), name, sizeof(name));
+    LOG_INFO(Common, "ADPF thread kind={} tid={} name={} enrolled=true", SessionName(session), tid,
+             name);
     return true;
 }
 
 void RemoveCurrentThread() {
-    if (!Resolve().usable) {
+    if (!g_enabled.load(std::memory_order_acquire) || !Resolve().usable) {
         return;
     }
     const pid_t tid = gettid();
@@ -236,6 +285,9 @@ void RemoveCurrentThread() {
 }
 
 void SetTargetWorkDuration(std::chrono::nanoseconds target) {
+    if (!g_enabled.load(std::memory_order_acquire)) {
+        return;
+    }
     const Api& api = Resolve();
     if (!api.usable || target.count() <= 0) {
         return;
@@ -251,37 +303,49 @@ void SetTargetWorkDuration(std::chrono::nanoseconds target) {
 }
 
 void ReportFrameInterval() {
+    if (!g_enabled.load(std::memory_order_acquire)) {
+        return;
+    }
     const Api& api = Resolve();
     if (!api.usable) {
         return;
     }
 
+    std::scoped_lock lock{g_mutex};
+    SessionState& state = StateOf(Session::Render);
+    if (!g_enabled.load(std::memory_order_relaxed) || state.handle == nullptr) {
+        return;
+    }
     const auto now = std::chrono::steady_clock::now();
-    const auto previous = t_last_frame;
-    t_last_frame = now;
+    const auto previous = state.last_frame;
+    state.last_frame = now;
     if (previous.time_since_epoch().count() == 0) {
         return;
     }
 
-    s64 actual = std::chrono::duration_cast<std::chrono::nanoseconds>(now - previous).count();
+    const s64 actual = std::chrono::duration_cast<std::chrono::nanoseconds>(now - previous).count();
     if (actual <= 0) {
         return;
     }
 
-    const s64 ceiling = g_target_ns.load(std::memory_order_relaxed) * MAX_REPORTED_TARGETS;
-    actual = (std::min)(actual, ceiling);
-
-    std::scoped_lock lock{g_mutex};
-    SessionState& state = StateOf(Session::Render);
-    if (state.handle != nullptr) {
-        api.report_actual(state.handle, actual);
+    const int result = api.report_actual(state.handle, actual);
+    if (result != state.last_report_result) {
+        LOG_INFO(Common, "ADPF report kind=render actual_ns={} target_ns={} result={}", actual,
+                 g_target_ns.load(std::memory_order_relaxed), result);
+        state.last_report_result = result;
     }
 }
 
-void Shutdown() {
-    if (!Resolve().usable) {
+void ResetFrameInterval() {
+    if (!g_enabled.load(std::memory_order_acquire)) {
         return;
     }
+    std::scoped_lock lock{g_mutex};
+    StateOf(Session::Render).last_frame = {};
+}
+
+void Shutdown() {
+    g_enabled.store(false, std::memory_order_release);
     std::scoped_lock lock{g_mutex};
     for (SessionState& state : g_sessions) {
         CloseLocked(state);
@@ -296,6 +360,8 @@ void Shutdown() {
 
 namespace Common::ADPF {
 
+void Configure() {}
+
 bool IsSessionSupported(Session) {
     return false;
 }
@@ -309,6 +375,8 @@ void RemoveCurrentThread() {}
 void SetTargetWorkDuration(std::chrono::nanoseconds) {}
 
 void ReportFrameInterval() {}
+
+void ResetFrameInterval() {}
 
 void Shutdown() {}
 

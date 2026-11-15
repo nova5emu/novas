@@ -35,9 +35,9 @@ constexpr GLenum GetTarget(VideoCore::QueryType type) {
 
 } // Anonymous namespace
 
-QueryCache::QueryCache(RasterizerOpenGL& rasterizer_,
+QueryCache::QueryCache(Tegra::GPU& gpu_, RasterizerOpenGL& rasterizer_,
                        Tegra::MaxwellDeviceMemoryManager& device_memory_)
-    : QueryCacheLegacy(rasterizer_, device_memory_), gl_rasterizer{rasterizer_} {
+    : QueryCacheLegacy(gpu_, rasterizer_, device_memory_), gl_rasterizer{rasterizer_} {
     EnableCounters();
 }
 

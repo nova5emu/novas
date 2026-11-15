@@ -14,6 +14,8 @@
 #include "core/core.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/svc.h"
+#include "core/hle/kernel/svc_deferred_transition.h"
+#include "video_core/deferred_write_journal.h"
 #include "core/hle/kernel/k_readable_event.h"
 #include "core/hle/service/kernel_helpers.h"
 
@@ -2506,6 +2508,11 @@ void Call(Core::System& system, u32 imm) {
     std::array<uint64_t, 8> args;
     kernel.CurrentPhysicalCore().SaveSvcArguments(process, args);
     GetCurrentThread(kernel).SetEnteredKernel();
+    GetCurrentThread(kernel).SetProfileSvcId(imm);
+    const auto deferred_transition = NeedsDeferredTransition(imm) ?
+        system.BeginDeferredTransition(Common::GpuTransitionProfile::SuspensionSite::SvcMemory) : nullptr;
+    Common::GpuTransitionProfile::RecordSvc(imm, NeedsDeferredTransition(imm),
+        deferred_transition != nullptr, deferred_transition && deferred_transition->CreatedEpoch());
     //kernel.EnterSVCProfile();
     LOG_TRACE(Kernel_SVC, "{} [0]={:#x} [1]={:#x} [2]={:#x} [3]={:#x} [4]={:#x} [5]={:#x} [6]={:#x}",
         imm, GetArg64(args, 0), GetArg64(args, 1), GetArg64(args, 2),

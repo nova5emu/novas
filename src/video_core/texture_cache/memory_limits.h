@@ -11,6 +11,14 @@ namespace VideoCommon::TextureCacheMemory {
 
 using namespace Common::Literals;
 
+inline constexpr u64 PressureIdleNs = 1'000'000'000;
+
+[[nodiscard]] constexpr bool PressureAgeEligible(u64 frame, u64 last_frame, u64 now,
+                                                u64 last_use, u64 tick_age, u64 minimum_ticks = 0) {
+    return frame > last_frame && frame - last_frame >= minimum_ticks &&
+           (frame - last_frame >= tick_age || now - last_use >= PressureIdleNs);
+}
+
 /// The lowest limit the texture cache accepts, however small a value is set.
 inline constexpr u64 MinLimit = 1_GiB;
 

@@ -24,6 +24,7 @@
 #include <fmt/format.h>
 
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
+#include "video_core/compute_release_trace.h"
 
 #include "common/assert.h"
 #include "common/dkb_frame_trace.h"
@@ -285,13 +286,38 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
       fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache, device, scheduler),
       frame_dump(device, memory_allocator, scheduler) {
     scheduler.SetQueryCache(query_cache);
+    const auto apply_deferred = [this](VideoCommon::DeferredWrites::Cut cut) {
+        ASSERT(VideoCommon::GpuSplit::OwnsScheduler());
+        gpu.OrderDeferredWriteCut(cut);
+    };
+    buffer_cache.SetDeferredWriteJournal(gpu.DeferredWriteJournal(), apply_deferred);
+    texture_cache.SetDeferredWriteJournal(gpu.DeferredWriteJournal(), apply_deferred,
+        [this](std::span<const VideoCommon::DeferredWrites::TransitionRange> ranges) {
+            std::scoped_lock lock{buffer_cache.mutex};
+            for (const auto& range : ranges) {
+                if (range.space == VideoCommon::DeferredWrites::TransitionSpace::Device) {
+                    buffer_cache.DownloadMemory(range.address, range.size);
+                }
+            }
+        });
     buffer_cache.SetPendingCpuWrites(
         [this](const std::function<void(DAddr, size_t)>& callback) {
             gpu.ForEachPendingCpuWrite(callback);
         });
     VideoCommon::GpuSplit::Get().SetIdleHook(
-        [](void* argument) { static_cast<Scheduler*>(argument)->FlushDeferred(); },
-        &scheduler);
+        [](void* argument, bool idle) {
+            auto& self = *static_cast<RasterizerVulkan*>(argument);
+            if (idle) {
+                self.fence_manager.CommitPendingOperations();
+            }
+            self.scheduler.FlushDeferred("idle-hook");
+            // Closing queries during submission can enqueue operations after the promotion.
+            // Rearm before parking; a back-thread producer does not request the hook itself.
+            if (idle && self.fence_manager.HasPendingOperations()) {
+                VideoCommon::GpuSplit::Get().RequestIdleHook();
+            }
+        },
+        this);
 }
 
 RasterizerVulkan::~RasterizerVulkan() {
@@ -442,9 +468,6 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         TraceRenderState(is_indexed, "no-pipeline", nullptr);
         return;
     }
-    if (VideoCommon::OotNetwork::BypassEnabled(Settings::GetCurrentProgramID())) {
-        TrackOotTonemappedImage(*pipeline);
-    }
     // Task/mesh pipelines: the draw's vertex count is the number of task workgroups.
     mesh_draw = pipeline->IsMeshPipeline();
     // EDEN_NX2_NO_MESH=1: skip task/mesh draws as before they were supported (A/B comparisons).
@@ -483,6 +506,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         return;
     }
 
+    if (VideoCommon::OotNetwork::BypassEnabled(Settings::GetCurrentProgramID())) {
+        TrackOotTonemappedImage(*pipeline);
+    }
     TracePendingCpuWrites(false, pipeline->ShaderHashes());
     TraceRenderState(is_indexed, "configured", texture_cache.GetFramebuffer());
     if (frame_dump.Capturing()) {
@@ -969,10 +995,47 @@ void RasterizerVulkan::TrackOotTonemappedImage(const GraphicsPipeline& pipeline)
     if (std::none_of(hashes.begin(), hashes.end(), VideoCommon::OotNetwork::IsTonemapShader)) {
         return;
     }
-    const GPUVAddr target = maxwell3d->regs.rt[0].Address();
-    if (target != 0 &&
-        oot_network_bypass.tonemapped_image.exchange(target, std::memory_order_relaxed) != target) {
-        LOG_INFO(Render_Vulkan, "Ocarina of Time: tonemapped image at {:#x}", target);
+    using namespace VideoCommon::OotNetwork;
+    const auto& rt = maxwell3d->regs.rt[0];
+    CopyEngine::Surface surface{};
+    surface.format = rt.format;
+    surface.linear = rt.tile_mode.is_pitch_linear ? CopyEngine::MemoryLayout::Pitch
+                                                 : CopyEngine::MemoryLayout::BlockLinear;
+    surface.block_width.Assign(rt.tile_mode.block_width);
+    surface.block_height.Assign(rt.tile_mode.block_height);
+    surface.block_depth.Assign(rt.tile_mode.block_depth);
+    surface.depth = rt.depth.Value();
+    surface.layer = rt.base_layer;
+    surface.width = rt.width;
+    surface.height = rt.height;
+    surface.addr_upper = rt.address_high;
+    surface.addr_lower = rt.address_low;
+    const GPUVAddr previous = oot_network_bypass.tonemapped_image.load(std::memory_order_relaxed);
+    if (!IsCopySurfaceValid(surface) ||
+        maxwell3d->regs.anti_alias_samples_mode != Tegra::Texture::MsaaMode::Msaa1x1) {
+        oot_network_bypass.SetTonemappedSurface(std::nullopt);
+        static std::atomic<bool> reported{};
+        if (!reported.exchange(true, std::memory_order_relaxed)) {
+            LOG_WARNING(Render_Vulkan,
+                        "Ocarina of Time: invalid tonemap source at {:#x} size={}x{} format={:#x} "
+                        "depth={} layer={} samples={}",
+                        surface.Address(), surface.width, surface.height,
+                        static_cast<u32>(surface.format), surface.depth, surface.layer,
+                        static_cast<u32>(maxwell3d->regs.anti_alias_samples_mode));
+        }
+        return;
+    }
+    oot_network_bypass.SetTonemappedSurface(surface);
+    if (previous != surface.Address()) {
+        const auto& viewport = maxwell3d->regs.viewport_transform[0];
+        const auto& scissor = maxwell3d->regs.scissor_test[0];
+        LOG_INFO(Render_Vulkan,
+                 "Ocarina of Time: tonemapped image at {:#x} size={}x{} format={:#x} "
+                 "viewport_scale=({},{}) viewport_translate=({},{}) scissor={} x={}..{} y={}..{}",
+                 surface.Address(), surface.width, surface.height, static_cast<u32>(surface.format),
+                 viewport.scale_x, viewport.scale_y, viewport.translate_x, viewport.translate_y,
+                 scissor.enable, scissor.min_x.Value(), scissor.max_x.Value(),
+                 scissor.min_y.Value(), scissor.max_y.Value());
     }
 }
 
@@ -1443,6 +1506,35 @@ void RasterizerVulkan::DispatchCompute() {
         }
         frame_dump.CaptureDispatch(pipeline->ShaderHash(), written);
     };
+    if (const u64 dispatch = kepler_compute->TraceDispatch();
+        VideoCommon::ComputeReleaseTrace::Enabled() && dispatch != 0) {
+        namespace Trace = VideoCommon::ComputeReleaseTrace;
+        Trace::Shader(dispatch, pipeline->ShaderHash(), scheduler.CurrentTick());
+        const auto range = [&](GPUVAddr address, u64 size, const char* kind, u32 binding,
+                               bool written) {
+            // Enumerate physical segments rather than treating sparse virtual ranges as contiguous.
+            for (const auto& [part, length] : gpu_memory->GetSubmappedRange(address, size)) {
+                const auto device_address = gpu_memory->GpuToCpuAddress(part);
+                if (device_address) {
+                    Trace::Range(dispatch, part, *device_address, length, kind, binding, written);
+                }
+            }
+        };
+        buffer_cache.ForEachBoundBuffer(true, [&](u32, bool storage, u32 index, bool written,
+                                                  const auto& binding, u32 size, const auto*, u32) {
+            range(binding.gpu_addr, size, storage ? "ssbo-bound" : "cbuf-bound", index, written);
+        });
+        u32 image_index{};
+        for (const auto id : pipeline->WrittenImages()) {
+            const auto* image = texture_cache.GetImageView(id).BackingImage();
+            if (image) range(image->gpu_addr, image->guest_size_bytes, "image-bound", image_index, true);
+            ++image_index;
+        }
+        for (const auto& sampled : pipeline->SampledImages()) {
+            const auto* image = texture_cache.GetImageView(sampled.id).BackingImage();
+            if (image) range(image->gpu_addr, image->guest_size_bytes, "sampled-bound", sampled.tic, false);
+        }
+    }
     TracePendingCpuWrites(true, std::array{pipeline->ShaderHash()});
     if (frame_dump.CapturingSampled()) {
         boost::container::small_vector<FrameDump::Sampled, 16> sampled;
@@ -1575,7 +1667,7 @@ void RasterizerVulkan::SubmitNx2ListCopies() {
     // Submitted at once: ReadGpuWrittenCommands waits on these copies, so they can't sit out
     // the longer DeferFlush interval (#161).
     if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
-        scheduler.Flush();
+        scheduler.FlushWithReason("list-copies");
     }
 }
 
@@ -1605,6 +1697,7 @@ void RasterizerVulkan::FlushGpuWrittenCommandListPages(std::span<const DAddr> pa
 }
 
 void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
+    auto epoch_access = gpu.BeforeCpuEpochConsumption();
     if (addr == 0 || size == 0) {
         return;
     }
@@ -1767,6 +1860,97 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
     return false;
 }
 
+bool RasterizerVulkan::PrepareCpuEpochPage(DAddr address, PAddr physical, u64& downloaded_bytes) {
+    downloaded_bytes = 0;
+    if (!VideoCommon::GpuSplit::OwnsScheduler() || (address & Core::DEVICE_PAGEMASK) ||
+        (physical & Core::DEVICE_PAGEMASK) || HasPendingQueries(address, Core::DEVICE_PAGESIZE) ||
+        gpu.HasPendingCPUWrites(address, Core::DEVICE_PAGESIZE)) {
+        return false;
+    }
+    // The opening callback drained readbacks with the identity pinned and native access blocked.
+    std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+    return !HasPendingQueries(address, Core::DEVICE_PAGESIZE) &&
+           !gpu.HasPendingCPUWrites(address, Core::DEVICE_PAGESIZE) &&
+           !texture_cache.IsRegionRegistered(address, Core::DEVICE_PAGESIZE) &&
+           buffer_cache.PrepareCpuEpochPage(address, physical, downloaded_bytes);
+}
+bool RasterizerVulkan::UploadCpuEpochPage(DAddr address, PAddr physical,
+                                          std::span<const u8> bytes) {
+    if (!VideoCommon::GpuSplit::OwnsScheduler() ||
+        HasPendingQueries(address, Core::DEVICE_PAGESIZE)) {
+        return false;
+    }
+    {
+        std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+        if (texture_cache.IsRegionRegistered(address, Core::DEVICE_PAGESIZE) ||
+            !buffer_cache.UploadCpuEpochPage(address, physical, bytes)) {
+            return false;
+        }
+        texture_cache.WriteMemory(address, bytes.size());
+    }
+    pipeline_cache.InvalidateRegion(address, bytes.size());
+    return true;
+}
+bool RasterizerVulkan::ApplyDeferredWrite(const VideoCommon::DeferredWrites::Write& write) {
+    if (!VideoCommon::GpuSplit::OwnsScheduler()) return false;
+    const DAddr page = Common::AlignDown(write.device_address, Core::DEVICE_PAGESIZE);
+    if (HasPendingQueries(page, Core::DEVICE_PAGESIZE)) return false;
+    {
+        std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+        if (texture_cache.IsRegionRegistered(page, Core::DEVICE_PAGESIZE) ||
+            !buffer_cache.ApplyDeferredWrite(write)) {
+            return false;
+        }
+        texture_cache.WriteMemory(write.device_address, write.size);
+    }
+    pipeline_cache.InvalidateRegion(write.device_address, write.size);
+    return true;
+}
+
+#ifdef HAS_NCE
+Core::NceExactStore::Result RasterizerVulkan::GrantDeferredWriteLease(
+    DAddr page, PAddr physical, u64 mapping_generation,
+    VideoCommon::DeferredWrites::Journal::Lease& lease) {
+    using Core::NceExactStore::Result;
+    if (!VideoCommon::GpuSplit::OwnsScheduler()) return Result::WrongThread;
+    if (HasPendingQueries(page, Core::DEVICE_PAGESIZE)) return Result::PendingQueries;
+    std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+    // Clean registered images can become GPU-written without another RegisterImage.
+    if (texture_cache.IsRegionRegistered(page, Core::DEVICE_PAGESIZE)) return Result::GpuTexture;
+    if (gpu.HasPendingCPUWrites(page, Core::DEVICE_PAGESIZE)) return Result::PendingWrites;
+    return buffer_cache.GrantDeferredWriteLease(page, physical, mapping_generation, lease);
+}
+
+Core::NceExactStore::Result RasterizerVulkan::WriteNceStore(DAddr addr,
+                                                         std::span<const u8> bytes,
+                                                         const Core::NceExactStore::Backing& backing) {
+    using Core::NceExactStore::Result;
+    if (!VideoCommon::GpuSplit::OwnsScheduler()) {
+        return Result::WrongThread;
+    }
+    const DAddr page = Common::AlignDown(addr, Core::DEVICE_PAGESIZE);
+    if (HasPendingQueries(page, Core::DEVICE_PAGESIZE)) {
+        return Result::PendingQueries;
+    }
+    {
+        std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+        if (texture_cache.IsRegionGpuModified(page, Core::DEVICE_PAGESIZE)) {
+            return Result::GpuTexture;
+        }
+        if (gpu.HasPendingCPUWrites(page, Core::DEVICE_PAGESIZE)) {
+            return Result::PendingWrites;
+        }
+        const Result result = buffer_cache.WriteNceStore(addr, bytes, backing);
+        if (result != Result::Success) {
+            return result;
+        }
+        texture_cache.WriteMemory(addr, bytes.size());
+    }
+    pipeline_cache.InvalidateRegion(addr, bytes.size());
+    return Result::Success;
+}
+#endif
+
 void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) {
     // Out of the GPU-written ranges first: applying one write downloads the GPU's bytes elsewhere
     // on its pages (WriteMemory), which would write over the next collected write.
@@ -1840,7 +2024,26 @@ void RasterizerVulkan::SignalFence(std::function<void()>&& func) {
 }
 
 void RasterizerVulkan::SyncOperation(std::function<void()>&& func) {
-    fence_manager.SyncOperation(std::move(func));
+    if (fence_manager.SyncOperation(std::move(func)) &&
+        !VideoCommon::GpuSplit::OnBackThread() &&
+        VideoCommon::GpuSplit::Get().BackRunning()) {
+        VideoCommon::GpuSplit::Get().RequestIdleHook();
+    }
+}
+
+void RasterizerVulkan::FlushPendingOperations() {
+    if (!fence_manager.HasPendingOperations()) {
+        return;
+    }
+    if (VideoCommon::GpuSplit::Get().Active()) {
+        VideoCommon::GpuSplit::Get().RequestIdleHook();
+    } else {
+        fence_manager.CommitPendingOperations();
+    }
+}
+
+VideoCore::FenceProgress RasterizerVulkan::GetFenceProgress() const {
+    return fence_manager.GetFenceProgress();
 }
 
 void RasterizerVulkan::SignalSyncPoint(u32 value) {
@@ -1851,11 +2054,17 @@ void RasterizerVulkan::SignalReference() {
     fence_manager.SignalReference();
 }
 
-void RasterizerVulkan::ReleaseFences(bool force) {
-    fence_manager.WaitPendingFences(force);
+void RasterizerVulkan::ReleaseFences(bool force, std::source_location caller) {
+    fence_manager.WaitPendingFences(force, caller);
+}
+
+bool RasterizerVulkan::ResolveDeferredWriteReadbacks() {
+    fence_manager.WaitPendingReadbacks();
+    return true;
 }
 
 void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
+    VideoCommon::FenceWaitTrace::Scope trace{VideoCommon::FenceWaitTrace::Op::QueryResults};
     if (addr == 0 || size == 0 || !query_cache.SemiFlushRegion(addr, size)) {
         return;
     }
@@ -1864,16 +2073,18 @@ void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
     // submission may be deferred, and the fencing thread would wait for this thread to submit it.
     std::mutex wait_mutex;
     std::condition_variable wait_cv;
-    bool written{};
+    std::atomic<bool> written{};
     fence_manager.SyncOperation([&] {
         std::scoped_lock lock{wait_mutex};
-        written = true;
+        written.store(true, std::memory_order_relaxed);
         wait_cv.notify_all();
     });
     fence_manager.SignalFence([] {});
-    scheduler.FlushDeferred();
+    trace.Prepared(written.load(std::memory_order_relaxed));
+    scheduler.FlushDeferred("query-read");
+    trace.Submitted(written.load(std::memory_order_relaxed));
     std::unique_lock lock{wait_mutex};
-    wait_cv.wait(lock, [&written] { return written; });
+    wait_cv.wait(lock, [&written] { return written.load(std::memory_order_relaxed); });
 }
 
 void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
@@ -1934,10 +2145,16 @@ void RasterizerVulkan::FlushCommands() {
     }
     draw_counter = 0;
     pending_native_work = false;
+    if (VideoCore::g_signaling_query_report_fence) {
+        // QueueFence already scheduled these commands; no report callback runs before here.
+        // Keep its final SubmitDeferredWork, but do not re-arm a redundant submit (OoT/Ally).
+        return;
+    }
     // Fences with downloads or queries come here right after queueing: ~9,400 a second in
     // Hyrule Warriors: Age of Imprisonment fights. Batched like the fences themselves.
-    if (!scheduler.DeferFlush()) {
-        scheduler.Flush();
+    const char* reason = "cache-flush";
+    if (!scheduler.DeferFlush(reason)) {
+        scheduler.FlushWithReason(reason);
     }
 }
 
@@ -2085,6 +2302,7 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
 }
 
 void RasterizerVulkan::TickFrame() {
+    auto epoch_access = gpu.BeforeCpuEpochConsumption();
     if (VideoCore::Nx2Debug::HasRequests()) {
         if (auto capture = VideoCore::Nx2Debug::TakeCapture()) {
             frame_dump.Arm(std::move(capture->directory), capture->sampled, capture->buffers,
@@ -2287,6 +2505,7 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
 
 std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
     const Tegra::FramebufferConfig& config, DAddr framebuffer_addr, u32 pixel_stride) {
+    auto epoch_access = gpu.BeforeCpuEpochConsumption();
     if (!framebuffer_addr) {
         return {};
     }
@@ -2409,7 +2628,8 @@ bool AccelerateDMA::DmaBufferImageCopy(const Tegra::DMA::ImageCopy& copy_info,
     const auto post_op = IS_IMAGE_UPLOAD ? VideoCommon::ObtainBufferOperation::DoNothing
                                          : VideoCommon::ObtainBufferOperation::MarkAsWritten;
     const auto [buffer, offset] =
-        buffer_cache.ObtainBuffer(buffer_operand.address, buffer_size, sync_info, post_op);
+        buffer_cache.ObtainBuffer(buffer_operand.address, buffer_size, sync_info, post_op,
+                                 VideoCommon::GpuWriteTrace::Origin::ImageToBuffer);
 
     const auto [image, copy] = texture_cache.DmaBufferImageCopy(
         copy_info, buffer_operand, image_operand, image_id, IS_IMAGE_UPLOAD);

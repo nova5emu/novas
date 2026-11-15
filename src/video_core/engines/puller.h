@@ -101,6 +101,7 @@ public:
     void CallEngineMethod(DmaPusher& dma_pusher, const MethodCall& method_call);
     void CallEngineMultiMethod(DmaPusher& dma_pusher, u32 method, u32 subchannel, const u32* base_start, u32 amount, u32 methods_pending);
 private:
+    friend struct PullerTestAccess;
     static constexpr std::size_t NUM_REGS = 0x800;
     struct Regs {
         static constexpr size_t NUM_REGS = 0x40;
@@ -150,6 +151,7 @@ private:
     void ProcessSemaphoreRelease(DmaPusher& dma_pusher);
     void ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher);
     void ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument);
+    void StartSemaphoreAcquire(DmaPusher& dma_pusher, PendingAcquire acquire);
     [[nodiscard]] bool ExecuteMethodOnEngine(DmaPusher& dma_pusher, u32 method);
 
     std::optional<PendingAcquire> pending_acquire;

@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/guest_thread_profile.h"
+#include "core/hle/kernel/k_readable_event.h"
 #include "core/hle/service/cmif_serialization.h"
 #include "core/hle/service/nvnflinger/hos_binder_driver.h"
 #include "core/hle/service/nvnflinger/parcel.h"
@@ -260,6 +262,9 @@ Result IApplicationDisplayService::GetDisplayVsyncEvent(
     R_UNLESS(created, VI::ResultPermissionDenied);
 
     m_container->LinkVsyncEvent(display_id, &it->second);
+    if (Common::GuestThreadProfile::Enabled()) {
+        it->second.GetHandle()->SetWaitProfile("vi_vsync", display_id);
+    }
     *out_vsync_event = it->second.GetHandle();
 
     R_SUCCEED();

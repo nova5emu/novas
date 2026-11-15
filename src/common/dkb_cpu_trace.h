@@ -54,6 +54,7 @@ constexpr std::optional<u64> CpuTimeDelta(const ThreadSample& before, const Thre
 }
 
 Snapshot ReadSnapshot();
+std::optional<ThreadSample> TryReadThreadSample(Role role);
 
 class Registration {
 public:

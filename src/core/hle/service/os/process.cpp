@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/scope_exit.h"
+#include "core/core.h"
 
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/svc_types.h"
@@ -14,6 +15,8 @@
 namespace Service {
 
 bool Process::Initialize(Loader::AppLoader& loader, Loader::ResultStatus& out_load_result) {
+    const auto deferred_transition = m_system.BeginDeferredTransition(
+        Common::GpuTransitionProfile::SuspensionSite::Loader);
     // First, ensure we are not holding another process.
     this->Finalize();
 
@@ -54,6 +57,8 @@ bool Process::Initialize(Loader::AppLoader& loader, Loader::ResultStatus& out_lo
 }
 
 void Process::Finalize() {
+    const auto deferred_transition = m_system.BeginDeferredTransition(
+        Common::GpuTransitionProfile::SuspensionSite::ProcessFinalize);
     // Terminate, if we are currently holding a process.
     this->Terminate();
 
@@ -72,6 +77,8 @@ void Process::Finalize() {
 }
 
 bool Process::Run() {
+    const auto deferred_transition = m_system.BeginDeferredTransition(
+        Common::GpuTransitionProfile::SuspensionSite::Loader);
     // If we already started the process, don't start again.
     if (m_process_started) {
         return false;
@@ -90,6 +97,8 @@ bool Process::Run() {
 }
 
 void Process::Terminate() {
+    const auto deferred_transition = m_system.BeginDeferredTransition(
+        Common::GpuTransitionProfile::SuspensionSite::ProcessFinalize);
     if (m_process) {
         m_process->Terminate(m_system.Kernel());
     }

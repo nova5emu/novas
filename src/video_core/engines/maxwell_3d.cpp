@@ -788,6 +788,8 @@ void Maxwell3D::ProcessFirmwareCall4() {
 
 void Maxwell3D::StampQueryResult(Core::System& system, u64 payload, bool long_query) {
     const GPUVAddr sequence_address{regs.report_semaphore.Address()};
+    auto deferred_write = memory_manager.BeginDeferredBackingWrite(
+        sequence_address, long_query ? 2 * sizeof(u64) : sizeof(u32));
     if (long_query) {
         memory_manager.Write<u64>(sequence_address + sizeof(u64), system.GPU().GetTicks());
         memory_manager.Write<u64>(sequence_address, payload);

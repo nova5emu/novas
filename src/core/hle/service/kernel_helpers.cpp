@@ -16,6 +16,7 @@
 #include "core/hle/kernel/k_resource_limit.h"
 #include "core/hle/kernel/k_scoped_resource_reservation.h"
 #include "core/hle/service/kernel_helpers.h"
+#include "common/guest_thread_profile.h"
 
 namespace Service::KernelHelpers {
 
@@ -77,6 +78,12 @@ Kernel::KEvent* ServiceContext::CreateEvent(std::string&& name) {
 
     // Initialize the event.
     event->Initialize(kernel, process);
+    if (Common::GuestThreadProfile::Enabled() && name.starts_with("BufferQueue")) {
+        event->GetReadableEvent().SetWaitProfile("vi_buffer_queue");
+    }
+    if (Common::GuestThreadProfile::Enabled() && name.starts_with("nx2:gsv:Syncpt")) {
+        event->GetReadableEvent().SetWaitProfile("nx2_syncpoint_notification");
+    }
 
     // Commit the thread reservation.
     event_reservation.Commit();

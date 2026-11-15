@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "core/hle/kernel/k_interrupt_manager.h"
+#include "common/guest_handoff_profile.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_scheduler.h"
 #include "core/hle/kernel/k_thread.h"
@@ -14,6 +15,7 @@
 namespace Kernel::KInterruptManager {
 
 void HandleInterrupt(KernelCore& kernel, s32 core_id) {
+    Common::GuestHandoffProfile::CoreInterruptHandled(static_cast<u32>(core_id));
     // Acknowledge the interrupt.
     kernel.PhysicalCore(core_id).ClearInterrupt();
 

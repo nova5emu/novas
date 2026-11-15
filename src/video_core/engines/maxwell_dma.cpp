@@ -191,6 +191,8 @@ void MaxwellDMA::Launch() {
         if (regs.launch_dma.remap_enable != 0 && is_const_a_dst) {
             const u32 component_size = regs.remap_const.component_size_minus_one + 1;
             ASSERT(component_size == 1 || component_size == 2 || component_size == 4);
+            auto deferred_write = memory_manager.BeginDeferredBackingWrite(
+                regs.offset_out, static_cast<size_t>(regs.line_length_in) * component_size);
             if (component_size == 4) {
                 accelerate.BufferClear(regs.offset_out, regs.line_length_in, regs.remap_const.remap_consta_value);
             }

@@ -470,6 +470,9 @@ void DecodeIntegerSequence(uint max_range, uint num_values) {
             ResultEmplaceBack(val);
             vals_decoded++;
             break;
+        default:
+            result_limit_reached = true;
+            return;
         }
     }
 }

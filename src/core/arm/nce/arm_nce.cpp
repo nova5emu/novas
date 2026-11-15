@@ -8,17 +8,36 @@
 #include <memory>
 
 #include "common/signal_chain.h"
+#include "common/guest_thread_profile.h"
+#include "common/guest_handoff_profile.h"
 #include "core/arm/nce/arm_nce.h"
 #include "core/arm/nce/interpreter_visitor.h"
+#include "core/arm/nce/nce_fault_stats.h"
 #include "core/arm/nce/patcher.h"
 #include "core/core.h"
 #include "core/memory.h"
 
 #include "core/hle/kernel/k_process.h"
 
+#ifdef HAS_NCE
+#include <cstdlib>
+#include <optional>
+
+#include "common/page_table.h"
+#include "core/arm/nce/nce_fault_policy.h"
+#include "core/arm/nce/nce_store_decoder.h"
+#include "core/deferred_write_config.h"
+#include "core/device_memory.h"
+#include "video_core/gpu.h"
+#include "video_core/nce_page_usage_profile.h"
+#include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/host1x/host1x.h"
+#endif
+
 #include <signal.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <time.h>
 
 namespace Core {
 
@@ -43,6 +62,53 @@ fpsimd_context* GetFloatingPointState(mcontext_t& host_ctx) {
 
 using namespace Common::Literals;
 constexpr u32 StackSize = 128_KiB;
+
+#ifdef HAS_NCE
+bool ExactStoresEnabled() {
+    const char* value = std::getenv("EDEN_NX2_NCE_EXACT_STORES");
+    if (value) {
+        return value[0] != '0';
+    }
+#ifdef __ANDROID__
+    return true;
+#else
+    return false;
+#endif
+}
+
+std::optional<u64> AccessFaultEsr(const mcontext_t& context) {
+    const auto* cursor = reinterpret_cast<const u8*>(context.__reserved);
+    const auto* const end = cursor + sizeof(context.__reserved);
+    while (static_cast<std::size_t>(end - cursor) >= sizeof(_aarch64_ctx)) {
+        const auto* header = reinterpret_cast<const _aarch64_ctx*>(cursor);
+        if (header->magic == 0 || header->size < sizeof(_aarch64_ctx) ||
+            header->size > static_cast<std::size_t>(end - cursor) || (header->size & 15) != 0) {
+            break;
+        }
+        if (header->magic == ESR_MAGIC) {
+            if (header->size >= sizeof(esr_context)) {
+                return reinterpret_cast<const esr_context*>(header)->esr;
+            }
+            break;
+        }
+        cursor += header->size;
+    }
+    return std::nullopt;
+}
+
+u8* CachedBacking(const Common::PageTable& table, u64 address) {
+    const u64 page = address >> Memory::YUZU_PAGEBITS;
+    if (page >= table.entries.size()) {
+        return nullptr;
+    }
+    const auto raw = table.entries[page].Raw();
+    if (static_cast<Common::PageType>(raw.type) != Common::PageType::RasterizerCachedMemory) {
+        return nullptr;
+    }
+    const auto pointer = Common::PageTable::PageEntryData::ExtractPointer(raw, true);
+    return pointer ? reinterpret_cast<u8*>(pointer + address) : nullptr;
+}
+#endif
 
 } // namespace
 
@@ -74,6 +140,19 @@ void* ArmNce::RestoreGuestContext(void* raw_context) {
     fpctx->fpsr = guest_ctx->fpsr;
     std::memcpy(host_ctx.regs, guest_ctx->cpu_registers.data(), sizeof(host_ctx.regs));
     std::memcpy(fpctx->vregs, guest_ctx->vector_registers.data(), sizeof(fpctx->vregs));
+
+    // Signal-safe timestamp only. The normal host continuation publishes the sample.
+    static_assert(std::atomic<u64>::is_always_lock_free);
+    if (tpidr->handoff_entry_ns.load(std::memory_order_relaxed) == 1) {
+        timespec now{};
+        if (clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+            tpidr->handoff_entry_frame.store(Common::GuestHandoffProfile::CurrentFrame(),
+                                            std::memory_order_relaxed);
+            tpidr->handoff_entry_ns.store(static_cast<u64>(now.tv_sec) * 1'000'000'000 +
+                                            static_cast<u64>(now.tv_nsec),
+                                        std::memory_order_release);
+        }
+    }
 
     // Return the new thread-local storage pointer.
     return tpidr;
@@ -143,6 +222,22 @@ bool ArmNce::HandleFailedGuestFault(GuestContext* guest_ctx, void* raw_info, voi
 
 bool ArmNce::HandleGuestAlignmentFault(GuestContext* guest_ctx, void* raw_info, void* raw_context) {
     auto& host_ctx = static_cast<ucontext_t*>(raw_context)->uc_mcontext;
+#ifdef HAS_NCE
+    auto& nce = *guest_ctx->parent;
+    if (nce.m_deferred_fallbacks_enabled) {
+        const u64 fault_address = reinterpret_cast<u64>(static_cast<siginfo_t*>(raw_info)->si_addr);
+        if (nce.ConsumeNativeRetry(host_ctx.pc, fault_address, true)) {
+            // The host decoder rejected this instruction. Preserve the old failure handling
+            // without decoding again in the signal (the guest may have changed the opcode).
+            return HandleFailedGuestFault(guest_ctx, raw_info, raw_context);
+        }
+        nce.m_pending_store = {fault_address, 0, true, true};
+        nce.m_store_pending.store(true, std::memory_order_release);
+        nce.m_running_thread->GetNativeExecutionParameters().lock.store(SpinLockLocked);
+        SaveGuestContext(guest_ctx, raw_context);
+        return false;
+    }
+#endif
     auto* fpctx = GetFloatingPointState(host_ctx);
     auto& memory = guest_ctx->parent->m_running_thread->GetOwnerProcess()->GetMemory();
 
@@ -160,6 +255,29 @@ bool ArmNce::HandleGuestAlignmentFault(GuestContext* guest_ctx, void* raw_info, 
 bool ArmNce::HandleGuestAccessFault(GuestContext* guest_ctx, void* raw_info, void* raw_context) {
     auto* info = static_cast<siginfo_t*>(raw_info);
 
+    // NovaS diagnostics: was it a read or which kind of write (InvalidateNCE counts it when the
+    // page is the GPU's cached memory). WnR comes from the kernel's ESR record.
+    {
+        auto& host_ctx = static_cast<ucontext_t*>(raw_context)->uc_mcontext;
+        bool is_write = false;
+        auto* header = reinterpret_cast<_aarch64_ctx*>(&host_ctx.__reserved);
+        for (int i = 0; i < 16 && header->magic != 0; ++i) {
+            if (header->magic == ESR_MAGIC) {
+                is_write = (reinterpret_cast<esr_context*>(header)->esr & (1ULL << 6)) != 0;
+                break;
+            }
+            header = reinterpret_cast<_aarch64_ctx*>(reinterpret_cast<char*>(header) + header->size);
+        }
+        const u32 inst = *reinterpret_cast<const u32*>(host_ctx.pc);
+        NceFaultStats::last_class = NceFaultStats::Classify(inst, is_write);
+    }
+
+#ifdef HAS_NCE
+    if (DeferExactStore(guest_ctx, raw_info, raw_context)) {
+        return false;
+    }
+#endif
+
     // Try to handle an invalid access.
     // TODO: handle accesses which split a page?
     const Common::ProcessAddress addr =
@@ -173,6 +291,384 @@ bool ArmNce::HandleGuestAccessFault(GuestContext* guest_ctx, void* raw_info, voi
     // We couldn't handle the access.
     return HandleFailedGuestFault(guest_ctx, raw_info, raw_context);
 }
+
+#ifdef HAS_NCE
+bool ArmNce::ConsumeNativeRetry(u64 pc, u64 fault_address, bool alignment_failure) {
+    if (!m_retry_store.exchange(false, std::memory_order_acquire)) {
+        return false;
+    }
+    if (m_retry_store_thread == m_running_thread && m_retry_store_pc == pc &&
+        m_retry_store_address == fault_address && m_retry_alignment_failure == alignment_failure) {
+        NceExactStore::retry_bypassed.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    NceExactStore::retry_mismatch.fetch_add(1, std::memory_order_relaxed);
+    return false;
+}
+
+bool ArmNce::DeferExactStore(GuestContext* ctx, void* raw_info, void* raw_context) {
+    using NceExactStore::CountFallback;
+    using NceExactStore::Result;
+    auto& nce = *ctx->parent;
+    const auto& info = *static_cast<const siginfo_t*>(raw_info);
+    const auto& context = static_cast<const ucontext_t*>(raw_context)->uc_mcontext;
+    const u64 fault_address = reinterpret_cast<u64>(info.si_addr);
+    if (nce.ConsumeNativeRetry(context.pc, fault_address, false)) {
+        return false;
+    }
+    const auto& table = nce.m_running_thread->GetOwnerProcess()->GetPageTable().GetImpl();
+    const u64 page = fault_address & ~Memory::YUZU_PAGEMASK;
+    auto* backing = CachedBacking(table, page);
+    if (!backing) {
+        return false;
+    }
+    const auto defer_to_host = [&](bool fallback_only, Result reason = Result::Success) {
+        nce.m_pending_store = {fault_address, reinterpret_cast<u64>(backing), fallback_only, false, reason};
+        nce.m_store_pending.store(true, std::memory_order_release);
+        // Follow the existing fault-to-host protocol, including the interrupt handshake.
+        nce.m_running_thread->GetNativeExecutionParameters().lock.store(SpinLockLocked);
+        SaveGuestContext(ctx, raw_context);
+        return true;
+    };
+    if (!nce.m_exact_stores_enabled && !nce.m_deferred_fallbacks_enabled) {
+        CountFallback(Result::Disabled);
+        return false;
+    }
+    const auto esr = AccessFaultEsr(context);
+    if (!esr) {
+        CountFallback(Result::MissingEsr);
+        return nce.m_deferred_fallbacks_enabled && defer_to_host(true, Result::MissingEsr);
+    }
+    // Android can report a translation FSC for a cached, protected page. B revalidates its
+    // CPU/device identity in the host continuation; the old exact-store path stays unchanged.
+    const auto decision = NceFaultPolicy::Classify(info.si_code == SEGV_ACCERR, *esr,
+        backing != nullptr, context.pc == fault_address, nce.m_deferred_fallbacks_enabled);
+    if (decision == NceFaultPolicy::Decision::Unsupported) {
+        using NceExactStore::FaultReason;
+        const auto reason = info.si_code != SEGV_ACCERR ? FaultReason::SignalCode :
+            ((*esr >> 26) & 0x3f) != 0x24 ? FaultReason::ExceptionClass :
+            (*esr & 0x3c) != 0x0c ? FaultReason::FaultStatus : FaultReason::PcEqualsAddress;
+        NceExactStore::unsupported_reasons[static_cast<std::size_t>(reason)]
+            .fetch_add(1, std::memory_order_relaxed);
+        NceExactStore::unsupported_ec[(*esr >> 26) & 0x3f].fetch_add(1, std::memory_order_relaxed);
+        NceExactStore::unsupported_fsc[*esr & 0x3f].fetch_add(1, std::memory_order_relaxed);
+        NceExactStore::unsupported_wnr[(*esr >> 6) & 1].fetch_add(1, std::memory_order_relaxed);
+        NceExactStore::unsupported_si_code[info.si_code == SEGV_ACCERR ? 0 :
+                                          info.si_code == SEGV_MAPERR ? 1 : 2]
+            .fetch_add(1, std::memory_order_relaxed);
+        CountFallback(Result::UnsupportedFault);
+        return nce.m_deferred_fallbacks_enabled && defer_to_host(true, Result::UnsupportedFault);
+    }
+    if (decision == NceFaultPolicy::Decision::Read) {
+        CountFallback(Result::Read);
+        return nce.m_deferred_fallbacks_enabled && defer_to_host(true, Result::Read);
+    }
+    // A page the guest keeps writing: one download (a Finish, ~2.6 ms on the phone) leaves it
+    // writable for every store that follows, while each emulated store costs ~150 us. Past
+    // StoreBudget stores to the same page within a 16 ms window, take the download instead.
+    if (!nce.m_deferred_fallbacks_enabled && !NceExactStore::WithinPageBudget(page)) {
+        CountFallback(Result::PageBudget);
+        return false;
+    }
+
+    return defer_to_host(false);
+}
+
+void ArmNce::CompleteExactStore(Kernel::KThread* thread) {
+    using NceExactStore::Result;
+    namespace Profile = Common::GpuTransitionProfile;
+    const Profile::WatchdogCoreScope host_phase{m_core_index, Profile::WatchdogPhase::HostContinuation};
+    auto& process = *thread->GetOwnerProcess();
+    const auto& table = process.GetPageTable().GetImpl();
+    const u64 fault_address = m_pending_store.fault_address;
+    if (!m_deferred_runtime_logged && Common::GuestThreadProfile::Enabled()) {
+        m_deferred_runtime_logged = true;
+        LOG_INFO(Core_ARM, "GPU_DEFERRED_RUNTIME core={} producer_active={} exact_stores_active={} journal_present={}",
+                 m_core_index, m_deferred_fallbacks_enabled, m_exact_stores_enabled,
+                 static_cast<bool>(m_system.DeferredWriteJournal()));
+    }
+    const bool writer_diagnostics = Common::GpuTransitionProfile::enabled.load(std::memory_order_relaxed);
+    if (writer_diagnostics || VideoCommon::NcePageUsageProfile::Enabled()) {
+        const Profile::WatchdogCoreScope inspection_phase{m_core_index, Profile::WatchdogPhase::WriterInspection};
+        namespace Profile = Common::GpuTransitionProfile;
+        bool physical_resolved{};
+        bool device_resolved{};
+        const u64 page = fault_address >> Memory::YUZU_PAGEBITS;
+        if (page < table.entries.size()) {
+            const auto pointer = table.entries[page].Pointer(true);
+            const auto* backing = reinterpret_cast<const u8*>(pointer + fault_address);
+            auto& device_memory = m_system.Host1x().MemoryManager();
+            if (pointer && device_memory.IsPhysicalPointer(backing)) {
+                physical_resolved = true;
+                const PAddr physical_page =
+                    device_memory.GetRawPhysicalAddr(backing) & ~PAddr{Memory::YUZU_PAGEMASK};
+                VideoCommon::NcePageUsageProfile::Fault(physical_page, m_guest_ctx.pc,
+                    thread->GetThreadId(), static_cast<u32>(m_core_index));
+                if (writer_diagnostics) {
+                    std::optional<DAddr> device_page;
+                    device_resolved = device_memory.TryApplyOpOnSingleMapping(backing, 1, [&](DAddr address) {
+                        device_page = address & ~DAddr{Memory::YUZU_PAGEMASK};
+                    });
+                    Profile::RecordLegacyNceFault(physical_page);
+                    if (const auto journal = m_system.DeferredWriteJournal()) {
+                        const auto writers = journal->InspectWriterExclusions(physical_page, device_page);
+                        Profile::RecordWriterNceFault(physical_page, writers.origin_mask,
+                                                     writers.first_reason_mask,
+                                                     writers.complete && device_resolved);
+                    }
+                }
+            }
+        }
+        if (!physical_resolved) {
+            VideoCommon::NcePageUsageProfile::UnresolvedFault();
+        }
+        if (writer_diagnostics) {
+            Profile::RecordWriterNceCoverage(physical_resolved, device_resolved);
+        }
+    }
+    if (m_deferred_fallbacks_enabled) {
+        const Profile::WatchdogCoreScope recovery_phase{m_core_index, Profile::WatchdogPhase::Recovery};
+        // Recovery must happen before preparing any legacy fallback, and never from the signal.
+        const Common::GpuTransitionProfile::DeferredProducerScope phase{
+            Common::GpuTransitionProfile::DeferredProducerPhase::Recovery};
+        const bool recovered = m_system.GPU().RecoverAbandonedDeferredWritesWithoutLocks();
+        (void)recovered;
+    }
+    if (m_pending_store.alignment) {
+        VideoCommon::NcePageUsageProfile::UnresolvedCpuWrite();
+        Common::GpuTransitionProfile::RecordDeferredFallback(Result::Unaligned);
+        const auto next_pc = MatchAndExecuteOneInstruction(
+            process.GetMemory(), m_guest_ctx.cpu_registers, m_guest_ctx.vector_registers,
+            m_guest_ctx.sp, m_guest_ctx.pc, true);
+        if (next_pc) {
+            m_guest_ctx.pc = *next_pc;
+        } else {
+            ArmNativeRetry(thread, fault_address, true);
+        }
+        return;
+    }
+    if (m_pending_store.fallback_only) {
+        VideoCommon::NcePageUsageProfile::UnresolvedCpuWrite();
+        Common::GpuTransitionProfile::RecordDeferredFallback(m_pending_store.fallback_reason);
+        RetryNativeAccess(thread, fault_address, m_pending_store.fallback_reason);
+        return;
+    }
+    std::optional<PAddr> budget_excluded_page;
+    std::optional<Result> budget_rejection;
+    std::optional<PAddr> profiled_physical;
+    bool native_epoch_opened = false;
+    NceExactStore::Store store{};
+    const Result result = [&]() -> Result {
+        const Profile::WatchdogCoreScope decode_phase{m_core_index, Profile::WatchdogPhase::Decode};
+        const u64 pc = m_guest_ctx.pc;
+        if ((pc & 3) != 0 || (pc >> Memory::YUZU_PAGEBITS) >= table.entries.size()) {
+            NceExactStore::opcode_read_failed.fetch_add(1, std::memory_order_relaxed);
+            return Result::UnsupportedInstruction;
+        }
+        const auto [code, code_type, code_block] =
+            table.entries[pc >> Memory::YUZU_PAGEBITS].PointerTypeBlock();
+        if (!code || code_type != Common::PageType::Memory) {
+            NceExactStore::opcode_read_failed.fetch_add(1, std::memory_order_relaxed);
+            return Result::UnsupportedInstruction;
+        }
+        u32 instruction{};
+        std::memcpy(&instruction, reinterpret_cast<const void*>(code + pc), sizeof(instruction));
+        if (NceFaultStats::Classify(instruction, true) == NceFaultStats::StoreOther) {
+            NceExactStore::RecordOtherOpcode(instruction);
+        }
+        u64 dczid_el0 = 0x10;
+        if ((instruction & 0xffffffe0U) == 0xd50b7420U) {
+            // NCE does not patch DCZID_EL0 or DC ZVA: use the same register as native guest code.
+            // This read and all opcode accounting happen after leaving the signal handler.
+            asm volatile("mrs %0, dczid_el0" : "=r"(dczid_el0));
+            NceExactStore::dc_zva_detected.fetch_add(1, std::memory_order_relaxed);
+            NceExactStore::dc_zva_dczid[dczid_el0 & 0x1f].fetch_add(1, std::memory_order_relaxed);
+        }
+        NceExactStore::StoreVisitor visitor{m_guest_ctx.cpu_registers, m_guest_ctx.sp,
+                                            m_guest_ctx.vector_registers, dczid_el0};
+        if (const auto decoded = visitor.Decode(instruction, fault_address, store);
+            decoded != Result::Success) {
+            if (decoded == Result::UnsupportedInstruction) {
+                Common::GpuTransitionProfile::RecordRejectedNceOpcode(instruction, pc);
+            }
+            return decoded;
+        }
+
+        // Use the same cached-page authority as InvalidateNCE. The producer revalidates this
+        // hint under the CPU identity gate before granting a lease or committing bytes.
+        auto* backing = CachedBacking(table, store.address);
+        if (!backing || reinterpret_cast<u64>(backing) !=
+                            m_pending_store.backing_page + (store.address & Memory::YUZU_PAGEMASK)) {
+            return Result::MappingChanged;
+        }
+        auto& device_memory = m_system.Host1x().MemoryManager();
+        if (!device_memory.IsPhysicalPointer(backing)) {
+            return Result::MappingChanged;
+        }
+        if (VideoCommon::NcePageUsageProfile::Enabled()) {
+            profiled_physical = device_memory.GetRawPhysicalAddr(backing);
+        }
+        DAddr device_address{};
+        if (!device_memory.ApplyOpOnSingleMapping(backing, store.size,
+                                                  [&](DAddr address) { device_address = address; })) {
+            return Result::AliasedMapping;
+        }
+        const NceExactStore::Backing mapping{
+            &table, store.address, backing,
+            table.entries[store.address >> Memory::YUZU_PAGEBITS].Block(),
+            store.zero_block && store.size > 16 ? 16 : store.pair ? store.size / 2 : store.size,
+            store.pair, store.zero_block};
+        const std::span<const u8> bytes =
+            store.zero_block ? std::span{NceExactStore::DcZvaZeros}.first(store.size)
+                             : std::span<const u8>{store.bytes}.first(store.size);
+        if (m_deferred_fallbacks_enabled && m_system.DeviceMemory().CpuEpochs().Requested() &&
+            store.size <= Memory::YUZU_PAGESIZE - (store.address & Memory::YUZU_PAGEMASK) &&
+            VideoCommon::NcePageUsageProfile::IsCpuEpochStorageCandidate(
+                device_memory.GetRawPhysicalAddr(backing) & ~PAddr{4095})) {
+            const PAddr physical = device_memory.GetRawPhysicalAddr(backing) & ~PAddr{4095};
+            VideoCommon::CpuEpochs::Identity identity{.memory = &process.GetMemory(),
+                                                      .cpu_owner = &table,
+                .device_owner = &device_memory,
+                                                      .address = store.address & ~VAddr{4095},
+                                                      .physical = physical,
+                                                      .device = device_address & ~DAddr{4095}};
+            const auto proof = m_system.DeviceMemory().CpuMappings().WithPage(
+                &table, identity.address, physical,
+                [&](const auto& snapshot) { identity.generation = snapshot.generation; });
+            if (proof == DeferredCpuMappings::Status::Eligible) {
+                identity.lifetime = std::make_shared<Kernel::KScopedAutoObject<Kernel::KProcess>>(
+                    m_system.Kernel(), &process);
+                if (m_system.GPU().TryOpenCpuEpoch(std::move(identity))) {
+                    native_epoch_opened = true;
+                    return Result::Success;
+                }
+            }
+        }
+        if (m_deferred_fallbacks_enabled) {
+            const PAddr physical_page = device_memory.GetRawPhysicalAddr(backing) & ~PAddr{4095};
+            using BudgetDecision = DeferredPublicationBudget::Decision;
+            const auto decision =
+                m_publication_budget.BeforeAttempt(physical_page, NceExactStore::NowNs());
+            if (const auto event = m_publication_budget.TakeCoreEvent()) {
+                Common::GpuTransitionProfile::RecordBudgetCoreEvent(
+                    event->activated, event->slow_samples, event->max_ns, m_core_index);
+            }
+            switch (decision) {
+            case BudgetDecision::PublicationCost: budget_rejection = Result::PublicationCost; break;
+            case BudgetDecision::CorePublicationCost: budget_rejection = Result::PublicationCoreCost; break;
+            case BudgetDecision::FaultDensity: budget_rejection = Result::FaultDensity; break;
+            case BudgetDecision::Allow: break;
+            }
+            u64 publication_ns{};
+            if (budget_rejection) {
+                Profile::RecordDeferredFallback(*budget_rejection);
+                const Profile::WatchdogCoreScope exact_phase{m_core_index, Profile::WatchdogPhase::BudgetExact};
+                const Profile::DeferredProducerScope exact_timing{Profile::DeferredProducerPhase::BudgetExact};
+                const auto exact = m_system.GPU().PublishNceStore(
+                    m_core_index, device_address, bytes, mapping, publication_ns, true);
+                if (Profile::enabled.load(std::memory_order_relaxed)) {
+                    Profile::deferred_counters.RecordPhase(exact == Result::Success ?
+                        Profile::DeferredProducerPhase::BudgetExactSuccess :
+                        Profile::DeferredProducerPhase::BudgetExactFailed, 0);
+                }
+                if (exact != Result::Success) budget_excluded_page = physical_page;
+                return exact;
+            }
+            const Profile::WatchdogCoreScope publish_phase{m_core_index, Profile::WatchdogPhase::Publish};
+            const auto published = m_system.GPU().PublishNceStore(
+                m_core_index, device_address, bytes, mapping, publication_ns);
+            if (published == Result::Success) {
+                m_publication_budget.Observe(physical_page, publication_ns, NceExactStore::NowNs());
+                if (const auto event = m_publication_budget.TakeCoreEvent()) {
+                    Common::GpuTransitionProfile::RecordBudgetCoreEvent(
+                        event->activated, event->slow_samples, event->max_ns, m_core_index);
+                }
+            }
+            // The epoch can have retired before this publication reports its transient exclusion.
+            if (published != Result::Success &&
+                m_system.DeviceMemory().CpuEpochs().Requested() &&
+                (m_system.DeviceMemory().CpuEpochs().FindPage(physical_page) ||
+                 VideoCommon::NcePageUsageProfile::IsCpuEpochStorageCandidate(physical_page))) {
+                auto exact = mapping;
+                exact.allow_clean_page = true;
+                return m_system.GPU().PublishNceStore(
+                    m_core_index, device_address, bytes, exact, publication_ns, true);
+            }
+            return published;
+        }
+        return m_system.GPU().WriteNceStore(device_address, bytes, mapping);
+    }();
+
+    if (native_epoch_opened) {
+        NceFaultStats::counts[store.zero_block ? NceFaultStats::StoreOther :
+                             store.simd ? NceFaultStats::StoreSimd :
+                             store.pair ? NceFaultStats::StorePair : NceFaultStats::StoreSingle]
+            .fetch_add(1, std::memory_order_relaxed);
+        // Resume the faulting instruction unchanged under native RW ownership.
+        return;
+    }
+    if (result == Result::Success) {
+        if (profiled_physical) {
+            VideoCommon::NcePageUsageProfile::CpuWrite(*profiled_physical, store.size);
+        }
+        if (store.writeback) {
+            if (store.base_register == 31) {
+                m_guest_ctx.sp = store.writeback_value;
+            } else {
+                m_guest_ctx.cpu_registers[store.base_register] = store.writeback_value;
+            }
+        }
+        m_guest_ctx.pc += 4;
+        auto& counter = store.zero_block ? NceExactStore::emulated_dc_zva : store.simd ?
+            (store.pair ? NceExactStore::emulated_simd_pair : NceExactStore::emulated_simd_single) :
+            (store.pair ? NceExactStore::emulated_pair : NceExactStore::emulated_single);
+        counter.fetch_add(1, std::memory_order_relaxed);
+        if (store.zero_block) {
+            NceExactStore::emulated_dc_zva_bytes.fetch_add(store.size, std::memory_order_relaxed);
+        }
+        NceFaultStats::counts[store.zero_block ? NceFaultStats::StoreOther :
+                             store.simd ? NceFaultStats::StoreSimd :
+                             store.pair ? NceFaultStats::StorePair : NceFaultStats::StoreSingle]
+            .fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
+    VideoCommon::NcePageUsageProfile::UnresolvedCpuWrite();
+    NceExactStore::CountFallback(result);
+    if (m_deferred_fallbacks_enabled) Common::GpuTransitionProfile::RecordDeferredFallback(result);
+    RetryNativeAccess(thread, fault_address, result);
+    if (budget_excluded_page) {
+        Common::GpuTransitionProfile::RecordBudgetExcludedPage(
+            *budget_rejection,
+            *budget_excluded_page);
+    }
+}
+
+void ArmNce::RetryNativeAccess(Kernel::KThread* thread, u64 fault_address,
+                             Common::GpuTransitionProfile::DeferredFallbackReason reason) {
+    const Common::GpuTransitionProfile::WatchdogCoreScope native_phase{
+        m_core_index, Common::GpuTransitionProfile::WatchdogPhase::NativeFallback};
+    if (m_deferred_fallbacks_enabled) {
+        const Common::GpuTransitionProfile::DeferredProducerScope phase{
+            Common::GpuTransitionProfile::DeferredProducerPhase::NativeFallback};
+        // Host continuation only. Keep both this VA and its physical identities excluded
+        // across the retry and subsequent writable accesses, including remaps and aliases.
+        thread->GetOwnerProcess()->GetMemory().PrepareNativeFallback(
+            fault_address & ~Memory::YUZU_PAGEMASK, Memory::YUZU_PAGESIZE, reason);
+    }
+    ArmNativeRetry(thread, fault_address, false);
+}
+
+void ArmNce::ArmNativeRetry(Kernel::KThread* thread, u64 fault_address, bool alignment_failure) {
+    // No guest state was changed. Let the next fault run the original handler exactly once,
+    // including its unmapped-memory handling, without sending it around this path again.
+    m_retry_store_thread = thread;
+    m_retry_store_pc = m_guest_ctx.pc;
+    m_retry_store_address = fault_address;
+    m_retry_alignment_failure = alignment_failure;
+    m_retry_store.store(true, std::memory_order_release);
+}
+#endif
 
 void ArmNce::HandleHostAlignmentFault(int sig, void* raw_info, void* raw_context) {
     return g_orig_bus_action.sa_sigaction(sig, static_cast<siginfo_t*>(raw_info), raw_context);
@@ -196,6 +692,7 @@ void ArmNce::UnlockThread(Kernel::KThread* thread) {
 }
 
 HaltReason ArmNce::RunThread(Kernel::KThread* thread) {
+    thread->ProfileHandoffNceRun(m_core_index);
     // Check if we're already interrupted.
     // If we are, we can just return immediately.
     HaltReason hr = static_cast<HaltReason>(m_guest_ctx.esr_el1.exchange(0));
@@ -225,12 +722,46 @@ HaltReason ArmNce::RunThread(Kernel::KThread* thread) {
     // TODO: finding and creating the post handler needs to be locked
     // to deal with dynamic loading of NROs.
     const auto& post_handlers = process->GetPostHandlers();
-    if (auto it = post_handlers.find(m_guest_ctx.pc); it != post_handlers.end()) {
+    const auto it = post_handlers.find(m_guest_ctx.pc);
+#ifdef HAS_NCE
+    if (m_store_resume_thread) {
+        if (m_store_resume_thread == thread) {
+            const u64 now = NceExactStore::NowNs();
+            NceExactStore::timing_resume.Add(now - m_store_host_done_ns);
+            NceExactStore::timing_total.Add(now - m_store_host_start_ns);
+        } else {
+            NceExactStore::resume_skipped.fetch_add(1, std::memory_order_relaxed);
+        }
+        m_store_resume_thread = nullptr;
+    }
+#endif
+    const bool signal_entry = it == post_handlers.end() && thread->ProfileHandoffPending();
+    if (signal_entry) {
+        thread_params->handoff_entry_ns.store(1, std::memory_order_relaxed);
+    } else {
+        thread->ProfileHandoffEnter(m_core_index);
+    }
+    if (it != post_handlers.end()) {
         hr = ReturnToRunCodeByTrampoline(thread_params, &m_guest_ctx, it->second);
     } else {
         hr = ReturnToRunCodeByExceptionLevelChange(m_thread_id, thread_params);  // Android: Use "process handle SIGUSR2 -n true -p true -s false" (and SIGURG) in LLDB when debugging
     }
 
+    if (signal_entry) {
+        const u64 entry_ns = thread_params->handoff_entry_ns.exchange(0, std::memory_order_acquire);
+        if (entry_ns > 1) {
+            thread->ProfileHandoffEnter(m_core_index, entry_ns,
+                thread_params->handoff_entry_frame.load(std::memory_order_relaxed));
+        } else {
+            thread->ProfileHandoffCancel();
+        }
+    }
+
+#ifdef HAS_NCE
+    if (m_store_pending.load(std::memory_order_acquire)) {
+        m_store_host_start_ns = NceExactStore::NowNs();
+    }
+#endif
     // Critical section for thread cleanup
     std::atomic_thread_fence(std::memory_order_acquire);
 
@@ -248,6 +779,17 @@ HaltReason ArmNce::RunThread(Kernel::KThread* thread) {
     // Return the halt reason.
     return hr;
 }
+
+#ifdef HAS_NCE
+void ArmNce::CompleteHostOperations(Kernel::KThread* thread) {
+    if (!m_store_pending.exchange(false, std::memory_order_acquire)) return;
+    CompleteExactStore(thread);
+    if (m_system.DebuggerEnabled()) GetContext(thread->GetContext());
+    m_store_host_done_ns = NceExactStore::NowNs();
+    m_store_resume_thread = thread;
+    NceExactStore::timing_host.Add(m_store_host_done_ns - m_store_host_start_ns);
+}
+#endif
 
 HaltReason ArmNce::StepThread(Kernel::KThread* thread) {
     return HaltReason::StepThread;
@@ -272,6 +814,10 @@ void ArmNce::SetSvcArguments(std::span<const uint64_t, 8> args) {
 ArmNce::ArmNce(System& system, bool uses_wall_clock, std::size_t core_index)
     : ArmInterface{uses_wall_clock}, m_system{system}, m_core_index{core_index} {
     m_guest_ctx.system = &m_system;
+#ifdef HAS_NCE
+    m_exact_stores_enabled = ExactStoresEnabled();
+    m_deferred_fallbacks_enabled = DeferredWritesConfig::ProducerRequested();
+#endif
 }
 
 ArmNce::~ArmNce() = default;

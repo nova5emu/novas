@@ -1254,6 +1254,8 @@ private:
 
 private:
     VkInstance instance;         ///< Vulkan instance.
+    std::unique_ptr<HangTrace::GpuMarkers> hang_markers;
+    VmaAllocation hang_marker_allocation{};
     VmaAllocator allocator{};    ///< VMA allocator.
     mutable std::mutex separate_pools_mutex;
     mutable std::array<std::array<VmaPool, VK_MAX_MEMORY_TYPES>, 2> separate_pools{};

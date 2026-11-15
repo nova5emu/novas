@@ -3,9 +3,12 @@
 
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <utility>
+#include <vector>
 
 #include "common/common_types.h"
 
@@ -37,6 +40,32 @@ constexpr u64 TimestampDelta(u64 begin, u64 end, u32 valid_bits) {
     }
     const u64 mask = valid_bits == 64 ? ~u64{0} : (u64{1} << valid_bits) - 1;
     return (end - begin) & mask;
+}
+
+// Distinguish overlap from wraparound; intervals must be shorter than half the timestamp range.
+constexpr double SignedTimestampDelta(u64 begin, u64 end, u32 valid_bits) {
+    if (valid_bits == 0 || valid_bits > 64) {
+        return 0.0;
+    }
+    const u64 delta = TimestampDelta(begin, end, valid_bits);
+    return (delta & (u64{1} << (valid_bits - 1)))
+        ? -static_cast<double>(TimestampDelta(end, begin, valid_bits))
+        : static_cast<double>(delta);
+}
+
+inline double IntervalUnionMilliseconds(std::vector<std::pair<double, double>> intervals) {
+    std::ranges::sort(intervals);
+    double total{}, end{};
+    bool first = true;
+    for (const auto& [begin, next_end] : intervals) {
+        if (next_end < begin) {
+            continue;
+        }
+        total += first ? next_end - begin : std::max(0.0, next_end - std::max(begin, end));
+        end = first ? next_end : std::max(end, next_end);
+        first = false;
+    }
+    return total;
 }
 
 } // namespace Common::DkbFrameTrace

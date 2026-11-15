@@ -314,6 +314,16 @@
         <item>2</item>
     </integer-array>
 
+    <string-array name="rendererOotAntiAliasingNames">
+        <item>@string/oot_anti_aliasing_game</item>
+        <item>@string/oot_anti_aliasing_no_sharpening</item>
+    </string-array>
+
+    <integer-array name="rendererOotAntiAliasingValues">
+        <item>0</item>
+        <item>1</item>
+    </integer-array>
+
     <string-array name="statsPosition">
         <item>@string/overlay_position_top_left</item>
         <item>@string/overlay_position_center_top</item>

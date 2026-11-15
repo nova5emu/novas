@@ -657,6 +657,15 @@ abstract class SettingsItem(
                 )
             )
             put(
+                SingleChoiceSetting(
+                    IntSetting.RENDERER_OOT_ANTI_ALIASING,
+                    titleId = R.string.renderer_oot_anti_aliasing,
+                    descriptionId = R.string.renderer_oot_anti_aliasing_description,
+                    choicesId = R.array.rendererOotAntiAliasingNames,
+                    valuesId = R.array.rendererOotAntiAliasingValues
+                )
+            )
+            put(
                 SwitchSetting(
                     BooleanSetting.RENDERER_FRAME_GEN,
                     titleId = R.string.frame_gen,

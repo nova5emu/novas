@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <source_location>
+
 #include <chrono>
 #include <deque>
 #include <memory>
@@ -85,7 +87,7 @@ public:
                                  DescriptorPool& descriptor_pool,
                                  ComputePassDescriptorQueue& compute_pass_descriptor_queue);
 
-    void Finish();
+    void Finish(std::source_location location = std::source_location::current());
 
     StagingBufferRef UploadStagingBuffer(size_t size, bool deferred = false);
 
@@ -482,7 +484,7 @@ public:
     Image& operator=(Image&&) = default;
 
     void UploadMemory(VkBuffer buffer, VkDeviceSize offset,
-                      std::span<const VideoCommon::BufferImageCopy> copies);
+                      std::span<const VideoCommon::BufferImageCopy> copies, bool staging_upload = false);
 
     void UploadMemory(const StagingBufferRef& map,
                       std::span<const VideoCommon::BufferImageCopy> copies);

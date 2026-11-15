@@ -10,6 +10,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging.h"
+#include "core/deferred_transition.h"
 #include "core/hle/service/nvdrv/core/container.h"
 #include "core/hle/service/nvdrv/core/heap_mapper.h"
 #include "core/hle/service/nvdrv/core/nvmap.h"
@@ -26,7 +27,8 @@ NvMap::Handle::Handle(u64 size_, Id id_)
 }
 
 NvResult NvMap::Handle::Alloc(Flags pFlags, u32 pAlign, u8 pKind, u64 pAddress,
-                              NvCore::SessionId pSessionId) {
+                              NvCore::SessionId pSessionId,
+                              std::shared_ptr<SessionLifetime> lifetime) {
     std::scoped_lock lock(mutex);
     // Handles cannot be allocated twice
     if (allocated) {
@@ -37,6 +39,7 @@ NvResult NvMap::Handle::Alloc(Flags pFlags, u32 pAlign, u8 pKind, u64 pAddress,
     kind = pKind;
     align = pAlign < YUZU_PAGESIZE ? YUZU_PAGESIZE : pAlign;
     session_id = pSessionId;
+    session_lifetime = std::move(lifetime);
 
     // This flag is only applicable for handles with an address passed
     if (pAddress) {
@@ -81,6 +84,7 @@ void NvMap::AddHandle(std::shared_ptr<Handle> handle_description) {
 }
 
 void NvMap::UnmapHandle(Handle& handle_description) {
+    [[maybe_unused]] auto transition = Core::DeferredTransitionScope::RequireReady(host1x.System());
     // Remove pending unmap queue entry if needed
     if (handle_description.unmap_queue_entry) {
         unmap_queue.erase(*handle_description.unmap_queue_entry);
@@ -99,16 +103,12 @@ void NvMap::UnmapHandle(Handle& handle_description) {
     // Free and unmap the handle from the SMMU
     const size_t map_size = handle_description.aligned_size;
     if (!handle_description.in_heap) {
-        auto& smmu = host1x.MemoryManager();
-        size_t aligned_up = Common::AlignUp(map_size, BIG_PAGE_SIZE);
-        smmu.Unmap(handle_description.d_address, map_size);
-        smmu.Free(handle_description.d_address, static_cast<size_t>(aligned_up));
+        handle_description.session_lifetime->FreeDeviceRange(handle_description.d_address);
         handle_description.d_address = 0;
         return;
     }
     const VAddr vaddress = handle_description.address;
-    auto* session = core.GetSession(handle_description.session_id);
-    session->mapper->Unmap(vaddress, map_size);
+    handle_description.session_lifetime->mapper->Unmap(vaddress, map_size);
     handle_description.d_address = 0;
     handle_description.in_heap = false;
 }
@@ -169,6 +169,8 @@ DAddr NvMap::PinHandle(NvMap::Handle::Id handle, bool low_area_pin) {
     std::scoped_lock lock(handle_description->mutex);
     const auto map_low_area = [&] {
         if (handle_description->pin_virt_address == 0) {
+            [[maybe_unused]] auto transition =
+                Core::DeferredTransitionScope::RequireReady(host1x.System());
             u32 address = host1x.Allocator().Allocate(u32(handle_description->aligned_size));
             host1x.gmmu_manager.Map(GPUVAddr(address), handle_description->d_address, handle_description->aligned_size);
             handle_description->pin_virt_address = address;
@@ -198,12 +200,14 @@ DAddr NvMap::PinHandle(NvMap::Handle::Id handle, bool low_area_pin) {
 
         using namespace std::placeholders;
         // If not then allocate some space and map it
+        [[maybe_unused]] auto transition = Core::DeferredTransitionScope::RequireReady(host1x.System());
         DAddr address{};
         auto& smmu = host1x.MemoryManager();
-        auto* session = core.GetSession(handle_description->session_id);
+        const auto& session = handle_description->session_lifetime;
+        ASSERT(session);
         const VAddr vaddress = handle_description->address;
         const size_t map_size = handle_description->aligned_size;
-        if (session->has_preallocated_area && session->mapper->IsInBounds(vaddress, map_size)) {
+        if (session->mapper && session->mapper->IsInBounds(vaddress, map_size)) {
             handle_description->d_address = session->mapper->Map(vaddress, map_size);
             handle_description->in_heap = true;
         } else {
@@ -223,6 +227,7 @@ DAddr NvMap::PinHandle(NvMap::Handle::Id handle, bool low_area_pin) {
             }
 
             handle_description->d_address = address;
+            session->TrackDeviceRange(address, map_size, aligned_up);
             smmu.Map(address, vaddress, map_size, session->asid, true);
             handle_description->in_heap = false;
         }
@@ -325,7 +330,8 @@ std::optional<NvMap::FreeInfo> NvMap::FreeHandle(Handle::Id handle, bool interna
     return freeInfo;
 }
 
-void NvMap::UnmapAllHandles(NvCore::SessionId session_id) {
+void NvMap::UnmapAllHandles(NvCore::SessionId session_id,
+                            const std::shared_ptr<SessionLifetime>& lifetime) {
     auto handles_copy = [&] {
         std::scoped_lock lk{handles_lock};
         return handles;
@@ -334,7 +340,8 @@ void NvMap::UnmapAllHandles(NvCore::SessionId session_id) {
     for (auto& [id, handle] : handles_copy) {
         {
             std::scoped_lock lk{handle->mutex};
-            if (handle->session_id.id != session_id.id || handle->dupes <= 0) {
+            if (handle->session_id.id != session_id.id || handle->session_lifetime != lifetime ||
+                handle->dupes <= 0) {
                 continue;
             }
         }

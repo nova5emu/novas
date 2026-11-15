@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/gpu_transition_profile.h"
 #include <array>
 #include <map>
 #include <span>
@@ -262,6 +263,10 @@ public:
     }
 
     void MapProcessMemory(VAddr dest_address, std::size_t size) {
+        // Guest-backed callbacks can run under this service JIT's exclusive monitor.
+        const Common::GpuTransitionProfile::LegacyWriterScope legacy_profile{
+            Common::GpuTransitionProfile::LegacyWriterSite::Jit, size};
+        memory.PrepareLegacyWrite(dest_address, size);
         mapped_ranges.add(IntervalType{dest_address, dest_address + size});
     }
 

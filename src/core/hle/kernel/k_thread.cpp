@@ -251,6 +251,7 @@ namespace Kernel {
 
         // Set thread ID.
         m_thread_id = kernel.CreateNewThreadID();
+        m_profile_entrypoint = GetInteger(func);
 
         // We initialized!
         m_initialized = true;
@@ -334,6 +335,8 @@ namespace Kernel {
     }
 
     void KThread::Finalize(KernelCore& kernel) {
+        const auto deferred_transition = kernel.System().BeginDeferredTransition(
+            Common::GpuTransitionProfile::SuspensionSite::ThreadFinalize);
         for (KThread* thread : m_pending_started_threads) {
             thread->Close(kernel);
         }
@@ -827,6 +830,7 @@ namespace Kernel {
 
         // Note the state change in scheduler.
         if (new_state != old_state) {
+            ProfileCurrentState();
             KScheduler::OnThreadStateChanged(kernel, this, old_state);
         }
     }
@@ -837,6 +841,7 @@ namespace Kernel {
         // Clear our suspend flags in state.
         const ThreadState old_state = m_thread_state.load(std::memory_order_relaxed);
         m_thread_state.store(old_state & ThreadState::Mask, std::memory_order_relaxed);
+        ProfileCurrentState();
 
         // Note the state change in scheduler.
         KScheduler::OnThreadStateChanged(kernel, this, old_state);
@@ -1193,6 +1198,8 @@ namespace Kernel {
     }
 
     void KThread::Exit(KernelCore& kernel) {
+        auto deferred_transition = kernel.System().BeginDeferredTransition(
+            Common::GpuTransitionProfile::SuspensionSite::ThreadFinalize);
         ASSERT(this == GetCurrentThreadPointer(kernel));
 
         // Release the thread resource hint, running thread count from parent.
@@ -1218,6 +1225,9 @@ namespace Kernel {
 
             // Register the thread as a work task.
             KWorkerTaskManager::AddTask(kernel, KWorkerTaskManager::WorkerType::Exit, this);
+            // Unlocking the scheduler switches away permanently; no stack unwinding follows.
+            // The queued worker acquires its own ready token before touching TLS/backing.
+            deferred_transition.reset();
         }
 
         UNREACHABLE_MSG("KThread::Exit() would return");
@@ -1255,6 +1265,7 @@ namespace Kernel {
             // If the thread is in initialized state, just change state to terminated.
             if (this->GetState() == ThreadState::Initialized) {
                 m_thread_state = ThreadState::Terminated;
+                ProfileCurrentState();
                 return ThreadState::Terminated;
             }
 
@@ -1403,6 +1414,7 @@ namespace Kernel {
     void KThread::BeginWait(KernelCore& kernel, KThreadQueue* queue) {
         // Set our state as waiting.
         this->SetState(kernel, ThreadState::Waiting);
+        ProfileWait(m_is_kernel_address_key ? "kernel_mutex" : "kernel_wait", GetInteger(m_address_key));
 
         // Set our wait queue.
         m_wait_queue = queue;
@@ -1413,6 +1425,11 @@ namespace Kernel {
         KScopedSchedulerLock sl(kernel);
         // If we're waiting, notify our queue that we're available.
         if (this->GetState() == ThreadState::Waiting) {
+            if (Common::GuestHandoffProfile::Enabled()) {
+                GetCurrentThread(kernel).ProfileWake(*this,
+                    reinterpret_cast<uintptr_t>(signaled_object),
+                    Common::GuestHandoffProfile::WakeKind::Event);
+            }
             m_wait_queue->NotifyAvailable(kernel, this, signaled_object, wait_result);
         }
     }
@@ -1449,8 +1466,124 @@ namespace Kernel {
         m_thread_state.store(
             static_cast<ThreadState>((old_state & ~ThreadState::Mask) | (state & ThreadState::Mask)),
             std::memory_order_relaxed);
+        ProfileCurrentState();
         if (m_thread_state.load(std::memory_order_relaxed) != old_state) {
             KScheduler::OnThreadStateChanged(kernel, this, old_state);
+        }
+    }
+
+    Common::GuestThreadProfile::ThreadInfo KThread::ProfileThreadInfo() const {
+        return {m_parent ? m_parent->GetProcessId() : 0, m_thread_id, m_profile_entrypoint,
+                static_cast<u32>(m_priority), m_profile_main_thread};
+    }
+
+    void KThread::ProfileCurrentState() {
+        if (Common::GuestThreadProfile::Enabled() && m_parent) {
+            ProfileHandoffMetadata();
+            const auto state = m_thread_state.load(std::memory_order_relaxed);
+            const u32 base_state = static_cast<u32>(state & ThreadState::Mask);
+            const bool suspended = True(state & ~ThreadState::Mask) &&
+                                   base_state != static_cast<u32>(ThreadState::Terminated);
+            m_profile_handoff.Runnable(!suspended &&
+                base_state == static_cast<u32>(ThreadState::Runnable));
+            Common::GuestThreadProfile::OnState(ProfileThreadInfo(),
+                suspended ? 4U : base_state, m_profile_svc_id.load(std::memory_order_relaxed));
+        }
+    }
+
+    void KThread::ProfileSwitch(KernelCore& kernel, bool scheduled, s32 core) {
+        if (!Common::GuestThreadProfile::Enabled() || !m_parent) {
+            return;
+        }
+        const auto role = kernel.System().IsMulticore()
+            ? static_cast<Common::DkbCpuTrace::Role>(core)
+            : Common::DkbCpuTrace::Role::GuestSingleCore;
+        Common::GuestThreadProfile::OnSwitch(ProfileThreadInfo(), scheduled, role);
+        if (scheduled && kernel.System().IsMulticore()) {
+            m_profile_handoff.Switch(static_cast<u32>(core));
+        }
+    }
+
+    void KThread::ProfileWait(const char* reason, u64 object, u64 detail, u64 target) {
+        if (Common::GuestThreadProfile::Enabled() && m_parent) {
+            Common::GuestThreadProfile::SetWait(ProfileThreadInfo(), reason, object, detail, target,
+                m_profile_svc_id.load(std::memory_order_relaxed));
+        }
+    }
+
+    void KThread::ProfileWaitReason(ThreadWaitReasonForDebugging reason) {
+        constexpr std::array names{"unknown", "sleep", "ipc_reply", "synchronization",
+                                    "condition_variable", "address_arbiter", "suspended"};
+        u64 object{};
+        if (reason == ThreadWaitReasonForDebugging::ConditionVar) {
+            object = GetInteger(m_address_key);
+        }
+        if (reason == ThreadWaitReasonForDebugging::Arbitration) {
+            object = m_condvar_key;
+        }
+        ProfileWait(names[static_cast<size_t>(reason)], object);
+    }
+
+    void KThread::ProfileWake(const KThread& waiter, u64 object,
+                             Common::GuestHandoffProfile::WakeKind kind) {
+        if (Common::GuestHandoffProfile::Enabled() && waiter.m_parent) {
+            waiter.m_profile_handoff.Wake(m_parent ? m_parent->GetProcessId() : 0, m_thread_id,
+                                         object, kind,
+                                         m_profile_svc_id.load(std::memory_order_relaxed));
+        }
+        if (Common::GuestThreadProfile::Enabled() && m_parent && waiter.m_parent) {
+            Common::GuestThreadProfile::RecordWake(ProfileThreadInfo(), waiter.ProfileThreadInfo(),
+                object, m_profile_svc_id.load(std::memory_order_relaxed));
+        }
+    }
+
+    void KThread::ProfileHandoffChosen(s32 core) {
+        if (Common::GuestHandoffProfile::Enabled() && m_parent && core >= 0) {
+            ProfileHandoffMetadata();
+            m_profile_handoff.Chosen(static_cast<u32>(core));
+        }
+    }
+
+    void KThread::ProfileHandoffMetadata() {
+        if (Common::GuestHandoffProfile::Enabled()) {
+            m_profile_virtual_affinity.store(m_virtual_affinity_mask, std::memory_order_relaxed);
+            m_profile_physical_affinity.store(m_physical_affinity_mask.GetAffinityMask(),
+                                              std::memory_order_relaxed);
+            m_profile_priority.store(static_cast<u32>(m_priority), std::memory_order_relaxed);
+        }
+    }
+
+    void KThread::ProfileHandoffService(s32 core) {
+        if (Common::GuestHandoffProfile::Enabled() && m_parent && core >= 0) {
+            m_profile_handoff.CoreService(static_cast<u32>(core));
+        }
+    }
+
+    void KThread::ProfileHandoffNceRun(size_t core) {
+        if (Common::GuestHandoffProfile::Enabled() && m_parent &&
+            core < Core::Hardware::NUM_CPU_CORES) {
+            m_profile_handoff.NceRun(static_cast<u32>(core));
+        }
+    }
+
+    bool KThread::ProfileHandoffPending() const {
+        return Common::GuestHandoffProfile::Enabled() && m_parent &&
+               m_profile_handoff.HasPending();
+    }
+
+    void KThread::ProfileHandoffCancel() {
+        m_profile_handoff.Runnable(false);
+    }
+
+    void KThread::ProfileHandoffEnter(size_t core, u64 entry_ns, u64 entry_frame) {
+        if (Common::GuestHandoffProfile::Enabled() && m_parent &&
+            core < Core::Hardware::NUM_CPU_CORES) {
+            const Common::GuestThreadProfile::ThreadInfo info{
+                m_parent->GetProcessId(), m_thread_id, m_profile_entrypoint,
+                m_profile_priority.load(std::memory_order_relaxed), m_profile_main_thread};
+            m_profile_handoff.Enter(info, static_cast<u32>(core),
+                m_profile_virtual_affinity.load(std::memory_order_relaxed),
+                m_profile_physical_affinity.load(std::memory_order_relaxed), entry_ns, entry_frame);
         }
     }
 

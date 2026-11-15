@@ -5,6 +5,7 @@
 
 #include "common/dkb_cpu_trace.h"
 #include "common/dkb_frame_trace.h"
+#include "common/guest_thread_profile.h"
 
 namespace Common::DkbCpuTrace {
 namespace {
@@ -22,8 +23,9 @@ Registry& GetRegistry() {
 
 } // namespace
 
-Registration::Registration(Role role_) : clock{DkbFrameTrace::Enabled()}, role{role_} {
-    if (!DkbFrameTrace::Enabled()) {
+Registration::Registration(Role role_)
+    : clock{DkbFrameTrace::Enabled() || GuestThreadProfile::Enabled()}, role{role_} {
+    if (!(DkbFrameTrace::Enabled() || GuestThreadProfile::Enabled())) {
         return;
     }
     auto& registry = GetRegistry();
@@ -58,6 +60,23 @@ Snapshot ReadSnapshot() {
         };
     }
     return result;
+}
+
+std::optional<ThreadSample> TryReadThreadSample(Role role) {
+    const size_t index = static_cast<size_t>(role);
+    if (index >= RoleCount) {
+        return std::nullopt;
+    }
+    auto& registry = GetRegistry();
+    std::unique_lock lock{registry.mutex, std::try_to_lock};
+    if (!lock) {
+        return std::nullopt;
+    }
+    return ThreadSample{
+        .generation = registry.generations[index],
+        .active = registry.clocks[index] != nullptr,
+        .cpu_ns = registry.clocks[index] ? registry.clocks[index]->Read() : std::nullopt,
+    };
 }
 
 } // namespace Common::DkbCpuTrace

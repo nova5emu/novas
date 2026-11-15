@@ -7,10 +7,14 @@
 
 #include <atomic>
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <functional>
 #include <mutex>
+#include <limits>
+#include <stdexcept>
 #include <set>
 #include <span>
 #include <thread>
@@ -21,6 +25,7 @@
 #include "common/assert.h"
 #include "common/atomic_ops.h"
 #include "common/common_types.h"
+#include "common/gpu_transition_profile.h"
 #include "common/heap_tracker.h"
 #include "common/logging.h"
 #include "common/page_table.h"
@@ -28,13 +33,21 @@
 #include "common/settings.h"
 #include "common/swap.h"
 #include "core/core.h"
+#include "core/deferred_kernel_writes.h"
+#include "core/deferred_transition.h"
+#include "core/deferred_write_config.h"
 #include "core/device_memory.h"
 #include "core/gpu_dirty_memory_manager.h"
 #include "core/hardware_properties.h"
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/memory.h"
+#ifdef HAS_NCE
+#include "core/arm/nce/nce_fault_stats.h"
+#endif
 #include "video_core/gpu.h"
+#include "video_core/gpu_write_trace.h"
+#include "video_core/compute_release_trace.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/rasterizer_download_area.h"
@@ -57,6 +70,107 @@ static inline bool AddressSpaceContains(const Common::PageTable& table, const Co
 struct Memory::Impl {
     explicit Impl(Core::System& system_) : system{system_} {}
 
+    void ProtectHostRange(u64 address, u64 size, Common::MemoryPermission permissions) {
+        auto& epochs = system.DeviceMemory().CpuEpochs();
+        if (!epochs.Requested()) {
+            host_buffer->Protect(address, size, permissions);
+            return;
+        }
+        if (size > std::numeric_limits<u64>::max() - address) {
+            throw std::overflow_error("CPU epoch protection range overflow");
+        }
+        epochs.WithAliasProtection(current_page_table, address, size, [&](bool allow_native_access) {
+            const auto applied = allow_native_access ? permissions :
+                Common::MemoryPermission{};
+            host_buffer->Protect(address, size, applied);
+        });
+    }
+
+    bool WithCpuEpochIdentity(const void* owner, VAddr address, PAddr physical, u64 generation,
+                              const std::function<bool(const u8*)>& operation) {
+        if (!current_page_table || owner != current_page_table ||
+            (address & YUZU_PAGEMASK) || (physical & YUZU_PAGEMASK) ||
+            !AddressSpaceContains(*current_page_table, address, YUZU_PAGESIZE)) return false;
+        bool valid = false;
+        const auto status = system.DeviceMemory().CpuMappings().WithPage(owner, address, physical,
+            [&](const auto& snapshot) {
+                const auto pointer = current_page_table->entries[address >> YUZU_PAGEBITS].Pointer(true);
+                if (!pointer || snapshot.generation != generation) return;
+                const auto* backing = reinterpret_cast<const u8*>(pointer + address);
+                if (system.DeviceMemory().GetRawPhysicalAddr(backing) == physical)
+                    valid = operation(backing);
+            });
+        return status == Core::DeferredCpuMappings::Status::Eligible && valid;
+    }
+
+    auto ReserveExcludedPhysicalPage(PAddr physical, Common::GpuTransitionProfile::Site site,
+        Common::GpuTransitionProfile::DeferredFallbackReason reason =
+            Common::GpuTransitionProfile::DeferredFallbackReason::Count) {
+        using namespace VideoCommon::DeferredWrites;
+        const std::array ranges{TransitionRange{TransitionSpace::Physical, physical, YUZU_PAGESIZE}};
+        using Site = Common::GpuTransitionProfile::Site;
+        const WriterOrigin origin = site == Site::NceFallbackExclude ? WriterOrigin::NcePersistent :
+            site == Site::LegacyWriterExclude ? WriterOrigin::LegacyPersistent : WriterOrigin::KernelJitPersistent;
+        auto permission = system.GPU().ReserveDeferredWriterPermission(ranges, origin, reason);
+        if (site == Common::GpuTransitionProfile::Site::LegacyWriterExclude) {
+            system.DeviceMemory().CpuMappings().ExcludePhysical(
+                physical, YUZU_PAGESIZE, Core::DeferredCpuMappings::Status::CapturedWriter);
+        }
+        Common::GpuTransitionProfile::RecordRange(site, YUZU_PAGESIZE);
+        return permission;
+    }
+
+    void PrepareLockedAccess(VAddr address, u64 size, Common::GpuTransitionProfile::Site site,
+        Common::GpuTransitionProfile::DeferredFallbackReason reason =
+            Common::GpuTransitionProfile::DeferredFallbackReason::Count) {
+        if (!system.DeferredWriteJournal() || size == 0) return;
+        address &= 0xffffffffffffULL;
+        const bool prepared = kernel_writes.Prepare(address, size,
+            [&](VAddr page) -> std::optional<PAddr> {
+                if (!current_page_table || !AddressSpaceContains(*current_page_table, page, 1))
+                    return std::nullopt;
+                const auto pointer = current_page_table->entries[page >> YUZU_PAGEBITS].Pointer(true);
+                if (!pointer) return std::nullopt;
+                return system.DeviceMemory().GetRawPhysicalAddr(
+                    reinterpret_cast<const u8*>(pointer + page));
+            },
+            [&](PAddr physical) { return ReserveExcludedPhysicalPage(physical, site, reason); },
+            [&](const auto& permission) {
+                // No historical B writes (e.g. TLS), or the caller already owns Ready:
+                // neither case may join another global transition under kernel locks.
+                if (site == Common::GpuTransitionProfile::Site::LegacyWriterExclude &&
+                    (permission->Watermark() == 0 || Core::DeferredTransitionScope::Current(system))) {
+                    return permission->MarkReady();
+                }
+                // Never retain a joined global Ready epoch in the permanent registry.
+                auto ready = system.GPU().PrepareDeferredWriterPermission(permission);
+                return ready && ready->Ready();
+            }, [&](PAddr physical, bool newly_excluded) {
+                Common::GpuTransitionProfile::RecordLegacyPhysicalPage(physical, newly_excluded);
+            }, site == Common::GpuTransitionProfile::Site::LegacyWriterExclude &&
+               Common::GpuTransitionProfile::enabled.load(std::memory_order_relaxed));
+        if (!prepared) UNREACHABLE_MSG("Locked/native access lacks a prepared exclusion");
+    }
+
+    bool PrepareLegacyWrite(VAddr address, u64 size) {
+        if (!deferred_legacy_writers || !current_page_table || size == 0) return false;
+        address &= 0xffffffffffffULL;
+        if (!AddressSpaceContains(*current_page_table, address, size)) return false;
+        if (!system.DeferredWriteJournal()) {
+            system.DeviceMemory().CpuMappings().ExcludeVirtualRange(address, size,
+                [&](VAddr page) -> std::optional<PAddr> {
+                    const auto pointer = current_page_table->entries[page >> YUZU_PAGEBITS].Pointer(true);
+                    if (!pointer) return std::nullopt;
+                    return system.DeviceMemory().GetRawPhysicalAddr(
+                        reinterpret_cast<const u8*>(pointer + page));
+                }, Core::DeferredCpuMappings::Status::CapturedWriter);
+            return true;
+        }
+        PrepareLockedAccess(address, size,
+                            Common::GpuTransitionProfile::Site::LegacyWriterExclude);
+        return true;
+    }
+
     void SetCurrentPageTable(Kernel::KProcess& process) {
         current_page_table = &process.GetPageTable().GetImpl();
 
@@ -77,10 +191,18 @@ struct Memory::Impl {
     void MapMemoryRegion(Common::PageTable& page_table, Common::ProcessAddress base, u64 size,
                          Common::PhysicalAddress target, Common::MemoryPermission perms,
                          bool separate_heap) {
+        auto epoch_mutation = system.DeviceMemory().CpuEpochs().BeforeMutation(
+            VideoCommon::CpuEpochs::CloseReason::Mapping);
         ASSERT_MSG((size & YUZU_PAGEMASK) == 0, "non-page aligned size: {:016X}", size);
         ASSERT_MSG((base & YUZU_PAGEMASK) == 0, "non-page aligned base: {:016X}", GetInteger(base));
         ASSERT_MSG(target >= DramMemoryMap::Base, "Out of bounds target: {:016X}",
                    GetInteger(target));
+        if (perms != Common::MemoryPermission::ReadWrite &&
+            system.DeviceMemory().CpuMappings().Enabled()) {
+            system.DeviceMemory().CpuMappings().ExcludePhysical(
+                GetInteger(target) - DramMemoryMap::Base, size,
+                Core::DeferredCpuMappings::Status::Code);
+        }
         MapPages(page_table, base / YUZU_PAGESIZE, size / YUZU_PAGESIZE, target,
                  Common::PageType::Memory);
 
@@ -91,6 +213,8 @@ struct Memory::Impl {
 
     void UnmapRegion(Common::PageTable& page_table, Common::ProcessAddress base, u64 size,
                      bool separate_heap) {
+        auto epoch_mutation = system.DeviceMemory().CpuEpochs().BeforeMutation(
+            VideoCommon::CpuEpochs::CloseReason::Mapping);
         ASSERT_MSG((size & YUZU_PAGEMASK) == 0, "non-page aligned size: {:016X}", size);
         ASSERT_MSG((base & YUZU_PAGEMASK) == 0, "non-page aligned base: {:016X}", GetInteger(base));
         MapPages(page_table, base / YUZU_PAGESIZE, size / YUZU_PAGESIZE, 0,
@@ -103,8 +227,24 @@ struct Memory::Impl {
 
     void ProtectRegion(Common::PageTable& page_table, VAddr vaddr, u64 size,
                        Common::MemoryPermission perms) {
+        auto epoch_mutation = system.DeviceMemory().CpuEpochs().BeforeMutation(
+            VideoCommon::CpuEpochs::CloseReason::Protection);
+        Common::GpuTransitionProfile::Record(Common::GpuTransitionProfile::Site::MemoryProtect);
         ASSERT_MSG((size & YUZU_PAGEMASK) == 0, "non-page aligned size: {:016X}", size);
         ASSERT_MSG((vaddr & YUZU_PAGEMASK) == 0, "non-page aligned base: {:016X}", vaddr);
+
+        // Kernel permission changes are under their outer Ready transition. Never admit
+        // a heap page repurposed as code/read-only memory, even if later made writable again.
+        if (perms != Common::MemoryPermission::ReadWrite &&
+            system.DeviceMemory().CpuMappings().Enabled()) {
+            for (u64 addr = vaddr; addr < vaddr + size; addr += YUZU_PAGESIZE) {
+                if (const auto pointer = page_table.entries[addr >> YUZU_PAGEBITS].Pointer(true)) {
+                    system.DeviceMemory().CpuMappings().ExcludePhysical(
+                        system.DeviceMemory().GetRawPhysicalAddr(reinterpret_cast<u8*>(pointer + addr)),
+                        YUZU_PAGESIZE, Core::DeferredCpuMappings::Status::Code);
+                }
+            }
+        }
 
         if (!current_page_table->fastmem_arena) {
             return;
@@ -118,7 +258,7 @@ struct Memory::Impl {
             switch (page_type) {
             case Common::PageType::RasterizerCachedMemory:
                 if (protect_bytes > 0) {
-                    host_buffer->Protect(protect_begin, protect_bytes, perms);
+                    ProtectHostRange(protect_begin, protect_bytes, perms);
                     protect_bytes = 0;
                 }
                 break;
@@ -130,7 +270,7 @@ struct Memory::Impl {
         }
 
         if (protect_bytes > 0) {
-            host_buffer->Protect(protect_begin, protect_bytes, perms);
+            ProtectHostRange(protect_begin, protect_bytes, perms);
         }
     }
 
@@ -352,6 +492,10 @@ struct Memory::Impl {
     }
 
     bool WriteBlockImpl(const Common::ProcessAddress addr, const void* buffer, const std::size_t size, bool unsafe) {
+        const Common::GpuTransitionProfile::LegacyWriterScope profile{
+            unsafe ? Common::GpuTransitionProfile::LegacyWriterSite::WriteBlockUnsafe :
+                     Common::GpuTransitionProfile::LegacyWriterSite::WriteBlock, size};
+        PrepareLegacyWrite(GetInteger(addr), size);
         return WalkBlock(addr, size,
         [addr, size](const std::size_t offset, const std::size_t copy_amount, const Common::ProcessAddress current_vaddr) {
             LOG_ERROR(HW_Memory, "Unmapped @ {:#016x} (start address = {:#016x}, size = {})", GetInteger(current_vaddr), GetInteger(addr), size);
@@ -360,7 +504,7 @@ struct Memory::Impl {
             std::memcpy(ptr, reinterpret_cast<u8 const*>(buffer) + offset, copy_amount);
         },
         [&](const Common::ProcessAddress current_vaddr, const std::size_t offset, const std::size_t copy_amount, u8* const ptr) {
-            if (!unsafe) {
+            if (!unsafe || deferred_legacy_writers) {
                 HandleRasterizerWrite(GetInteger(current_vaddr), copy_amount);
             }
             std::memcpy(ptr, reinterpret_cast<u8 const*>(buffer) + offset, copy_amount);
@@ -368,6 +512,9 @@ struct Memory::Impl {
     }
 
     bool ZeroBlock(const Common::ProcessAddress addr, const std::size_t size) {
+        const Common::GpuTransitionProfile::LegacyWriterScope profile{
+            Common::GpuTransitionProfile::LegacyWriterSite::ZeroBlock, size};
+        PrepareLegacyWrite(GetInteger(addr), size);
         return WalkBlock(addr, size,
         [addr, size](const std::size_t offset, const std::size_t copy_amount, const Common::ProcessAddress current_vaddr) {
             LOG_ERROR(HW_Memory, "Unmapped @ {:#016x} (start address = {:#016x}, size = {})", GetInteger(current_vaddr), GetInteger(addr), size);
@@ -382,6 +529,9 @@ struct Memory::Impl {
     }
 
     bool CopyBlock(Common::ProcessAddress dest_addr, Common::ProcessAddress src_addr, const std::size_t size) {
+        const Common::GpuTransitionProfile::LegacyWriterScope profile{
+            Common::GpuTransitionProfile::LegacyWriterSite::CopyBlock, size};
+        PrepareLegacyWrite(GetInteger(dest_addr), size);
         return WalkBlock(dest_addr, size,
         [&](const std::size_t offset, const std::size_t copy_amount, const Common::ProcessAddress current_vaddr) {
             LOG_ERROR(HW_Memory, "Unmapped @ {:#016x} (start address = {:#016x}, size = {})", GetInteger(current_vaddr), GetInteger(src_addr), size);
@@ -445,7 +595,7 @@ struct Memory::Impl {
         if (current_page_table->fastmem_arena) {
             const auto perm{debug ? Common::MemoryPermission{}
                                   : Common::MemoryPermission::ReadWrite};
-            host_buffer->Protect(vaddr, size, perm);
+            ProtectHostRange(vaddr, size, perm);
         }
 
         // Iterate over a contiguous CPU address space, marking/unmarking the region.
@@ -516,7 +666,7 @@ struct Memory::Impl {
             if (!cached) {
                 perm |= Common::MemoryPermission::Write;
             }
-            host_buffer->Protect(vaddr, size, perm);
+            ProtectHostRange(vaddr, size, perm);
             if (cached && perm != Common::MemoryPermission{}) {
                 ProtectArmedPages(vaddr, size);
             }
@@ -609,7 +759,7 @@ struct Memory::Impl {
             if (run_pages > 0) {
                 // Reads that hit a cached read area must not skip the flush of a new trap.
                 read_trap_generation.fetch_add(1, std::memory_order_release);
-                host_buffer->Protect(run_begin << YUZU_PAGEBITS, run_pages << YUZU_PAGEBITS,
+                ProtectHostRange(run_begin << YUZU_PAGEBITS, run_pages << YUZU_PAGEBITS,
                                      Common::MemoryPermission{});
                 run_pages = 0;
             }
@@ -649,7 +799,7 @@ struct Memory::Impl {
         const u64 page_end = ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1;
         for (auto it = armed_read_traps.lower_bound(vaddr >> YUZU_PAGEBITS);
              it != armed_read_traps.end() && *it < page_end; ++it) {
-            host_buffer->Protect(*it << YUZU_PAGEBITS, YUZU_PAGESIZE, Common::MemoryPermission{});
+            ProtectHostRange(*it << YUZU_PAGEBITS, YUZU_PAGESIZE, Common::MemoryPermission{});
         }
     }
 
@@ -663,7 +813,7 @@ struct Memory::Impl {
         auto it = armed_read_traps.lower_bound(vaddr >> YUZU_PAGEBITS);
         while (it != armed_read_traps.end() && *it < page_end) {
             // Still cached (this read came through the rasterizer path): writes stay trapped.
-            host_buffer->Protect(*it << YUZU_PAGEBITS, YUZU_PAGESIZE,
+            ProtectHostRange(*it << YUZU_PAGEBITS, YUZU_PAGESIZE,
                                  Common::MemoryPermission::Read);
             it = armed_read_traps.erase(it);
             armed_read_trap_count.fetch_sub(1, std::memory_order_relaxed);
@@ -681,6 +831,42 @@ struct Memory::Impl {
      */
     void MapPages(Common::PageTable& page_table, Common::ProcessAddress base_address, u64 size,
                   Common::PhysicalAddress target, Common::PageType type) {
+        if (!system.DeferredWriteJournal()) {
+            MapPagesImpl(page_table, base_address, size, target, type);
+            return;
+        }
+        const auto physical = target ? std::make_optional(GetInteger(target) - DramMemoryMap::Base)
+                                     : std::nullopt;
+        const bool mapped = kernel_writes.WithMapping(GetInteger(base_address) * YUZU_PAGESIZE,
+            size * YUZU_PAGESIZE, physical,
+            [&](PAddr page) { return ReserveExcludedPhysicalPage(
+                page, Common::GpuTransitionProfile::Site::LockedAccessRemapExclude); },
+            [&] { MapPagesImpl(page_table, base_address, size, target, type); });
+        // The outer mapping transition already drained, or this is a fresh sparse identity.
+        // Waiting here would invert the kernel/mapping locks.
+        if (!mapped) UNREACHABLE_MSG("Mapping exposed a locked/native access page before Ready");
+    }
+
+    void MapPagesImpl(Common::PageTable& page_table, Common::ProcessAddress base_address, u64 size,
+                     Common::PhysicalAddress target, Common::PageType type) {
+        auto epoch_mutation = system.DeviceMemory().CpuEpochs().BeforeMutation(
+            VideoCommon::CpuEpochs::CloseReason::Mapping);
+        system.DeviceMemory().CpuMappings().WithMapping(
+            GetInteger(base_address) * YUZU_PAGESIZE, size,
+            target ? std::make_optional(GetInteger(target) - DramMemoryMap::Base) : std::nullopt,
+            [&](VAddr address) -> std::optional<PAddr> {
+                const auto pointer = page_table.entries[address >> YUZU_PAGEBITS].Pointer(true);
+                if (!pointer) return std::nullopt;
+                return system.DeviceMemory().GetRawPhysicalAddr(reinterpret_cast<u8*>(pointer + address));
+            },
+            [&] { MapPagesRaw(page_table, base_address, size, target, type); });
+    }
+
+    void MapPagesRaw(Common::PageTable& page_table, Common::ProcessAddress base_address, u64 size,
+                    Common::PhysicalAddress target, Common::PageType type) {
+        Common::GpuTransitionProfile::Record(type == Common::PageType::Unmapped
+            ? Common::GpuTransitionProfile::Site::MemoryUnmap
+            : Common::GpuTransitionProfile::Site::MemoryMap);
         auto base = GetInteger(base_address);
 
         LOG_DEBUG(HW_Memory, "Mapping {:016X} onto {:016X}-{:016X}", GetInteger(target),
@@ -828,6 +1014,9 @@ struct Memory::Impl {
     template <typename T>
     inline void Write(Common::ProcessAddress vaddr, const T data) noexcept requires(std::is_trivially_copyable_v<T>) {
         const u64 addr = GetInteger(vaddr);
+        const Common::GpuTransitionProfile::LegacyWriterScope profile{
+            Common::GpuTransitionProfile::LegacyWriterSite::Write, sizeof(T)};
+        PrepareLegacyWrite(addr, sizeof(T));
         if (auto const ptr = GetPointerImpl(addr, [addr, data]() {
             LOG_ERROR(HW_Memory, "Unmapped Write{} @ {:#016x} = {:#016x}", sizeof(T) * 8, addr, u64(data));
         }, [&]() { HandleRasterizerWrite(addr, sizeof(T)); }); ptr) [[likely]]
@@ -899,6 +1088,8 @@ struct Memory::Impl {
             }
             Common::ScratchBuffer<u32> scratch;
             gpu_device_memory->ApplyOpOnPointer(p, scratch, [&](DAddr address) {
+                VideoCommon::ComputeReleaseTrace::ObserveCpu(address, size, false, v_address,
+                    static_cast<u32>(core), "download-service-intent");
                 DisarmReadTraps(v_address, size);
                 (void)system.GPU().OnCPURead(address, size);
             });
@@ -912,6 +1103,8 @@ struct Memory::Impl {
         }
         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
             const DAddr end_address = address + size;
+            VideoCommon::ComputeReleaseTrace::ObserveCpu(address, size, false, v_address,
+                static_cast<u32>(core), "download-intent");
             if (current_area.start_address <= address && end_address <= current_area.end_address)
                 [[likely]] {
                 return;
@@ -944,6 +1137,9 @@ struct Memory::Impl {
             }
         };
         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
+            VideoCommon::GpuWriteTrace::Cpu(VideoCommon::GpuWriteTrace::Site::CpuExact, address, size);
+            VideoCommon::ComputeReleaseTrace::ObserveCpu(address, size, true, v_address,
+                static_cast<u32>(core), "write-intent");
             auto& current_area = rasterizer_write_areas[core];
             PAddr subaddress = address >> YUZU_PAGEBITS;
             // Performance note:
@@ -990,6 +1186,8 @@ struct Memory::Impl {
     }
 
     Core::System& system;
+    const bool deferred_legacy_writers{Core::DeferredWritesConfig::ProducerRequested()};
+    Core::DeferredKernelWrites kernel_writes;
     Tegra::MaxwellDeviceMemoryManager* gpu_device_memory{};
     Common::PageTable* current_page_table = nullptr;
 
@@ -1018,12 +1216,84 @@ Memory::Memory(Core::System& system_) : system{system_} {
 
 Memory::~Memory() = default;
 
+bool Memory::ValidateCpuEpochIdentity(const void* owner, VAddr address, PAddr physical, u64 generation) {
+    return impl->WithCpuEpochIdentity(owner, address, physical, generation, [](const u8*) { return true; });
+}
+bool Memory::ReprotectCpuEpoch(const void* owner, VAddr address, PAddr physical, u64 generation) {
+    return impl->WithCpuEpochIdentity(owner, address, physical, generation, [&](const u8*) {
+        if (!impl->current_page_table->fastmem_arena || !impl->host_buffer) return false;
+        impl->host_buffer->Protect(address, YUZU_PAGESIZE, Common::MemoryPermission{});
+        return impl->host_buffer->TryReprotectCpuEpoch(address, YUZU_PAGESIZE);
+    });
+}
+bool Memory::GrantCpuEpoch(const void* owner, VAddr address, PAddr physical, u64 generation) {
+    return impl->WithCpuEpochIdentity(owner, address, physical, generation, [&](const u8*) {
+        return impl->current_page_table->fastmem_arena && impl->host_buffer &&
+               impl->host_buffer->TryGrantCpuEpoch(address, YUZU_PAGESIZE);
+    });
+}
+bool Memory::CaptureCpuEpoch(const void* owner, VAddr address, PAddr physical, u64 generation,
+                             std::span<u8> destination) {
+    if (destination.size() != YUZU_PAGESIZE) return false;
+    return impl->WithCpuEpochIdentity(owner, address, physical, generation, [&](const u8* backing) {
+        std::memcpy(destination.data(), backing, destination.size());
+        return true;
+    });
+}
+
 void Memory::Reset() {
     impl = std::make_unique<Impl>(system);
 }
 
 void Memory::SetCurrentPageTable(Kernel::KProcess& process) {
     impl->SetCurrentPageTable(process);
+}
+
+void Memory::PrepareKernelWrite(VAddr address, u64 size) {
+    impl->PrepareLockedAccess(address, size, Common::GpuTransitionProfile::Site::KernelSyncPhysicalExclude);
+}
+
+void Memory::PrepareLegacyWrite(VAddr address, u64 size) {
+    const Common::GpuTransitionProfile::LegacyWriterScope profile{
+        Common::GpuTransitionProfile::LegacyWriterSite::Unknown, size};
+    if (impl->PrepareLegacyWrite(address, size) && system.DeferredWriteJournal()) {
+        // The outer caller may write through a captured linear pointer instead of WriteBlock.
+        // Keep the same cache notification as an ordinary CPU write, before taking its locks.
+        (void)impl->StoreDataCache(address, size);
+    }
+}
+
+void Memory::PrepareExclusiveAccess(VAddr address, u64 size) {
+    namespace Profile = Common::GpuTransitionProfile;
+    const u64 begin = Profile::SuspensionNowNs();
+    const bool fast = impl->kernel_writes.IsPreparedFast(address & 0xffffffffffffULL, size);
+    if (!fast)
+        impl->PrepareLockedAccess(address, size, Profile::Site::JitExclusiveExclude);
+    Profile::RecordExclusiveHook(fast, begin);
+}
+
+const std::atomic<u64>* Memory::GetExclusiveFastTable() {
+    static_assert(ExclusiveFastTableMask == Core::DeferredKernelWrites::FastTableMask);
+    return impl->kernel_writes.EnableFastTable();
+}
+
+#ifdef HAS_NCE
+void Memory::PrepareNativeFallback(VAddr address, u64 size) {
+    PrepareNativeFallback(address, size, Common::GpuTransitionProfile::DeferredFallbackReason::Count);
+}
+
+void Memory::PrepareNativeFallback(VAddr address, u64 size,
+                                  Common::GpuTransitionProfile::DeferredFallbackReason reason) {
+    impl->PrepareLockedAccess(address, size, Common::GpuTransitionProfile::Site::NceFallbackExclude, reason);
+}
+#endif
+
+bool Memory::IsKernelWritePrepared(VAddr address, u64 size) const {
+    return !system.DeferredWriteJournal() || impl->kernel_writes.IsPrepared(address & 0xffffffffffffULL, size);
+}
+
+void Memory::ClearDeferredKernelWrites() {
+    impl->kernel_writes.Clear();
 }
 
 void Memory::MapMemoryRegion(Common::PageTable& page_table, Common::ProcessAddress base, u64 size,
@@ -1219,7 +1489,24 @@ bool Memory::InvalidateNCE(Common::ProcessAddress vaddr, size_t size) {
         },
         [&] { rasterizer = true; });
     if (rasterizer) {
+#ifdef HAS_NCE
+        NceFaultStats::counts[NceFaultStats::last_class].fetch_add(1, std::memory_order_relaxed);
+        // Only POD TLS in the signal; GPU::InvalidateRegion captures this for its host callback.
+        const bool write_trace = VideoCommon::GpuWriteTrace::enabled ||
+                                 VideoCommon::GpuWriteTrace::profile_footprints;
+        const auto previous_fault = write_trace
+            ? VideoCommon::GpuWriteTrace::fault : VideoCommon::GpuWriteTrace::Fault::None;
+        if (write_trace) {
+            VideoCommon::GpuWriteTrace::fault = NceFaultStats::last_class == NceFaultStats::Read
+                ? VideoCommon::GpuWriteTrace::Fault::Read : VideoCommon::GpuWriteTrace::Fault::Store;
+        }
+#endif
         impl->InvalidateGPUMemory(ptr, size);
+#ifdef HAS_NCE
+        if (write_trace) {
+            VideoCommon::GpuWriteTrace::fault = previous_fault;
+        }
+#endif
     }
 
 #ifdef __ANDROID__

@@ -20,6 +20,7 @@ KReadableEvent::~KReadableEvent() = default;
 
 void KReadableEvent::Initialize(KernelCore& kernel, KEvent* parent) {
     m_is_signaled = false;
+    SetWaitProfile(nullptr);
     m_parent = parent;
     if (m_parent != nullptr) {
         m_parent->Open(kernel);

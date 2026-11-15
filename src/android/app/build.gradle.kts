@@ -92,6 +92,12 @@ android {
                     )
                 )
 
+                // NovaS test builds only: turn the deferred-writes switches on inside the APK.
+                arguments.add(
+                    if (System.getenv("NOVAS_DEFERRED_TEST") == "1") "-DNOVAS_DEFERRED_TEST=ON"
+                    else "-DNOVAS_DEFERRED_TEST=OFF" // never inherit a test value from the CMake cache
+                )
+
                 if (isNightly) {
                     arguments.addAll(listOf(
                         "-DENABLE_UPDATE_CHECKER=ON",

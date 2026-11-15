@@ -18,6 +18,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/div_ceil.h"
+#include "common/gpu_transition_profile.h"
 #include "common/paged_scalar.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -25,6 +26,7 @@
 #include "core/device_memory_manager.h"
 #include "core/memory.h"
 #include "video_core/nx2_perf.h"
+#include "video_core/gpu_split.h"
 
 namespace Core {
 
@@ -173,6 +175,7 @@ struct DeviceMemoryManagerAllocator {
 template <typename Traits>
 DeviceMemoryManager<Traits>::DeviceMemoryManager(const DeviceMemory& device_memory_)
     : physical_base{uintptr_t(device_memory_.buffer.BackingBasePointer())}
+    , physical_size{device_memory_.buffer.BackingSize()}
     , device_memory_ptr{&device_memory_}
     , device_inter{nullptr}
     , compressed_device_addr(1ULL << ((Settings::values.memory_layout_mode.GetValue() == Settings::MemoryLayout::Memory_4Gb ? physical_min_bits : physical_max_bits) - Memory::YUZU_PAGEBITS))
@@ -249,12 +252,61 @@ void DeviceMemoryManager<Traits>::Free(DAddr start, size_t size) {
 }
 
 template <typename Traits>
+void DeviceMemoryManager<Traits>::ExcludeCpuEpochExport(DAddr address, u64 size) const {
+    if (device_memory_ptr->CpuEpochs().Requested() && !VideoCommon::GpuSplit::OwnsScheduler()) {
+        ExcludeCpuEpochRange(address, size, VideoCommon::CpuEpochs::Exclusion::OtherConsumer);
+    }
+}
+template <typename Traits>
+void DeviceMemoryManager<Traits>::ExcludeCpuEpochRange(
+    DAddr address, u64 size, VideoCommon::CpuEpochs::Exclusion reason) const {
+    auto& epochs = device_memory_ptr->CpuEpochs();
+    if (!epochs.Requested() || !size) return;
+    static thread_local VideoCommon::CpuEpochs::DeviceExclusionCache excluded;
+    if (excluded.Contains(epochs.InstanceId(), this, address, size, reason))
+        return;
+    epochs.ExcludeDevice(this, address, size, reason);
+    std::vector<std::pair<PAddr, u64>> physical;
+    const bool valid_range = address < device_as_size && size <= device_as_size - address;
+    if (valid_range) {
+        std::scoped_lock lock{const_cast<DeviceMemoryManager*>(this)->mapping_guard};
+        for (u64 offset = 0; offset < size;) {
+            const auto part = (std::min<u64>)(size - offset, page_size - ((address + offset) & page_mask));
+            const auto* pointer = GetPointer<u8>(address + offset);
+            if (!pointer || !IsPhysicalPointer(pointer)) {
+                offset += part;
+                continue;
+            }
+            const auto page = GetRawPhysicalAddr(pointer);
+            if (!physical.empty() && physical.back().first + physical.back().second == page) {
+                physical.back().second += part;
+            } else {
+                physical.emplace_back(page, part);
+            }
+            offset += part;
+        }
+    }
+    if (!valid_range) epochs.Exclude(~u64{0}, 2, reason);
+    for (const auto& [page, bytes] : physical) epochs.Exclude(page, bytes, reason);
+    if (valid_range)
+        excluded.Remember(epochs.InstanceId(), this, address, size, reason);
+}
+template <typename Traits>
 void DeviceMemoryManager<Traits>::Map(DAddr address, VAddr virtual_address, size_t size, Asid asid,
                                       bool track) {
+    auto epoch_mutation = device_memory_ptr->CpuEpochs().BeforeMutation(
+        VideoCommon::CpuEpochs::CloseReason::Mapping);
+    std::scoped_lock lk(mapping_guard);
+    MapImpl(address, virtual_address, size, asid, track);
+}
+
+template <typename Traits>
+void DeviceMemoryManager<Traits>::MapImpl(DAddr address, VAddr virtual_address, size_t size, Asid asid,
+                                         bool track) {
+    Common::GpuTransitionProfile::Record(Common::GpuTransitionProfile::Site::DeviceMap);
     Core::Memory::Memory* process_memory = registered_processes[asid.id];
     size_t start_page_d = address >> Memory::YUZU_PAGEBITS;
     size_t num_pages = Common::AlignUp(size, Memory::YUZU_PAGESIZE) >> Memory::YUZU_PAGEBITS;
-    std::scoped_lock lk(mapping_guard);
 
     tracked_entries.CommitRegion(start_page_d, start_page_d + num_pages);
     CutContinuityAt(start_page_d);
@@ -270,6 +322,11 @@ void DeviceMemoryManager<Traits>::Map(DAddr address, VAddr virtual_address, size
         }
         auto phys_addr = static_cast<u32>(GetRawPhysicalAddr(ptr) >> Memory::YUZU_PAGEBITS) + 1U;
         tracked_entries.GetUnchecked(start_page_d + i).compressed_physical_ptr = phys_addr;
+        if (device_memory_ptr->CpuEpochs().Requested()) {
+            device_memory_ptr->CpuEpochs().ExcludeMappedDevice(
+                this, (start_page_d + i) * Memory::YUZU_PAGESIZE,
+                static_cast<PAddr>(phys_addr - 1U) * Memory::YUZU_PAGESIZE, Memory::YUZU_PAGESIZE);
+        }
         InsertCPUBacking(start_page_d + i, new_vaddress, asid);
         const u32 base_dev = compressed_device_addr[phys_addr - 1U];
         const u32 new_dev = static_cast<u32>(start_page_d + i);
@@ -291,10 +348,62 @@ void DeviceMemoryManager<Traits>::Map(DAddr address, VAddr virtual_address, size
 }
 
 template <typename Traits>
+void DeviceMemoryManager<Traits>::MapPhysicalImpl(
+    DAddr address, std::span<const DeviceMemoryPhysicalSpan> spans, size_t size) {
+    Common::GpuTransitionProfile::Record(Common::GpuTransitionProfile::Site::DeviceMap);
+    const size_t first = address >> page_bits;
+    const size_t pages = size >> page_bits;
+    tracked_entries.CommitRegion(first, first + pages);
+    CutContinuityAt(first);
+    size_t device_page = first;
+    for (const auto& span : spans) {
+        for (u64 offset = span.offset; offset < span.offset + span.size; offset += page_size) {
+            const u32 physical_page = static_cast<u32>(offset >> page_bits);
+            auto& entry = tracked_entries.GetUnchecked(device_page);
+            entry.cpu_backing_address = 0;
+            entry.continuity_tracker = 0;
+            entry.compressed_physical_ptr = physical_page + 1U;
+            if (device_memory_ptr->CpuEpochs().Requested()) {
+                device_memory_ptr->CpuEpochs().ExcludeMappedDevice(
+                    this, device_page * page_size, offset, page_size);
+            }
+            const u32 base_dev = compressed_device_addr[physical_page];
+            const u32 new_dev = static_cast<u32>(device_page++);
+            if (base_dev == 0) {
+                compressed_device_addr.GetAndFault(physical_page) = new_dev;
+                continue;
+            }
+            u32 start_id = base_dev & MULTI_MASK;
+            if ((base_dev >> MULTI_FLAG_BITS) == 0) {
+                start_id = impl->multi_dev_address.Register(base_dev);
+                compressed_device_addr.GetAndFault(physical_page) = MULTI_FLAG | start_id;
+            }
+            impl->multi_dev_address.Register(new_dev, start_id);
+        }
+    }
+    // Adjacent spans may join; fragmented pages must never become one memcpy run.
+    for (size_t page = first + pages - 1; page > first; --page) {
+        auto& previous = tracked_entries.GetUnchecked(page - 1);
+        const auto& current = tracked_entries.GetUnchecked(page);
+        if (previous.compressed_physical_ptr + 1U == current.compressed_physical_ptr) {
+            previous.continuity_tracker = current.continuity_tracker + 1U;
+        }
+    }
+    translation_generation.fetch_add(1, std::memory_order_release);
+}
+
+template <typename Traits>
 void DeviceMemoryManager<Traits>::Unmap(DAddr address, size_t size) {
+    auto epoch_mutation = device_memory_ptr->CpuEpochs().BeforeMutation(
+        VideoCommon::CpuEpochs::CloseReason::Mapping);
+    Common::GpuTransitionProfile::Record(Common::GpuTransitionProfile::Site::DeviceUnmap);
     size_t start_page_d = address >> Memory::YUZU_PAGEBITS;
     size_t num_pages = Common::AlignUp(size, Memory::YUZU_PAGESIZE) >> Memory::YUZU_PAGEBITS;
-    device_inter->InvalidateRegion(address, size);
+    // Shutdown detaches the rasterizer after its caches have been destroyed. Late mapping
+    // owners must still release translations and allocations without accessing those caches.
+    if (device_inter) {
+        device_inter->InvalidateRegion(address, size);
+    }
     std::scoped_lock lk(mapping_guard);
 
     tracked_entries.CommitRegion(start_page_d, start_page_d + num_pages); // should already be committed, but just in case
@@ -363,6 +472,7 @@ void DeviceMemoryManager<Traits>::TrackContinuityImpl(DAddr address, VAddr virtu
 }
 template <typename Traits>
 u8* DeviceMemoryManager<Traits>::GetSpan(const DAddr src_addr, const std::size_t size) {
+    ExcludeCpuEpochExport(src_addr, size);
     size_t page_index = src_addr >> page_bits;
     size_t subbits = src_addr & page_mask;
     if ((static_cast<size_t>(tracked_entries[page_index].continuity_tracker+1) << page_bits) >= size + subbits) {
@@ -373,6 +483,7 @@ u8* DeviceMemoryManager<Traits>::GetSpan(const DAddr src_addr, const std::size_t
 
 template <typename Traits>
 const u8* DeviceMemoryManager<Traits>::GetSpan(const DAddr src_addr, const std::size_t size) const {
+    ExcludeCpuEpochExport(src_addr, size);
     size_t page_index = src_addr >> page_bits;
     size_t subbits = src_addr & page_mask;
     if ((static_cast<size_t>(tracked_entries[page_index].continuity_tracker+1) << page_bits) >= size + subbits) {
@@ -420,6 +531,9 @@ const T* DeviceMemoryManager<Traits>::GetPointer(DAddr address) const {
 template <typename Traits>
 template <typename T>
 void DeviceMemoryManager<Traits>::Write(DAddr address, T value) {
+    if (device_memory_ptr->CpuEpochs().Requested() && !VideoCommon::GpuSplit::OwnsScheduler()) {
+        ExcludeCpuEpochRange(address, sizeof(T), VideoCommon::CpuEpochs::Exclusion::CapturedWriter);
+    }
     Common::WritePagedScalar(address, value, [&](DAddr page_address) {
         return page_address < device_as_size ? GetPointer<u8>(page_address) : nullptr;
     });
@@ -428,6 +542,7 @@ void DeviceMemoryManager<Traits>::Write(DAddr address, T value) {
 template <typename Traits>
 template <typename T>
 T DeviceMemoryManager<Traits>::Read(DAddr address) const {
+    ExcludeCpuEpochExport(address, sizeof(T));
     return Common::ReadPagedScalar<T>(address, [&](DAddr page_address) {
         return page_address < device_as_size ? GetPointer<u8>(page_address) : nullptr;
     });
@@ -464,6 +579,7 @@ void DeviceMemoryManager<Traits>::WalkBlock(DAddr addr, std::size_t size, auto o
 
 template <typename Traits>
 void DeviceMemoryManager<Traits>::ReadBlock(DAddr address, void* dest_pointer, size_t size) {
+    ExcludeCpuEpochExport(address, size);
     device_inter->FlushRegion(address, size);
     const std::size_t page_offset = address & Memory::YUZU_PAGEMASK;
     if (size <= Memory::YUZU_PAGESIZE - page_offset) {
@@ -508,6 +624,9 @@ void DeviceMemoryManager<Traits>::ReadBlock(DAddr address, void* dest_pointer, s
 
 template <typename Traits>
 void DeviceMemoryManager<Traits>::WriteBlock(DAddr address, const void* src_pointer, size_t size) {
+    if (device_memory_ptr->CpuEpochs().Requested() && !VideoCommon::GpuSplit::OwnsScheduler()) {
+        ExcludeCpuEpochRange(address, size, VideoCommon::CpuEpochs::Exclusion::CapturedWriter);
+    }
     WalkBlock(
         address, size,
         [&](size_t copy_amount, DAddr current_vaddr) {
@@ -530,6 +649,7 @@ void DeviceMemoryManager<Traits>::WriteBlock(DAddr address, const void* src_poin
 
 template <typename Traits>
 void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_pointer, size_t size) {
+    ExcludeCpuEpochExport(address, size);
     const std::size_t page_offset = address & Memory::YUZU_PAGEMASK;
     if (size <= Memory::YUZU_PAGESIZE - page_offset) {
         const DAddr guest_page = address & ~static_cast<DAddr>(Memory::YUZU_PAGEMASK);
@@ -574,6 +694,9 @@ void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_poin
 template <typename Traits>
 void DeviceMemoryManager<Traits>::WriteBlockUnsafe(DAddr address, const void* src_pointer,
                                                    size_t size) {
+    if (device_memory_ptr->CpuEpochs().Requested() && !VideoCommon::GpuSplit::OwnsScheduler()) {
+        ExcludeCpuEpochRange(address, size, VideoCommon::CpuEpochs::Exclusion::CapturedWriter);
+    }
     WalkBlock(
         address, size,
         [&](size_t copy_amount, DAddr current_vaddr) {

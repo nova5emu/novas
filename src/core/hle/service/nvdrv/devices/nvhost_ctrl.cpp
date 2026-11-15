@@ -11,6 +11,7 @@
 
 #include <fmt/ranges.h>
 #include "common/assert.h"
+#include "common/guest_thread_profile.h"
 #include "common/logging.h"
 #include "common/scope_exit.h"
 #include "core/core.h"
@@ -190,6 +191,9 @@ NvResult nvhost_ctrl::IocCtrlEventWait(IocCtrlEventWaitParams& params, bool is_a
     event.status.store(EventState::Waiting, std::memory_order_release);
     event.assigned_syncpt = fence_id;
     event.assigned_value = target_value;
+    if (Common::GuestThreadProfile::Enabled()) {
+        event.kevent->GetReadableEvent().SetWaitProfile("nvhost_syncpoint", fence_id, target_value);
+    }
     if (is_allocation) {
         params.value.syncpoint_id_for_allocation.Assign(static_cast<u16>(fence_id));
         params.value.event_allocated.Assign(1);

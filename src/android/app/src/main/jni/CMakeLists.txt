@@ -33,6 +33,11 @@ if (ENABLE_UPDATE_CHECKER)
     target_compile_definitions(yuzu-android PUBLIC ENABLE_UPDATE_CHECKER)
 endif()
 
+# NovaS test APKs: deferred writes on (see native.cpp).
+if (NOVAS_DEFERRED_TEST)
+    target_compile_definitions(yuzu-android PRIVATE NOVAS_DEFERRED_TEST)
+endif()
+
 set(CPACK_PACKAGE_EXECUTABLES ${CPACK_PACKAGE_EXECUTABLES} yuzu-android)
 
 target_link_options(yuzu-android PRIVATE "-Wl,-Bsymbolic")

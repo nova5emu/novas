@@ -4,10 +4,13 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/gpu_transition_profile.h"
+#include "core/core.h"
 #include "core/hle/kernel/k_light_server_session.h"
 #include "core/hle/kernel/k_light_session.h"
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/k_thread_queue.h"
+#include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/svc_results.h"
 
 namespace Kernel {
@@ -107,6 +110,7 @@ Result KLightServerSession::OnRequest(KernelCore& kernel, KThread* request_threa
         // Begin waiting on the request.
         request_thread->SetWaitReasonForDebugging(ThreadWaitReasonForDebugging::IPC);
         request_thread->BeginWait(kernel, std::addressof(wait_queue));
+        request_thread->ProfileWait("ipc_reply", reinterpret_cast<uintptr_t>(this));
 
         // If we have a server thread, end its wait.
         if (m_server_thread != nullptr) {
@@ -126,6 +130,10 @@ Result KLightServerSession::ReplyAndReceive(KernelCore& kernel, u32* data) {
 
     // Reply, if we need to.
     if (data[0] & KLightSession::ReplyFlag) {
+        // Closing the request can finalize its thread. Do not retain the suspension while
+        // waiting for the next request below.
+        [[maybe_unused]] auto transition = kernel.System().BeginDeferredTransition(
+            Common::GpuTransitionProfile::SuspensionSite::IpcCleanup);
         KScopedSchedulerLock sl(kernel);
 
         // Check that we're open.
@@ -204,6 +212,7 @@ Result KLightServerSession::ReplyAndReceive(KernelCore& kernel, u32* data) {
             m_server_thread = GetCurrentThreadPointer(kernel);
             GetCurrentThread(kernel).SetWaitReasonForDebugging(ThreadWaitReasonForDebugging::IPC);
             GetCurrentThread(kernel).BeginWait(kernel, std::addressof(wait_queue));
+            GetCurrentThread(kernel).ProfileWait("ipc_receive", reinterpret_cast<uintptr_t>(this));
         }
 
         // We waited to receive a request; if our wait failed, return the failing result.
@@ -212,6 +221,8 @@ Result KLightServerSession::ReplyAndReceive(KernelCore& kernel, u32* data) {
 }
 
 void KLightServerSession::CleanupRequests(KernelCore& kernel) {
+    [[maybe_unused]] auto transition = kernel.System().BeginDeferredTransition(
+        Common::GpuTransitionProfile::SuspensionSite::IpcCleanup);
     // Cleanup all pending requests.
     {
         KScopedSchedulerLock sl(kernel);

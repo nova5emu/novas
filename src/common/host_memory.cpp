@@ -56,6 +56,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <limits>
 #include <random>
 #include <utility>
 #include <vector>
@@ -748,6 +749,27 @@ public:
         ASSERT_MSG(ret == 0, "mprotect failed: {}", strerror(errno));
     }
 
+    bool TryReprotectCpuEpoch(size_t virtual_offset, size_t length, bool writable = false) {
+#if defined(__linux__)
+        if (host_page_size != PageAlignment || page_states || length != PageAlignment ||
+            virtual_offset % PageAlignment != 0) {
+            return false;
+        }
+        std::unique_lock lock{page_states_mutex};
+        const auto original = virtual_offset;
+        AdjustMap(&virtual_offset, &length);
+        if (virtual_offset != original || length != PageAlignment) {
+            return false;
+        }
+        return mprotect(reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(virtual_base) +
+                                                virtual_offset), length, writable ? PROT_READ | PROT_WRITE : PROT_NONE) == 0;
+#else
+        static_cast<void>(virtual_offset);
+        static_cast<void>(length);
+        static_cast<void>(writable);
+        return false;
+#endif
+    }
     void EnableDirectMappedAddress() {
         virtual_base = nullptr;
     }
@@ -1023,6 +1045,36 @@ void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission 
 #endif
 }
 
+bool HostMemory::TryReprotectCpuEpoch(size_t virtual_offset, size_t length) {
+#if defined(__linux__) && !defined(__OPENORBIS__) && !defined(__managarm__)
+    if (!impl || !virtual_base || fallback_buffer || length != PageAlignment ||
+        virtual_offset % PageAlignment != 0 || virtual_offset > virtual_size ||
+        length > virtual_size - virtual_offset ||
+        virtual_offset > std::numeric_limits<size_t>::max() - virtual_base_offset) {
+        return false;
+    }
+    return impl->TryReprotectCpuEpoch(virtual_offset + virtual_base_offset, length);
+#else
+    static_cast<void>(virtual_offset);
+    static_cast<void>(length);
+    return false;
+#endif
+}
+bool HostMemory::TryGrantCpuEpoch(size_t virtual_offset, size_t length) {
+#if defined(__linux__) && !defined(__OPENORBIS__) && !defined(__managarm__)
+    if (!impl || !virtual_base || fallback_buffer || length != PageAlignment ||
+        virtual_offset % PageAlignment != 0 || virtual_offset > virtual_size ||
+        length > virtual_size - virtual_offset ||
+        virtual_offset > std::numeric_limits<size_t>::max() - virtual_base_offset) {
+        return false;
+    }
+    return impl->TryReprotectCpuEpoch(virtual_offset + virtual_base_offset, length, true);
+#else
+    static_cast<void>(virtual_offset);
+    static_cast<void>(length);
+    return false;
+#endif
+}
 void HostMemory::HintCold(size_t physical_offset, size_t length,
                           std::optional<size_t> virtual_offset) const {
     if (length == 0 || backing_base == nullptr) {

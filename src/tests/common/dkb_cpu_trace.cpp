@@ -9,6 +9,8 @@
 
 #include "common/dkb_cpu_trace.h"
 #include "common/dkb_frame_trace.h"
+#include "common/guest_thread_profile.h"
+#include "common/guest_handoff_profile.h"
 
 namespace {
 using namespace Common::DkbCpuTrace;
@@ -158,4 +160,207 @@ TEST_CASE("Thread CPU snapshots serialize against unregister", "[common][dkb_cpu
     REQUIRE(unavailable.load() == 0);
 #endif
     REQUIRE_FALSE(ReadSnapshot().threads[static_cast<size_t>(Role::GpuBack)].active);
+}
+
+TEST_CASE("Guest thread timelines charge open waits through each reporting boundary",
+          "[common][guest_thread_profile]") {
+    using Common::GuestThreadProfile::Timeline;
+    Timeline timeline;
+    timeline.cursor_ns = 100;
+    timeline.state = 1;
+    CHECK(timeline.Advance(150) == 50);
+    CHECK(timeline.blocked_ns == 50);
+    timeline.ClearWindow();
+    CHECK(timeline.cursor_ns == 150);
+    CHECK(timeline.Advance(140) == 0);
+    CHECK(timeline.cursor_ns == 150);
+    CHECK(timeline.Advance(230) == 80);
+    CHECK(timeline.blocked_ns == 80);
+    timeline.state = 2;
+    CHECK(timeline.Advance(280) == 0);
+    CHECK(timeline.runnable_ns == 50);
+    timeline.scheduled = true;
+    CHECK(timeline.Advance(400) == 0);
+    CHECK(timeline.scheduled_wall_ns == 120);
+    CHECK(timeline.blocked_ns == 80);
+    CHECK(timeline.runnable_ns == 50);
+}
+
+TEST_CASE("Guest thread timelines distinguish dormant and terminated time from scheduled wall time",
+          "[common][guest_thread_profile]") {
+    using Common::GuestThreadProfile::Timeline;
+    Timeline timeline;
+    timeline.cursor_ns = 100;
+    timeline.state = 4;
+    CHECK(timeline.Advance(180) == 80);
+    timeline.state = 3;
+    CHECK(timeline.Advance(250) == 0);
+    CHECK(timeline.blocked_ns == 80);
+    timeline.state = 1;
+    timeline.scheduled = true;
+    timeline.Advance(300);
+    CHECK(timeline.scheduled_wall_ns == 50);
+    CHECK(timeline.blocked_ns == 80);
+}
+
+TEST_CASE("Guest thread CPU accounting preserves live baselines across windows and rejects clock gaps",
+          "[common][guest_thread_profile]") {
+    using Common::GuestThreadProfile::Timeline;
+    Timeline timeline;
+    timeline.cpu_baseline = 1000;
+    CHECK(timeline.ChargeCpu(1100));
+    CHECK(timeline.host_cpu_ns == 100);
+    timeline.ClearWindow();
+    CHECK(timeline.cpu_baseline == 1100);
+    CHECK(timeline.ChargeCpu(1170));
+    CHECK(timeline.host_cpu_ns == 70);
+    CHECK_FALSE(timeline.ChargeCpu(std::nullopt));
+    CHECK_FALSE(timeline.cpu_baseline);
+    CHECK_FALSE(timeline.ChargeCpu(2000));
+    CHECK(timeline.host_cpu_ns == 70);
+    CHECK(timeline.ChargeCpu(2010));
+    CHECK(timeline.host_cpu_ns == 80);
+    CHECK_FALSE(timeline.ChargeCpu(10));
+    CHECK(timeline.host_cpu_ns == 80);
+    timeline.cpu_baseline = 7000;
+    CHECK(timeline.ChargeCpu(7030));
+    CHECK(timeline.host_cpu_ns == 110);
+}
+
+TEST_CASE("Authoritative role ownership survives an omitted scheduler registry update",
+          "[common][guest_thread_profile]") {
+    using namespace Common::GuestThreadProfile;
+    RoleOwner owner;
+    const u64 original = owner.Publish(64, 100, 1000, 3);
+    Timeline stale;
+    stale.cursor_ns = 100;
+    stale.state = 1;
+    stale.scheduled = true;
+    stale.cpu_baseline = 1000;
+    owner.Publish(0, 200, 1050, 3);
+    owner.Publish(72, 300, 1100, 3);
+    const auto current = owner.Read();
+    REQUIRE(current);
+    CHECK(current->tid == 72);
+    CHECK(current->sequence > original);
+    CHECK(current->wall_ns == 300);
+    CHECK(current->clock_generation == 3);
+    CHECK(current->cpu_ns == 1100);
+    stale.ReconcileOwnership(current->wall_ns, 500, current->tid == 64);
+    CHECK_FALSE(stale.scheduled);
+    CHECK_FALSE(stale.wall_complete);
+    CHECK_FALSE(stale.cpu_baseline);
+    CHECK(stale.unknown_wall_ns == 200);
+    CHECK(stale.Advance(500) == 200);
+    CHECK(stale.scheduled_wall_ns == 0);
+    CHECK(stale.blocked_ns == 200);
+    stale.ClearWindow();
+    stale.Advance(5500);
+    CHECK(stale.scheduled_wall_ns == 0);
+    CHECK(stale.blocked_ns == 5000);
+    CHECK(stale.host_cpu_ns == 0);
+}
+
+TEST_CASE("Recovered owner gaps preserve uncertainty instead of inventing CPU or wall categories",
+          "[common][guest_thread_profile]") {
+    using namespace Common::GuestThreadProfile;
+    Timeline timeline;
+    timeline.cursor_ns = 100;
+    timeline.state = 2;
+    timeline.Advance(200);
+    timeline.ReconcileOwnership(300, 500, true);
+    CHECK(timeline.unknown_wall_ns == 200);
+    CHECK(timeline.runnable_ns == 0);
+    CHECK_FALSE(timeline.wall_complete);
+    timeline.Advance(500);
+    CHECK(timeline.scheduled_wall_ns == 200);
+    CHECK_FALSE(timeline.ChargeCpu(9000));
+    CHECK(timeline.host_cpu_ns == 0);
+    timeline.ReconcileOwnership(250, 600, false);
+    CHECK(timeline.cursor_ns == 500);
+    CHECK(timeline.unknown_wall_ns == 400);
+    CHECK(timeline.scheduled_wall_ns == 0);
+    CHECK_FALSE(timeline.cpu_baseline);
+}
+TEST_CASE("Guest handoff timeline preserves first stages and rejects reversed time", "[common][guest_handoff_profile]") {
+    using Common::GuestHandoffProfile::Timeline;
+    Timeline t;
+    t.pending = true;
+    t.Stamp(0, 10);
+    t.Stamp(1, 20);
+    t.Stamp(1, 30);
+    REQUIRE(t.ns[1] == 20);
+    t.Stamp(6, 100);
+    REQUIRE(t.Ordered());
+    REQUIRE(t.ns[2] == 0);
+    t.Stamp(3, 15);
+    REQUIRE_FALSE(t.Ordered());
+    t.Cancel();
+    REQUIRE_FALSE(t.pending);
+    REQUIRE(t.ns[6] == 0);
+    t.Stamp(0, 100);
+    t.Stamp(6, 200);
+    t.invalid = true;
+    REQUIRE_FALSE(t.Ordered());
+}
+
+TEST_CASE("Guest handoff does not mix core selections or aborted NCE entries", "[common][guest_handoff_profile]") {
+    using Common::GuestHandoffProfile::Timeline;
+    Timeline t;
+    t.Stamp(0, 10);
+    t.Stage(2, 1, 20);
+    t.Stage(3, 1, 30);
+    t.Stage(5, 1, 40);
+    t.Stage(5, 1, 60);
+    t.Stamp(6, 70);
+    REQUIRE(t.ns[5] == 60);
+    REQUIRE(t.Ordered());
+    t.Stage(2, 2, 80);
+    REQUIRE_FALSE(t.Ordered());
+    t.Cancel();
+    REQUIRE(t.chosen_core == ~0U);
+    REQUIRE_FALSE(t.invalid);
+    t.Stage(2, 1, 100);
+    t.Stage(4, 2, 110);
+    REQUIRE_FALSE(t.Ordered());
+}
+
+TEST_CASE("Guest handoff ring bounds loss and preserves order across wrap", "[common][guest_handoff_profile]") {
+    Common::GuestHandoffProfile::CompletionRing<u64, 2> ring;
+    u64 value = 0;
+    REQUIRE_FALSE(ring.Pop(value));
+    REQUIRE(ring.Push(1));
+    REQUIRE(ring.Push(2));
+    REQUIRE_FALSE(ring.Push(3));
+    REQUIRE(ring.Available() == 2);
+    REQUIRE(ring.Pop(value));
+    REQUIRE(value == 1);
+    REQUIRE(ring.Push(4));
+    REQUIRE(ring.Pop(value));
+    REQUIRE(value == 2);
+    REQUIRE(ring.Pop(value));
+    REQUIRE(value == 4);
+    REQUIRE_FALSE(ring.Pop(value));
+    ring.Push(5);
+    ring.Reset();
+    REQUIRE_FALSE(ring.Pop(value));
+}
+
+TEST_CASE("Guest handoff captured entry timestamp excludes later host processing", "[common][guest_handoff_profile]") {
+    Common::GuestHandoffProfile::Timeline t;
+    t.Stamp(0, 100);
+    t.Stage(2, 1, 200);
+    t.Stage(5, 1, 300);
+    t.Stamp(6, 900);
+    t.Complete(400);
+    REQUIRE(t.ns[6] == 400);
+    REQUIRE(t.ns[6] - t.ns[0] == 300);
+    REQUIRE(t.Ordered());
+    t.Stage(2, 2, 950);
+    REQUIRE(t.migrated);
+    REQUIRE_FALSE(t.Ordered());
+    t.Cancel();
+    REQUIRE_FALSE(t.migrated);
+    t.Complete(0);
+    REQUIRE_FALSE(t.Ordered());
 }

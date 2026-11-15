@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <thread>
 #include "common/scope_exit.h"
+#include "common/guest_handoff_profile.h"
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/debugger/debugger.h"
@@ -107,6 +108,10 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
 
             ExitContext();
         }
+
+#ifdef HAS_NCE
+        interface->CompleteHostOperations(thread);
+#endif
 
         // Determine why we stopped.
         // If a step completed successfully, skip other halt reason handlers
@@ -251,7 +256,9 @@ void PhysicalCore::Idle(KernelCore& kernel) {
         }
     }
     std::unique_lock lk{m_guard};
+    Common::GuestHandoffProfile::CoreIdle(static_cast<u32>(m_core_index), true);
     m_on_interrupt.wait(lk, [this] { return m_is_interrupted.load(); });
+    Common::GuestHandoffProfile::CoreIdle(static_cast<u32>(m_core_index), false);
 }
 
 bool PhysicalCore::IsInterrupted() const {
@@ -259,6 +266,7 @@ bool PhysicalCore::IsInterrupted() const {
 }
 
 void PhysicalCore::Interrupt() {
+    Common::GuestHandoffProfile::CoreInterrupt(static_cast<u32>(m_core_index));
     // Lock core context.
     std::scoped_lock lk{m_guard};
 
@@ -279,6 +287,11 @@ void PhysicalCore::Interrupt() {
 
     // Interrupt the CPU.
     arm_interface->SignalInterrupt(thread);
+}
+
+bool PhysicalCore::TryNativeQuiescence() noexcept {
+    std::unique_lock lock{m_guard, std::try_to_lock};
+    return lock.owns_lock() && m_arm_interface == nullptr;
 }
 
 void PhysicalCore::ClearInterrupt() {

@@ -26,8 +26,10 @@ class Memory;
 class InterpreterVisitor final : public VisitorBase {
 public:
     explicit InterpreterVisitor(Core::Memory::Memory& memory, std::span<u64, 31> regs,
-                                std::span<u128, 32> fpsimd_regs, u64& sp, const u64& pc)
-        : m_memory(memory), m_regs(regs), m_fpsimd_regs(fpsimd_regs), m_sp(sp), m_pc(pc) {}
+                                std::span<u128, 32> fpsimd_regs, u64& sp, const u64& pc,
+                                bool prepare_native_access = false)
+        : m_memory(memory), m_regs(regs), m_fpsimd_regs(fpsimd_regs), m_sp(sp), m_pc(pc),
+          m_prepare_native_access{prepare_native_access} {}
     ~InterpreterVisitor() override = default;
 
     enum class MemOp {
@@ -98,12 +100,25 @@ public:
                         Vec Vt) override;
 
 private:
+    void PrepareMemory(u64 address, u64 size) {
+        if (m_prepare_native_access) {
+            m_memory.PrepareNativeFallback(address, size);
+        }
+    }
+
     Core::Memory::Memory& m_memory;
     std::span<u64, 31> m_regs;
     std::span<u128, 32> m_fpsimd_regs;
     u64& m_sp;
     const u64& m_pc;
+    bool m_prepare_native_access{};
 };
+
+// Host continuation overload: prepare the exact data range before accessing guest backing.
+std::optional<u64> MatchAndExecuteOneInstruction(Core::Memory::Memory& memory,
+                                                 std::span<u64, 31> regs,
+                                                 std::span<u128, 32> vectors, u64& sp,
+                                                 const u64& pc, bool prepare_native_access);
 
 std::optional<u64> MatchAndExecuteOneInstruction(Core::Memory::Memory& memory, mcontext_t* context,
                                                  fpsimd_context* fpsimd_context);

@@ -41,6 +41,10 @@ class UpdateDescriptorQueue final {
     static constexpr size_t FRAMES_IN_FLIGHT = 8;
 
 public:
+    struct TraceBuffer {
+        u64 entry, buffer, offset, size, address;
+    };
+    const std::vector<TraceBuffer>& TraceBuffers() const { return trace_buffers; }
     static constexpr size_t GUEST_FRAME_PAYLOAD_SIZE = 0x80000;
     static constexpr size_t COMPUTE_FRAME_PAYLOAD_SIZE = 0x20000;
 
@@ -81,6 +85,9 @@ public:
     }
 
     void AddBuffer(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size) {
+        if (HangTrace::ResourcesEnabled()) {
+            trace_buffers.push_back({UpdateCount(), HangTrace::Handle(buffer), offset, size, 0});
+        }
         *(payload_cursor++) = VkDescriptorBufferInfo{
             .buffer = buffer,
             .offset = offset,
@@ -93,6 +100,11 @@ public:
         if (!use_descriptor_buffer) {
             AddBuffer(buffer, offset, size);
             return;
+        }
+        if (HangTrace::ResourcesEnabled()) {
+            trace_buffers.push_back({UpdateCount(), HangTrace::Handle(buffer), offset,
+                                     base_address == 0 ? VK_WHOLE_SIZE : size,
+                                     base_address == 0 ? 0 : base_address + offset});
         }
         *(payload_cursor++) = DescriptorAddress{
             .address = base_address == 0 ? 0 : base_address + offset,
@@ -119,6 +131,7 @@ public:
     }
 
 private:
+    std::vector<TraceBuffer> trace_buffers;
     const Device& device;
     const size_t frame_payload_size;
     const bool supports_descriptor_buffer;

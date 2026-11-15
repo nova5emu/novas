@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <deque>
+#include <functional>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -26,6 +27,7 @@
 #include <queue>
 
 #include "common/common_types.h"
+#include "video_core/cpu_epoch_coordinator.h"
 #include "common/spin_recursive_mutex.h"
 #include "common/hash.h"
 #include "common/literals.h"
@@ -38,6 +40,7 @@
 #include "video_core/compatible_formats.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/delayed_destruction_ring.h"
+#include "video_core/deferred_consumer.h"
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/game_dlss_status.h"
 #include "video_core/surface.h"
@@ -224,6 +227,14 @@ public:
 
     explicit TextureCache(Runtime&, Tegra::MaxwellDeviceMemoryManager&);
 
+    void SetDeferredWriteJournal(
+        DeferredWrites::Journal* journal, std::function<void(DeferredWrites::Cut)> apply,
+        std::function<void(std::span<const DeferredWrites::TransitionRange>)> prepare_upload) {
+        deferred_writes = journal;
+        deferred_apply = std::move(apply);
+        deferred_prepare_upload = std::move(prepare_upload);
+    }
+
     /// Notify the cache that a new frame has been queued
     void TickFrame();
 
@@ -341,6 +352,7 @@ public:
 
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(DAddr addr, size_t size);
+    [[nodiscard]] bool IsRegionRegistered(DAddr addr, size_t size);
 
     [[nodiscard]] bool IsRescaling() const noexcept;
 
@@ -536,9 +548,28 @@ private:
     void QueueAsyncUnswizzle(Image& image, ImageId image_id);
     void TickAsyncUnswizzle();
 
+    std::vector<DeferredWrites::TransitionRange> DeferredUploadRanges(GPUVAddr address, u64 size);
+    void ApplyDeferredConsumerCut(DeferredWrites::Cut cut) {
+        if (!deferred_apply) UNREACHABLE_MSG("Texture consumer requires its scheduler-owner sink");
+        deferred_apply(cut);
+    }
+    void PrepareDeferredUpload(std::span<const DeferredWrites::TransitionRange> ranges) {
+        for (const auto& range : ranges) {
+            if (range.space == DeferredWrites::TransitionSpace::Device) {
+                device_memory.ExcludeCpuEpochRange(range.address, range.size, CpuEpochs::Exclusion::Texture);
+            }
+        }
+        if (!deferred_writes || ranges.empty()) return;
+        if (!deferred_prepare_upload) UNREACHABLE_MSG("Texture upload requires buffer preservation");
+        deferred_prepare_upload(ranges);
+    }
+
     Runtime& runtime;
 
     Tegra::MaxwellDeviceMemoryManager& device_memory;
+    DeferredWrites::Journal* deferred_writes{};
+    std::function<void(DeferredWrites::Cut)> deferred_apply;
+    std::function<void(std::span<const DeferredWrites::TransitionRange>)> deferred_prepare_upload;
     std::deque<TextureCacheGPUMap> gpu_page_table_storage;
 
     RenderTargets render_targets;
@@ -672,6 +703,7 @@ private:
     u64 modification_tick = 0;
     bool use_alias_modification_ticks = false;
     u64 frame_tick = 0;
+    u64 memory_snapshot_ns = 0;
 
     Common::ThreadWorker texture_decode_worker{1, "TextureDecoder", {},
                                                Common::ThreadPlacement::Efficiency};

@@ -57,6 +57,9 @@ public:
              bool is_separate_heap);
     void Unmap(size_t virtual_offset, size_t size, bool is_separate_heap);
     void Protect(size_t virtual_offset, size_t length, MemoryPermission perm);
+    // Opening splits the separate mapping before checking this exact guest-page range.
+    bool TryReprotectCpuEpoch(size_t virtual_offset, size_t length = 0x1000);
+    bool TryGrantCpuEpoch(size_t virtual_offset, size_t length = 0x1000);
     u8* VirtualBasePointer() {
         return m_buffer.VirtualBasePointer();
     }

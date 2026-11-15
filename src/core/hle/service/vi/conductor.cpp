@@ -75,7 +75,7 @@ void Conductor::UnlinkVsyncEvent(u64 display_id, Event* event) {
 
 void Conductor::ProcessVsync() {
     Common::PollThreadPolicies();
-    Common::ADPF::SetTargetWorkDuration(std::chrono::nanoseconds{this->GetFramePeriodNs()});
+    Common::ADPF::SetTargetWorkDuration(std::chrono::nanoseconds{16'666'667});
 
     for (auto& [display_id, manager] : m_vsync_managers) {
         m_container.ComposeOnDisplay(&m_swap_interval, &m_compose_speed_scale, display_id);

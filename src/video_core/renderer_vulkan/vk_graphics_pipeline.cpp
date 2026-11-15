@@ -803,6 +803,9 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                 return;
             }
             cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline);
+            if (HangTrace::Enabled()) {
+                HangTrace::Bind(false, HangTrace::Handle(*pipeline), key.Hash());
+            }
         }
         const VkShaderStageFlags push_stages =
             IsMeshPipeline() ? VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_TASK_BIT_EXT |

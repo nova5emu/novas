@@ -5,6 +5,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <random>
+#include <boost/container/small_vector.hpp>
+#include "common/gpu_transition_profile.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
@@ -127,6 +129,9 @@ void GenerateRandom(std::span<u64> out_random) {
 } // namespace
 
 void KProcess::Finalize(KernelCore& kernel) {
+    const auto deferred_transition = kernel.System().BeginDeferredTransition(
+        Common::GpuTransitionProfile::SuspensionSite::ProcessFinalize);
+    Common::GpuTransitionProfile::Record(Common::GpuTransitionProfile::Site::ProcessFinalize);
     // Delete the process local region.
     this->DeleteThreadLocalRegion(kernel, m_plr_address);
 
@@ -135,6 +140,7 @@ void KProcess::Finalize(KernelCore& kernel) {
 
     // Finalize the page table.
     m_page_table.Finalize();
+    m_memory.ClearDeferredKernelWrites();
 
     // Finish using our system resource.
     if (m_system_resource) {
@@ -510,6 +516,8 @@ void KProcess::FinishTermination(KernelCore& kernel) {
 }
 
 void KProcess::Exit(KernelCore& kernel) {
+    auto deferred_transition = kernel.System().BeginDeferredTransition(
+        Common::GpuTransitionProfile::SuspensionSite::ProcessFinalize);
     // Determine whether we need to start terminating
     bool needs_terminate = false;
     {
@@ -535,6 +543,7 @@ void KProcess::Exit(KernelCore& kernel) {
     }
 
     // Exit the current thread.
+    deferred_transition.reset();
     GetCurrentThread(kernel).Exit(kernel);
 }
 
@@ -979,6 +988,7 @@ Result KProcess::Run(KernelCore& kernel, s32 priority, size_t stack_size) {
     // Initialize the thread.
     R_TRY(KThread::InitializeUserThread(kernel.System(), main_thread, this->GetEntryPoint(), 0,
                                         stack_top, priority, m_ideal_core_id, this));
+    main_thread->m_profile_main_thread = true;
 
     // Register the thread, and commit our reservation.
     KThread::Register(kernel, main_thread);
@@ -1146,25 +1156,18 @@ Result KProcess::GetThreadList(KernelCore& kernel, s32* out_num_threads, KProces
                                s32 max_out_count) {
     auto& memory = this->GetMemory();
 
-    // Lock the list.
-    KScopedLightLock lk(m_list_lock);
-
-    // Iterate over the list.
+    boost::container::small_vector<u64, 32> ids;
     s32 count = 0;
-    auto end = this->GetThreadList().end();
-    for (auto it = this->GetThreadList().begin(); it != end; ++it) {
-        // If we're within array bounds, write the id.
-        if (count < max_out_count) {
-            // Get the thread id.
-            KThread* thread = std::addressof(*it);
-            const u64 id = thread->GetId();
-
-            // Copy the id to userland.
-            memory.Write64(out_thread_ids + count * sizeof(u64), id);
+    {
+        KScopedLightLock lk(m_list_lock);
+        for (auto& thread : this->GetThreadList()) {
+            if (count < max_out_count) ids.push_back(thread.GetId());
+            ++count;
         }
-
-        // Increment the count.
-        ++count;
+    }
+    // Guest writes may need a deferred prefix; never wait for it under m_list_lock.
+    for (size_t i = 0; i < ids.size(); ++i) {
+        memory.Write64(out_thread_ids + i * sizeof(u64), ids[i]);
     }
 
     // We successfully iterated the list.
@@ -1277,6 +1280,8 @@ Result KProcess::LoadFromMetadata(KernelCore& kernel, const FileSys::ProgramMeta
 }
 
 void KProcess::LoadModule(KernelCore& kernel, CodeSet code_set, KProcessAddress base_addr) {
+    const auto deferred_transition = kernel.System().BeginDeferredTransition(
+        Common::GpuTransitionProfile::SuspensionSite::Loader);
     const auto ReprotectSegment = [&](const CodeSet::Segment& segment, Svc::MemoryPermission permission) {
         m_page_table.SetProcessMemoryPermission(segment.addr + base_addr, segment.size, permission);
     };

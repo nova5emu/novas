@@ -4,9 +4,12 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <fmt/format.h>
+
 #include "common/assert.h"
 #include "common/common_types.h"
 #include "common/scratch_buffer.h"
+#include "core/hle/kernel/k_readable_event.h"
 #include "core/hle/kernel/k_scheduler.h"
 #include "core/hle/kernel/k_scoped_scheduler_lock_and_sleep.h"
 #include "core/hle/kernel/k_synchronization_object.h"
@@ -137,6 +140,21 @@ Result KSynchronizationObject::Wait(KernelCore& kernel, s32* out_index,
         wait_queue.SetHardwareTimer(timer);
         thread->BeginWait(kernel, std::addressof(wait_queue));
         thread->SetWaitReasonForDebugging(ThreadWaitReasonForDebugging::Synchronization);
+        if (Common::GuestThreadProfile::Enabled()) {
+            std::string wait_objects;
+            for (s32 i = 0; i < num_objects; ++i) {
+                auto* object = objects[i];
+                const auto* event = object->DynamicCast<KReadableEvent*>();
+                const char* tag = event ? event->GetWaitProfileReason() : nullptr;
+                wait_objects += fmt::format("{}{}@{:#x}:{}:{}:{}", i ? "," : "",
+                    object->GetTypeName(), reinterpret_cast<uintptr_t>(object), tag ? tag : "generic",
+                    event ? event->GetWaitProfileDetail() : 0,
+                    event ? event->GetWaitProfileTarget() : 0);
+            }
+            const auto reason = fmt::format("wait_any[{}]", wait_objects);
+            thread->ProfileWait(reason.c_str(), num_objects ? reinterpret_cast<uintptr_t>(objects[0]) : 0,
+                                static_cast<u64>(num_objects));
+        }
     }
 
     // Set the output index.

@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <memory>
 #include <optional>
@@ -19,6 +20,9 @@
 #include "core/hle/result.h"
 
 namespace Common {
+namespace GpuTransitionProfile {
+enum class DeferredFallbackReason : size_t;
+}
 enum class MemoryPermission : u32;
 struct PageTable;
 } // namespace Common
@@ -63,6 +67,12 @@ class Memory {
 public:
     explicit Memory(Core::System& system);
     ~Memory();
+    bool ValidateCpuEpochIdentity(const void* owner, VAddr address, PAddr physical,
+                                  u64 generation);
+    bool GrantCpuEpoch(const void* owner, VAddr address, PAddr physical, u64 generation);
+    bool ReprotectCpuEpoch(const void* owner, VAddr address, PAddr physical, u64 generation);
+    bool CaptureCpuEpoch(const void* owner, VAddr address, PAddr physical, u64 generation,
+                         std::span<u8> destination);
 
     Memory(const Memory&) = delete;
     Memory& operator=(const Memory&) = delete;
@@ -83,6 +93,27 @@ public:
      * @param process The process to use the page table of.
      */
     void SetCurrentPageTable(Kernel::KProcess& process);
+
+    /// Before kernel/monitor locks: permanently exclude these synchronization VA pages and
+    /// all physical identities they acquire from B until process finalization. Off is a no-op.
+    void PrepareKernelWrite(VAddr address, u64 size);
+    /// JIT pre-exclusive callback, BEFORE the global monitor. Uses the same permanent roles.
+    void PrepareExclusiveAccess(VAddr address, u64 size);
+    /// HLE/audio writes: prepare before outer locks or exposing a writable pointer.
+    /// Excludes this VA and all its physical identities until process teardown.
+    void PrepareLegacyWrite(VAddr address, u64 size);
+    static constexpr u64 ExclusiveFastTableMask = (1u << 18) - 1;
+    /// Stable tagged cache for JIT guards; allocated only for the explicit producer mode.
+    const std::atomic<u64>* GetExclusiveFastTable();
+#ifdef HAS_NCE
+    /// Host continuation only, before reexecuting a fault through the original NCE path.
+    void PrepareNativeFallback(VAddr address, u64 size);
+    void PrepareNativeFallback(VAddr address, u64 size,
+                               Common::GpuTransitionProfile::DeferredFallbackReason reason);
+#endif
+    [[nodiscard]] bool IsKernelWritePrepared(VAddr address, u64 size) const;
+    /// Finalization only, after page-table teardown under its outer Ready transition.
+    void ClearDeferredKernelWrites();
 
     /**
      * Maps an allocated buffer onto a region of the emulated process address space.

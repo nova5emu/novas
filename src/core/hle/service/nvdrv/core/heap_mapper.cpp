@@ -3,20 +3,24 @@
 
 #include <mutex>
 
+#include "common/gpu_transition_profile.h"
 #include "common/range_sets.h"
 #include "common/range_sets.inc"
+#include "core/deferred_transition.h"
 #include "core/hle/service/nvdrv/core/heap_mapper.h"
 #include "video_core/host1x/host1x.h"
 
 namespace Service::Nvidia::NvCore {
 
 struct HeapMapper::HeapMapperInternal {
-    HeapMapperInternal(Tegra::Host1x::Host1x& host1x) : m_device_memory{host1x.MemoryManager()} {}
+    HeapMapperInternal(Tegra::Host1x::Host1x& host1x)
+        : m_device_memory{host1x.MemoryManager()}, m_system{host1x.System()} {}
     ~HeapMapperInternal() = default;
 
     Common::RangeSet<VAddr> m_temporary_set;
     Common::OverlapRangeSet<VAddr> m_mapped_ranges;
     Tegra::MaxwellDeviceMemoryManager& m_device_memory;
+    Core::System& m_system;
     std::mutex m_guard;
 };
 
@@ -27,15 +31,20 @@ HeapMapper::HeapMapper(VAddr start_vaddress, DAddr start_daddress, size_t size, 
 }
 
 HeapMapper::~HeapMapper() {
+    [[maybe_unused]] auto transition = Core::DeferredTransitionScope::RequireReady(m_internal->m_system);
     // Unmap whatever has been mapped.
     m_internal->m_mapped_ranges.ForEach([this](VAddr start_addr, VAddr end_addr, s32 count) {
         const size_t sub_size = end_addr - start_addr;
         const size_t offset = start_addr - m_vaddress;
+        Common::GpuTransitionProfile::RecordRange(
+            Common::GpuTransitionProfile::Site::HeapDestroyUnmap, sub_size);
         m_internal->m_device_memory.Unmap(m_daddress + offset, sub_size);
     });
 }
 
 DAddr HeapMapper::Map(VAddr start, size_t size) {
+    [[maybe_unused]] auto transition = Core::DeferredTransitionScope::RequireReady(m_internal->m_system);
+    Common::GpuTransitionProfile::RecordRange(Common::GpuTransitionProfile::Site::HeapMapCall, size);
     std::scoped_lock lk(m_internal->m_guard);
     // Add the mapping range to a temporary range set.
     m_internal->m_temporary_set.Clear();
@@ -51,6 +60,8 @@ DAddr HeapMapper::Map(VAddr start, size_t size) {
     m_internal->m_temporary_set.ForEach([this](VAddr start_addr, VAddr end_addr) {
         const size_t sub_size = end_addr - start_addr;
         const size_t offset = start_addr - m_vaddress;
+        Common::GpuTransitionProfile::RecordRange(
+            Common::GpuTransitionProfile::Site::HeapMapMutation, sub_size);
         m_internal->m_device_memory.Map(m_daddress + offset, m_vaddress + offset, sub_size, m_asid);
     });
 
@@ -61,12 +72,16 @@ DAddr HeapMapper::Map(VAddr start, size_t size) {
 }
 
 void HeapMapper::Unmap(VAddr start, size_t size) {
+    [[maybe_unused]] auto transition = Core::DeferredTransitionScope::RequireReady(m_internal->m_system);
+    Common::GpuTransitionProfile::RecordRange(Common::GpuTransitionProfile::Site::HeapUnmapCall, size);
     std::scoped_lock lk(m_internal->m_guard);
 
     // Just subtract the range and whatever is deleted, unmap it.
     m_internal->m_mapped_ranges.Subtract(start, size, [this](VAddr start_addr, VAddr end_addr) {
         const size_t sub_size = end_addr - start_addr;
         const size_t offset = start_addr - m_vaddress;
+        Common::GpuTransitionProfile::RecordRange(
+            Common::GpuTransitionProfile::Site::HeapUnmapMutation, sub_size);
         m_internal->m_device_memory.Unmap(m_daddress + offset, sub_size);
     });
 }

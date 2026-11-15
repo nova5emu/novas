@@ -18,6 +18,7 @@
 
 #include "common/assert.h"
 #include "common/cityhash.h"
+#include "common/dkb_frame_trace.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/ampere/trap_guards.h"
@@ -31,6 +32,8 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_profile.h"
+#include "video_core/oot_network.h"
 #include "video_core/pipeline_cache_policy.h"
 #include "video_core/shader_cache.h"
 #include "video_core/shader_environment.h"
@@ -252,6 +255,27 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
     return false;
 }
 
+void ShaderCache::TraceOotCompute(const ShaderInfo& shader) {
+    if (program_id != OotNetwork::ProgramId ||
+        !(Nx2Profile::Enabled() || Common::DkbFrameTrace::Enabled())) {
+        return;
+    }
+    const u64 native_key = shader.lowered_native ? shader.lowered_native->native_program_key : 0;
+    {
+        std::unique_lock lock{oot_compute_mutex, std::try_to_lock};
+        if (!lock) {
+            oot_compute_dropped.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        if (!oot_compute_identities.emplace(native_key, shader.unique_hash).second) {
+            return;
+        }
+    }
+    kepler_compute->TraceOotCompute(native_key, shader.unique_hash,
+                                   static_cast<bool>(shader.lowered_native),
+                                   oot_compute_dropped.exchange(0, std::memory_order_relaxed));
+}
+
 const ShaderInfo* ShaderCache::ComputeShader() {
     const GPUVAddr program_base{kepler_compute->regs.code_loc.Address()};
     const auto& qmd{kepler_compute->launch_description};
@@ -289,6 +313,7 @@ const ShaderInfo* ShaderCache::ComputeShader() {
             throw;
         }
     }
+    TraceOotCompute(*shader);
     // Check both warm and cold shader paths, before selecting a disk-cached pipeline.
     // EDEN_NX2_DLSS_REPLACEMENT=native retains the native network for comparisons.
     if (kepler_compute->IsNativeMode() && shader->lowered_native &&

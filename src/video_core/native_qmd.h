@@ -41,6 +41,10 @@ public:
     std::function<void(std::string_view, Address, std::int32_t)> trace;
     // Optional diagnostics: called with the QMD, slot and raw words of a release it skips.
     std::function<void(Address, std::size_t, std::span<const Word, 4>)> skipped_release;
+    enum class ReleaseStatus : Word { NotReached, Disabled, Unsupported, Unmapped, Queued };
+    using ReleaseStatuses = std::array<ReleaseStatus, 3>;
+    // Queued records acceptance by the backend release callback.
+    std::function<void(Address, const Descriptor&, const ReleaseStatuses&)> release_trace;
     // QMD V03_00 release flags: 7:0 address high, 19 membar, 22:20 reduction op, 23 enable,
     // 25:24 reduction format, 26 reduction enable, 28:27 non-blocking interrupt, 29 64-bit
     // payload, 31:30 structure size (0 four words with timestamp, 1 one word, 2 two words).
@@ -115,19 +119,30 @@ public:
             if (!dispatched) error = "native shader dispatch required";
             if (trace) trace("run", request.address, dispatched ? 1 : 0);
             state.completed = true;
+            ReleaseStatuses release_statuses{};
             for (std::size_t slot = 0; slot < ReleaseSlots.size(); ++slot) {
                 const Word base = ReleaseSlots[slot];
                 const Word flags = qmd[base + 1];
-                if (!(flags & (1U << 23))) continue;
+                if (!(flags & (1U << 23))) {
+                    release_statuses[slot] = ReleaseStatus::Disabled;
+                    continue;
+                }
                 // Skip only this slot: the others are what other queues and the CPU wait on.
                 if (!IsDecodableRelease(flags)) {
+                    release_statuses[slot] = ReleaseStatus::Unsupported;
                     if (skipped_release) skipped_release(request.address, slot, std::span<const Word, 4>{&qmd[base], 4});
                     if (error.empty()) error = "unsupported QMD release format";
                     continue;
                 }
                 const Address destination = (Address{flags & 0xff} << 32) | qmd[base];
-                if (!release(destination, qmd[base + 2], flags)) return "unmapped QMD release";
+                if (!release(destination, qmd[base + 2], flags)) {
+                    release_statuses[slot] = ReleaseStatus::Unmapped;
+                    if (release_trace) release_trace(request.address, qmd, release_statuses);
+                    return "unmapped QMD release";
+                }
+                release_statuses[slot] = ReleaseStatus::Queued;
             }
+            if (release_trace) release_trace(request.address, qmd, release_statuses);
             if (qmd[16] & 1) {
                 const Word action = (qmd[16] >> 1) & 7;
                 if (action != 4 && action != 3 && action != 1) return "unsupported dependent QMD action";

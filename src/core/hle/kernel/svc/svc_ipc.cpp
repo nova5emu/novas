@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/gpu_transition_profile.h"
 #include "common/scope_exit.h"
 #include "common/scratch_buffer.h"
 #include "core/core.h"
@@ -163,11 +164,17 @@ Result SendSyncRequestWithUserBuffer(Core::System& system, uint64_t message, uin
     auto& page_table = GetCurrentProcess(kernel).GetPageTable();
 
     // Lock the message buffer.
-    R_TRY(page_table.LockForIpcUserBuffer(nullptr, message, buffer_size));
+    {
+        [[maybe_unused]] auto transition = system.BeginDeferredTransition(
+            Common::GpuTransitionProfile::SuspensionSite::SvcUserBuffer);
+        R_TRY(page_table.LockForIpcUserBuffer(nullptr, message, buffer_size));
+    }
 
     {
         // If we fail to send the message, unlock the message buffer.
         ON_RESULT_FAILURE {
+            [[maybe_unused]] auto transition = system.BeginDeferredTransition(
+                Common::GpuTransitionProfile::SuspensionSite::SvcUserBuffer);
             page_table.UnlockForIpcUserBuffer(message, buffer_size);
         };
 
@@ -177,12 +184,20 @@ Result SendSyncRequestWithUserBuffer(Core::System& system, uint64_t message, uin
     }
 
     // We successfully processed, so try to unlock the message buffer.
-    R_RETURN(page_table.UnlockForIpcUserBuffer(message, buffer_size));
+    {
+        [[maybe_unused]] auto transition = system.BeginDeferredTransition(
+            Common::GpuTransitionProfile::SuspensionSite::SvcUserBuffer);
+        R_RETURN(page_table.UnlockForIpcUserBuffer(message, buffer_size));
+    }
 }
 
 Result SendAsyncRequestWithUserBuffer(Core::System& system, Handle* out_event_handle,
                                       uint64_t message, uint64_t buffer_size,
                                       Handle session_handle) {
+    // OnRequest returns immediately for an asynchronous request. Its later mapping changes
+    // and user-buffer unlock run under ReceiveRequest/SendReply/CleanupRequests transitions.
+    [[maybe_unused]] auto transition = system.BeginDeferredTransition(
+        Common::GpuTransitionProfile::SuspensionSite::IpcAsync);
     // Get the process and handle table.
     auto& process = GetCurrentProcess(system.Kernel());
     auto& handle_table = process.GetHandleTable();
@@ -250,11 +265,17 @@ Result ReplyAndReceiveWithUserBuffer(Core::System& system, int32_t* out_index, u
 
     // Lock the message buffer, getting its physical address.
     KPhysicalAddress message_paddr;
-    R_TRY(page_table.LockForIpcUserBuffer(std::addressof(message_paddr), message, buffer_size));
+    {
+        [[maybe_unused]] auto transition = system.BeginDeferredTransition(
+            Common::GpuTransitionProfile::SuspensionSite::SvcUserBuffer);
+        R_TRY(page_table.LockForIpcUserBuffer(std::addressof(message_paddr), message, buffer_size));
+    }
 
     {
         // If we fail to send the message, unlock the message buffer.
         ON_RESULT_FAILURE {
+            [[maybe_unused]] auto transition = system.BeginDeferredTransition(
+                Common::GpuTransitionProfile::SuspensionSite::SvcUserBuffer);
             page_table.UnlockForIpcUserBuffer(message, buffer_size);
         };
 
@@ -265,7 +286,11 @@ Result ReplyAndReceiveWithUserBuffer(Core::System& system, int32_t* out_index, u
     }
 
     // We successfully processed, so try to unlock the message buffer.
-    R_RETURN(page_table.UnlockForIpcUserBuffer(message, buffer_size));
+    {
+        [[maybe_unused]] auto transition = system.BeginDeferredTransition(
+            Common::GpuTransitionProfile::SuspensionSite::SvcUserBuffer);
+        R_RETURN(page_table.UnlockForIpcUserBuffer(message, buffer_size));
+    }
 }
 
 Result SendSyncRequest64(Core::System& system, Handle session_handle) {

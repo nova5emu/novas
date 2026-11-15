@@ -157,6 +157,7 @@ Result KAddressArbiter::Signal(uint64_t addr, s32 count) {
                (it->GetAddressArbiterKey() == addr)) {
             // End the thread's wait.
             KThread* target_thread = std::addressof(*it);
+            GetCurrentThread(system.Kernel()).ProfileWake(*target_thread, addr);
             target_thread->EndWait(system.Kernel(), ResultSuccess);
 
             ASSERT(target_thread->IsWaitingForAddressArbiter());
@@ -170,6 +171,7 @@ Result KAddressArbiter::Signal(uint64_t addr, s32 count) {
 }
 
 Result KAddressArbiter::SignalAndIncrementIfEqual(uint64_t addr, s32 value, s32 count) {
+    GetCurrentMemory(system.Kernel()).PrepareKernelWrite(addr, sizeof(s32));
     // Perform signaling.
     s32 num_waiters{};
     {
@@ -186,6 +188,7 @@ Result KAddressArbiter::SignalAndIncrementIfEqual(uint64_t addr, s32 value, s32 
                (it->GetAddressArbiterKey() == addr)) {
             // End the thread's wait.
             KThread* target_thread = std::addressof(*it);
+            GetCurrentThread(system.Kernel()).ProfileWake(*target_thread, addr);
             target_thread->EndWait(system.Kernel(), ResultSuccess);
 
             ASSERT(target_thread->IsWaitingForAddressArbiter());
@@ -199,6 +202,7 @@ Result KAddressArbiter::SignalAndIncrementIfEqual(uint64_t addr, s32 value, s32 
 }
 
 Result KAddressArbiter::SignalAndModifyByWaitingCountIfEqual(uint64_t addr, s32 value, s32 count) {
+    GetCurrentMemory(system.Kernel()).PrepareKernelWrite(addr, sizeof(s32));
     // Perform signaling.
     s32 num_waiters{};
     {
@@ -249,6 +253,7 @@ Result KAddressArbiter::SignalAndModifyByWaitingCountIfEqual(uint64_t addr, s32 
                (it->GetAddressArbiterKey() == addr)) {
             // End the thread's wait.
             KThread* target_thread = std::addressof(*it);
+            GetCurrentThread(system.Kernel()).ProfileWake(*target_thread, addr);
             target_thread->EndWait(system.Kernel(), ResultSuccess);
 
             ASSERT(target_thread->IsWaitingForAddressArbiter());
@@ -262,6 +267,7 @@ Result KAddressArbiter::SignalAndModifyByWaitingCountIfEqual(uint64_t addr, s32 
 }
 
 Result KAddressArbiter::WaitIfLessThan(uint64_t addr, s32 value, bool decrement, s64 timeout) {
+    GetCurrentMemory(system.Kernel()).PrepareKernelWrite(addr, sizeof(s32));
     // Prepare to wait.
     KThread* cur_thread = GetCurrentThreadPointer(system.Kernel());
     KHardwareTimer* timer{};
@@ -317,6 +323,7 @@ Result KAddressArbiter::WaitIfLessThan(uint64_t addr, s32 value, bool decrement,
 }
 
 Result KAddressArbiter::WaitIfEqual(uint64_t addr, s64 value, s64 timeout, bool is_64_bit) {
+    GetCurrentMemory(system.Kernel()).PrepareKernelWrite(addr, is_64_bit ? sizeof(s64) : sizeof(s32));
     // Prepare to wait.
     KThread* cur_thread = GetCurrentThreadPointer(system.Kernel());
     KHardwareTimer* timer{};

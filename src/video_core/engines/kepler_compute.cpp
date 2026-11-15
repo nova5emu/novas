@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <bitset>
@@ -15,11 +16,13 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include "common/assert.h"
 #include "common/dkb_frame_trace.h"
 #include "common/game_presets.h"
 #include "common/logging.h"
 #include "common/settings.h"
+#include "common/scope_exit.h"
 #include "shader_recompiler/exception.h"
 #include "core/core.h"
 #include "video_core/gpu_split.h"
@@ -33,6 +36,7 @@
 #include "video_core/game_dlss_status.h"
 #include "video_core/memory_manager.h"
 #include "video_core/native_query_trace.h"
+#include "video_core/compute_release_trace.h"
 #include "video_core/oot_network.h"
 #ifdef ARCHITECTURE_x86_64
 #include "video_core/macro_turing_jit.h"
@@ -113,11 +117,27 @@ void KeplerCompute::ProcessNativeReportSemaphore(u32 argument) {
         LOG_WARNING(HW_GPU, "Native compute report semaphore operation {} not supported", operation);
         return;
     }
+    namespace ReleaseTrace = VideoCommon::ComputeReleaseTrace;
+    const u64 release_trace = ReleaseTrace::Enabled()
+        ? ReleaseTrace::Release(trace_dispatch, address,
+                                memory_manager.GpuToCpuAddress(address).value_or(0), payload,
+                                argument, "native-report-preceding-dispatch") : 0;
+    const u64 previous_trace = std::exchange(ReleaseTrace::current_release, release_trace);
+    SCOPE_EXIT { ReleaseTrace::current_release = previous_trace; };
     if ((argument >> 3) & 1) {
         const u32 reduction = (argument >> 9) & 7;
-        rasterizer->SignalFence([this, address, payload, reduction] {
-            memory_manager.Write<u32>(address, ReduceSemaphore(reduction, false,
-                                                               memory_manager.Read<u32>(address), payload));
+        auto deferred_write = memory_manager.BeginDeferredBackingWrite(address, sizeof(payload));
+        u8* const destination = deferred_write ? memory_manager.GetPointer(address) : nullptr;
+        ASSERT(!deferred_write || destination);
+        rasterizer->SignalFence([this, address, payload, reduction, release_trace,
+                                 destination, deferred_write = std::move(deferred_write)] {
+            u32 current;
+            if (destination) std::memcpy(&current, destination, sizeof(current));
+            else current = memory_manager.Read<u32>(address);
+            const u32 value = ReduceSemaphore(reduction, false, current, payload);
+            if (destination) std::memcpy(destination, &value, sizeof(value));
+            else memory_manager.Write<u32>(address, value);
+            ReleaseTrace::Published(release_trace, value);
         });
         return;
     }
@@ -347,8 +367,14 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
         }
         const auto error = native_qmd.Signal(qmd_address, argument,
             [&](u64 address, NativeQmdScheduler::Descriptor& descriptor) {
+                oot_replaced_program.reset();
                 if (!memory_manager.IsFullyMappedRange(address, sizeof(descriptor))) return false;
                 memory_manager.ReadBlockUnsafe(address, descriptor.data(), sizeof(descriptor));
+                trace_qmd = address;
+                trace_dispatch = 0;
+                trace_program = (u64{descriptor[49] & 0x1ffff} << 32) | descriptor[48];
+                trace_empty_pending =
+                    !(descriptor[12] && (descriptor[13] & 0xffff) && (descriptor[14] & 0xffff));
                 if (static u32 logged{}; (descriptor[53] & (1U << 23)) && logged < 8) {
                     ++logged;
                     LOG_INFO(HW_GPU, "Native QMD {:#x} releases: {:08x} | {:08x} | {:08x}", address,
@@ -369,13 +395,36 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             [&](u64 address, u32 payload, u32 flags) {
                 const bool four_words = (flags >> 30) == 0;
                 if (!memory_manager.IsFullyMappedRange(address, four_words ? 16 : sizeof(payload))) return false;
+                namespace ReleaseTrace = VideoCommon::ComputeReleaseTrace;
+                if (trace_empty_pending) {
+                    trace_empty_pending = false;
+                    trace_dispatch = ReleaseTrace::Begin(
+                        memory_manager.GetID(), trace_channel, trace_qmd, trace_program);
+                }
+                const u64 release_trace = ReleaseTrace::Enabled()
+                    ? ReleaseTrace::Release(trace_dispatch, address,
+                        memory_manager.GpuToCpuAddress(address).value_or(0), payload, flags, "qmd") : 0;
+                const u64 previous_trace = std::exchange(ReleaseTrace::current_release, release_trace);
+                SCOPE_EXIT { ReleaseTrace::current_release = previous_trace; };
                 if (flags & (1U << 26)) {
-                    rasterizer->SignalFence([this, address, payload, flags] {
+                    auto deferred_write = memory_manager.BeginDeferredBackingWrite(address, sizeof(payload));
+                    u8* const destination = deferred_write ? memory_manager.GetPointer(address) : nullptr;
+                    const auto device = memory_manager.GpuToCpuAddress(address);
+                    ASSERT(!deferred_write || destination);
+                    rasterizer->SignalFence([this, address, payload, flags, release_trace,
+                                             destination, device,
+                                             deferred_write = std::move(deferred_write)] {
+                        u32 current;
+                        if (destination) std::memcpy(&current, destination, sizeof(current));
+                        else current = memory_manager.Read<u32>(address);
                         const u32 value = ReduceSemaphore((flags >> 20) & 7, (flags >> 24) & 1,
-                                                          memory_manager.Read<u32>(address), payload);
-                        memory_manager.Write<u32>(address, value);
-                        if (const auto device = memory_manager.GpuToCpuAddress(address)) {
-                            Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*device, value);
+                                                          current, payload);
+                        if (destination) std::memcpy(destination, &value, sizeof(value));
+                        else memory_manager.Write<u32>(address, value);
+                        ReleaseTrace::Published(release_trace, value);
+                        const auto target_device = deferred_write ? device : memory_manager.GpuToCpuAddress(address);
+                        if (target_device) {
+                            Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*target_device, value);
                         }
                         static const u64 watch = [] {
                             const char* text = std::getenv("EDEN_NX2_SEM_WATCH");
@@ -395,11 +444,23 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                     // NVN2 tracks QMD completion with a max release (bit 19) into a word other
                     // releases also advance: a plain write would move it backwards and leave
                     // GEQ acquires waiting forever.
-                    rasterizer->SignalFence([this, address, payload] {
-                        const u32 value = (std::max)(memory_manager.Read<u32>(address), payload);
-                        memory_manager.Write<u32>(address, value);
-                        if (const auto device = memory_manager.GpuToCpuAddress(address)) {
-                            Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*device, value);
+                    auto deferred_write = memory_manager.BeginDeferredBackingWrite(address, sizeof(payload));
+                    u8* const destination = deferred_write ? memory_manager.GetPointer(address) : nullptr;
+                    const auto device = memory_manager.GpuToCpuAddress(address);
+                    ASSERT(!deferred_write || destination);
+                    rasterizer->SignalFence([this, address, payload, release_trace,
+                                             destination, device,
+                                             deferred_write = std::move(deferred_write)] {
+                        u32 current;
+                        if (destination) std::memcpy(&current, destination, sizeof(current));
+                        else current = memory_manager.Read<u32>(address);
+                        const u32 value = (std::max)(current, payload);
+                        if (destination) std::memcpy(destination, &value, sizeof(value));
+                        else memory_manager.Write<u32>(address, value);
+                        ReleaseTrace::Published(release_trace, value);
+                        const auto target_device = deferred_write ? device : memory_manager.GpuToCpuAddress(address);
+                        if (target_device) {
+                            Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*target_device, value);
                         }
                     });
                 } else {
@@ -717,6 +778,7 @@ bool KeplerCompute::UpscaleFromConstBuffers() {
 
 bool KeplerCompute::DispatchNativeCompute(Core::System& system,
                                          const NativeQmdScheduler::Descriptor& qmd) {
+    oot_replaced_program.reset();
     launch_description = {};
     launch_description.grid_dim_x.Assign(qmd[12]);
     launch_description.grid_dim_y.Assign(qmd[13] & 0xffff);
@@ -730,6 +792,10 @@ bool KeplerCompute::DispatchNativeCompute(Core::System& system,
     launch_description.local_crs_alloc.Assign(qmd[50] & 0xffffff);
     regs.code_loc.address_low = qmd[48];
     regs.code_loc.address_high = qmd[49] & 0x1ffff;
+    if (VideoCommon::ComputeReleaseTrace::Enabled()) {
+        trace_dispatch = VideoCommon::ComputeReleaseTrace::Begin(
+            memory_manager.GetID(), trace_channel, trace_qmd, regs.code_loc.Address());
+    }
     for (u32 slot = 0; slot < NumConstBuffers; ++slot) {
         const u32 high = qmd[33 + slot * 2];
         if (high & 0x1ff00) {
@@ -1248,6 +1314,76 @@ std::optional<Texture::TICEntry> KeplerCompute::ConstBuffer0Image(u32 offset) co
     return GetTICEntry(tic_index);
 }
 
+void KeplerCompute::TraceOotCompute(u64 native_key, u64 shader_hash, bool lowered_native, u64 dropped) {
+    using namespace VideoCommon::OotNetwork;
+    const auto& cbuf = launch_description.const_buffer_config[0];
+    const GPUVAddr cbuf_address = (GPUVAddr{cbuf.address_high} << 32) | cbuf.address_low;
+    const bool handle_present = (launch_description.const_buffer_enable_mask & 1) &&
+        cbuf.size.Value() >= OutputImageHandleOffset + sizeof(u32) &&
+        memory_manager.IsFullyMappedRange(cbuf_address + OutputImageHandleOffset, sizeof(u32));
+    const u32 handle = handle_present
+        ? memory_manager.Read<u32>(cbuf_address + OutputImageHandleOffset) : 0;
+    const auto image = ConstBuffer0Image(OutputImageHandleOffset);
+    const auto* bypass = rasterizer->OotNetworkBypass();
+    LOG_INFO(HW_GPU,
+             "OOT compute identity native_key={:016x} shader_hash={:016x} "
+             "native_mode={} lowered_native={} grid={}x{}x{} block={}x{}x{} "
+             "cb0_d0_present={} cb0_d0_handle={:#x} image_present={} image_address={:#x} "
+             "image_size={}x{} image_format={:#x} image_block_linear={} "
+             "tonemapped={:#x} output_replaced={} dropped_identity={}",
+             native_key, shader_hash, IsNativeMode(), lowered_native,
+             launch_description.grid_dim_x.Value(), launch_description.grid_dim_y.Value(),
+             launch_description.grid_dim_z.Value(), launch_description.block_dim_x.Value(),
+             launch_description.block_dim_y.Value(), launch_description.block_dim_z.Value(),
+             handle_present, handle, image.has_value(), image ? image->Address() : 0,
+             image ? image->Width() : 0, image ? image->Height() : 0,
+             image ? static_cast<u32>(image->format.Value()) : 0,
+             image && image->IsBlockLinear(),
+             bypass ? bypass->tonemapped_image.load(std::memory_order_relaxed) : 0,
+             bypass && bypass->output_replaced.load(std::memory_order_relaxed), dropped);
+}
+
+void KeplerCompute::RecordOotDispatchReplacement(u64 native_key) {
+    if (!(VideoCommon::Nx2Profile::Enabled() || Common::DkbFrameTrace::Enabled())) {
+        return;
+    }
+    oot_replaced_program = native_key;
+    if (native_qmd.release_trace) {
+        return;
+    }
+    native_qmd.release_trace = [this](u64 address, const NativeQmdScheduler::Descriptor& qmd,
+                                    const NativeQmdScheduler::ReleaseStatuses& statuses) {
+        using namespace VideoCommon::OotNetwork;
+        const auto key = std::exchange(oot_replaced_program, std::nullopt);
+        auto* const bypass = rasterizer->OotNetworkBypass();
+        if (!key || !bypass) {
+            return;
+        }
+        constexpr std::array<u64, 5> keys{PrepassProgramKey, NetworkProgramKey,
+                                         OutputProgramKeys[0], OutputProgramKeys[1], OutputProgramKeys[2]};
+        const auto entry = std::find(keys.begin(), keys.end(), *key);
+        if (entry == keys.end()) {
+            return;
+        }
+        const u32 bit = 1U << static_cast<u32>(entry - keys.begin());
+        if (bypass->reported_qmd_releases.fetch_or(bit, std::memory_order_relaxed) & bit) {
+            return;
+        }
+        constexpr std::array names{"not_reached", "disabled", "unsupported", "unmapped", "queued"};
+        LOG_INFO(HW_GPU,
+                 "OOT QMD releases native_key={:016x} qmd={:#x} phase=release_processing_return "
+                 "slot0_status={} slot0_words={:08x},{:08x},{:08x},{:08x} "
+                 "slot1_status={} slot1_words={:08x},{:08x},{:08x},{:08x} "
+                 "slot2_status={} slot2_words={:08x},{:08x},{:08x},{:08x} "
+                 "dependent_words={:08x},{:08x}",
+                 *key, address,
+                 names[static_cast<size_t>(statuses[0])], qmd[24], qmd[25], qmd[26], qmd[27],
+                 names[static_cast<size_t>(statuses[1])], qmd[28], qmd[29], qmd[30], qmd[31],
+                 names[static_cast<size_t>(statuses[2])], qmd[52], qmd[53], qmd[54], qmd[55],
+                 qmd[15], qmd[16]);
+    };
+}
+
 bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     using namespace VideoCommon::OotNetwork;
     if (!BypassEnabled(program_id)) {
@@ -1264,15 +1400,21 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     if (tonemapped == 0) {
         return false;
     }
-    if (native_key == PrepassProgramKey || native_key == NetworkProgramKey) {
-        return bypass->output_replaced.load(std::memory_order_relaxed);
+    if (!IsOutputProgram(native_key)) {
+        const bool skipped = ShouldSkipIntermediate(native_key,
+            bypass->output_replaced.load(std::memory_order_relaxed));
+        if (skipped) {
+            RecordOotDispatchReplacement(native_key);
+        }
+        return skipped;
     }
-    if (native_key != OutputProgramKey) {
-        return false;
-    }
+    const auto source = bypass->GetTonemappedSurface();
     const auto output = ConstBuffer0Image(OutputImageHandleOffset);
     if (!output || output->format != Texture::TextureFormat::B10G11R11 || output->Address() == 0 ||
-        output->Address() == tonemapped || !output->IsBlockLinear()) {
+        output->Address() == tonemapped || !output->IsBlockLinear() || !source ||
+        output->Depth() != 1 || output->BaseLayer() != 0 || output->res_min_mip_level.Value() != 0 ||
+        (output->texture_type != Texture::TextureType::Texture2D &&
+         output->texture_type != Texture::TextureType::Texture2DNoMipmap)) {
         bypass->output_replaced.store(false, std::memory_order_relaxed);
         static bool warned = false;
         if (!std::exchange(warned, true)) {
@@ -1280,7 +1422,6 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
         }
         return false;
     }
-    // The tonemapped image is a render target of the output's size, format and layout.
     Fermi2D::Surface destination{};
     destination.format = Tegra::RenderTargetFormat::B10G11R11_FLOAT;
     destination.linear = Fermi2D::MemoryLayout::BlockLinear;
@@ -1292,33 +1433,51 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     destination.height = output->Height();
     destination.addr_upper = static_cast<u32>(output->Address() >> 32);
     destination.addr_lower = static_cast<u32>(output->Address());
-    Fermi2D::Surface source = destination;
-    source.addr_upper = static_cast<u32>(tonemapped >> 32);
-    source.addr_lower = static_cast<u32>(tonemapped);
-    const s32 width = static_cast<s32>(output->Width());
-    const s32 height = static_cast<s32>(output->Height());
-    const Fermi2D::Config config{
-        .operation = Fermi2D::Operation::SrcCopy,
-        .filter = Fermi2D::Filter::Point,
-        .must_accelerate = true,
-        .dst_x0 = 0,
-        .dst_y0 = 0,
-        .dst_x1 = width,
-        .dst_y1 = height,
-        .src_x0 = 0,
-        .src_y0 = 0,
-        .src_x1 = width,
-        .src_y1 = height,
+    const auto report_output = [&](bool replaced, const char* filter, const char* reason) {
+        const auto variant = std::find(OutputProgramKeys.begin(), OutputProgramKeys.end(), native_key);
+        const u32 variant_index = static_cast<u32>(variant - OutputProgramKeys.begin());
+        const u32 report_bit = 1U << (variant_index * 2 + static_cast<u32>(replaced));
+        if (!(bypass->reported_output_states.fetch_or(report_bit, std::memory_order_relaxed) & report_bit)) {
+            const auto input = ConstBuffer0Image(0xc0);
+            const auto& cbuf = launch_description.const_buffer_config[0];
+            const GPUVAddr cbuf_address = (GPUVAddr{cbuf.address_high} << 32) | cbuf.address_low;
+            const bool constants_present = (launch_description.const_buffer_enable_mask & 1) &&
+                cbuf.size.Value() >= 0x80 &&
+                memory_manager.IsFullyMappedRange(cbuf_address + 0x30, 0x50);
+            // Float coordinate transforms used by the captured e40f output shader.
+            constexpr std::array<u32, 8> offsets{0x30, 0x34, 0x60, 0x64, 0x68, 0x6c, 0x78, 0x7c};
+            std::array<float, offsets.size()> constants{};
+            if (constants_present) {
+                for (size_t i = 0; i < offsets.size(); ++i) {
+                    constants[i] = std::bit_cast<float>(memory_manager.Read<u32>(cbuf_address + offsets[i]));
+                }
+            }
+            LOG_INFO(HW_GPU,
+                     "OOT output identity native_key={:016x} output_replaced={} source={:#x} "
+                     "source_size={}x{} destination={:#x} destination_size={}x{} filter={} reason={} "
+                     "input_present={} input={:#x} input_size={}x{} cb0_constants_present={} "
+                     "cb0_f30={:.9g} cb0_f34={:.9g} cb0_f60={:.9g} cb0_f64={:.9g} "
+                     "cb0_f68={:.9g} cb0_f6c={:.9g} cb0_f78={:.9g} cb0_f7c={:.9g}",
+                     native_key, replaced, source->Address(), source->width, source->height,
+                     destination.Address(), destination.width, destination.height, filter, reason,
+                     input.has_value(), input ? input->Address() : 0, input ? input->Width() : 0,
+                     input ? input->Height() : 0, constants_present, constants[0], constants[1],
+                     constants[2], constants[3], constants[4], constants[5], constants[6], constants[7]);
+        }
     };
-    const bool copied = rasterizer->AccelerateSurfaceCopy(source, destination, config);
-    bypass->output_replaced.store(copied, std::memory_order_relaxed);
-    static bool logged = false;
-    if (!std::exchange(logged, true)) {
-        LOG_INFO(HW_GPU,
-                 "Ocarina of Time: anti-aliasing network bypassed ({}): {:#x} -> {:#x} {}x{}",
-                 copied ? "copy of the tonemapped image" : "copy failed", tonemapped,
-                 output->Address(), width, height);
+    const auto config = MakeCopyConfig(*source, destination);
+    if (!config) {
+        bypass->output_replaced.store(false, std::memory_order_relaxed);
+        report_output(false, "rejected", "invalid_geometry_or_layout");
+        return false;
     }
+    const bool copied = rasterizer->AccelerateSurfaceCopy(*source, destination, *config);
+    bypass->output_replaced.store(copied, std::memory_order_relaxed);
+    if (copied) {
+        RecordOotDispatchReplacement(native_key);
+    }
+    report_output(copied, config->filter == Fermi2D::Filter::Bilinear ? "bilinear" : "point",
+                  copied ? "copied" : "accelerated_copy_failed");
     return copied;
 }
 

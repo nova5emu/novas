@@ -151,6 +151,9 @@ u128 InterpreterVisitor::GetVec(Vec v) {
 }
 
 u64 InterpreterVisitor::GetReg(Reg r) {
+    if (r == Reg::R31) {
+        return 0;
+    }
     return m_regs[static_cast<u32>(r)];
 }
 
@@ -167,6 +170,9 @@ void InterpreterVisitor::SetVec(Vec v, u128 value) {
 }
 
 void InterpreterVisitor::SetReg(Reg r, u64 value) {
+    if (r == Reg::R31) {
+        return;
+    }
     m_regs[static_cast<u32>(r)] = value;
 }
 
@@ -181,6 +187,7 @@ bool InterpreterVisitor::Ordered(size_t size, bool L, bool o0, Reg Rn, Reg Rt) {
     const size_t dbytes = datasize / 8;
 
     u64 address = (Rn == Reg::SP) ? this->GetSp() : this->GetReg(Rn);
+    PrepareMemory(address, dbytes);
     switch (memop) {
     case MemOp::Store: {
         std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -234,6 +241,7 @@ bool InterpreterVisitor::LDR_lit_gen(bool opc_0, Imm<19> imm19, Reg Rt) {
     const size_t size = opc_0 == 0 ? 4 : 8;
     const s64 offset = Dynarmic::concatenate(imm19, Imm<2>{0}).SignExtend<s64>();
     const u64 address = this->GetPc() + offset;
+    PrepareMemory(address, size);
 
     u64 data = 0;
     m_memory.ReadBlock(address, &data, size);
@@ -252,6 +260,7 @@ bool InterpreterVisitor::LDR_lit_fpsimd(Imm<2> opc, Imm<19> imm19, Vec Vt) {
     const u64 size = 4 << opc.ZeroExtend();
     const u64 offset = imm19.SignExtend<u64>() << 2;
     const u64 address = this->GetPc() + offset;
+    PrepareMemory(address, size);
 
     u128 data{};
     m_memory.ReadBlock(address, &data, size);
@@ -298,6 +307,7 @@ bool InterpreterVisitor::STP_LDP_gen(Imm<2> opc, bool not_postindex, bool wback,
     }
 
     const size_t dbytes = datasize / 8;
+    PrepareMemory(address, 2 * dbytes);
     switch (memop) {
     case MemOp::Store: {
         u64 data1 = this->GetReg(Rt);
@@ -368,6 +378,7 @@ bool InterpreterVisitor::STP_LDP_fpsimd(Imm<2> opc, bool not_postindex, bool wba
         address += offset;
     }
 
+    PrepareMemory(address, 2 * dbytes);
     switch (memop) {
     case MemOp::Store: {
         u128 data1 = VectorGetElement(this->GetVec(Vt), datasize);
@@ -427,6 +438,9 @@ bool InterpreterVisitor::RegisterImmediate(bool wback, bool postindex, size_t sc
     if (!postindex)
         address += offset;
 
+    if (memop != MemOp::Prefetch) {
+        PrepareMemory(address, datasize / 8);
+    }
     switch (memop) {
     case MemOp::Store: {
         u64 data = this->GetReg(Rt);
@@ -493,6 +507,7 @@ bool InterpreterVisitor::SIMDImmediate(bool wback, bool postindex, size_t scale,
     if (!postindex)
         address += offset;
 
+    PrepareMemory(address, datasize / 8);
     switch (memop) {
     case MemOp::Store: {
         u128 data = VectorGetElement(this->GetVec(Vt), datasize);
@@ -647,6 +662,9 @@ bool InterpreterVisitor::RegisterOffset(size_t scale, u8 shift, Imm<2> size, Imm
     }
     address += offset;
 
+    if (memop != MemOp::Prefetch) {
+        PrepareMemory(address, datasize / 8);
+    }
     switch (memop) {
     case MemOp::Store: {
         u64 data = this->GetReg(Rt);
@@ -710,6 +728,7 @@ bool InterpreterVisitor::SIMDOffset(size_t scale, u8 shift, Imm<1> opc_0, Reg Rm
     }
     address += offset;
 
+    PrepareMemory(address, datasize / 8);
     switch (memop) {
     case MemOp::Store: {
         u128 data = VectorGetElement(this->GetVec(Vt), datasize);
@@ -767,7 +786,17 @@ std::optional<u64> MatchAndExecuteOneInstruction(Core::Memory::Memory& memory, m
     u64& sp = *reinterpret_cast<u64*>(&context->sp);
     const u64& pc = *reinterpret_cast<u64*>(&context->pc);
 
-    InterpreterVisitor visitor(memory, regs, vregs, sp, pc);
+    return MatchAndExecuteOneInstruction(memory, regs, vregs, sp, pc, false);
+}
+
+std::optional<u64> MatchAndExecuteOneInstruction(Core::Memory::Memory& memory,
+                                                 std::span<u64, 31> regs,
+                                                 std::span<u128, 32> vectors, u64& sp,
+                                                 const u64& pc, bool prepare_native_access) {
+    if (prepare_native_access) {
+        memory.PrepareNativeFallback(pc, sizeof(u32));
+    }
+    InterpreterVisitor visitor(memory, regs, vectors, sp, pc, prepare_native_access);
     u32 instruction = memory.Read32(pc);
     bool was_executed = false;
 

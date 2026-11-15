@@ -47,6 +47,7 @@ struct SubmitListCommand final {
 
     s32 channel;
     Tegra::CommandList entries;
+    u64 deferred_write_cut{};
 };
 
 /// Command to signal to the GPU thread to flush a region

@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/cpu_epoch_coordinator.h"
 #include <variant>
 #include "video_core/present.h"
 #include "video_core/renderer_vulkan/present/anti_alias_pass.h"
@@ -347,7 +348,7 @@ void Layer::UpdateRawImage(const Tegra::FramebufferConfig& framebuffer, size_t i
     const u64 image_offset = GetRawImageOffset(framebuffer, image_index);
 
     const DAddr framebuffer_addr = framebuffer.address + framebuffer.offset;
-    const u8* const host_ptr = device_memory.GetPointer<u8>(framebuffer_addr);
+
 
     // TODO(Rodrigo): Read this from HLE
     constexpr u32 block_height_log2 = 4;
@@ -355,6 +356,9 @@ void Layer::UpdateRawImage(const Tegra::FramebufferConfig& framebuffer, size_t i
     const u64 linear_size{GetSizeInBytes(framebuffer)};
     const u64 tiled_size{Tegra::Texture::CalculateSize(
         true, bytes_per_pixel, framebuffer.stride, framebuffer.height, 1, block_height_log2, 0)};
+    device_memory.ExcludeCpuEpochRange(framebuffer_addr, tiled_size,
+        VideoCommon::CpuEpochs::Exclusion::Texture);
+    const u8* const host_ptr = device_memory.GetPointer<u8>(framebuffer_addr);
     if (host_ptr) {
         Tegra::Texture::UnswizzleTexture(
             mapped_span.subspan(image_offset, linear_size), std::span(host_ptr, tiled_size),

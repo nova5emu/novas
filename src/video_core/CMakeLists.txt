@@ -18,15 +18,28 @@ add_library(video_core STATIC
     buffer_cache/buffer_cache_base.h
     buffer_cache/buffer_cache.cpp
     buffer_cache/buffer_cache.h
+    buffer_cache/download_copy_plan.h
     buffer_cache/memory_tracker_base.h
+    buffer_cache/storage_base_snapshot.h
     buffer_cache/usage_tracker.h
     buffer_cache/virtual_range_cache.h
     buffer_cache/word_manager.h
+    nce_page_usage_profile.cpp
+    nce_page_usage_profile.h
+    cpu_epoch_admission.h
+    cpu_epoch_barrier.cpp
+    cpu_epoch_barrier.h
+    cpu_epoch_coordinator.cpp
+    cpu_epoch_coordinator.h
+    sync_request_queue.cpp
+    sync_request_queue.h
     cache_types.h
     capture.h
     cdma_pusher.cpp
     cdma_pusher.h
     compatible_formats.cpp
+    compute_release_trace.cpp
+    compute_release_trace.h
     compatible_formats.h
     control/channel_state.cpp
     control/channel_state.h
@@ -35,6 +48,9 @@ add_library(video_core STATIC
     control/scheduler.cpp
     control/scheduler.h
     delayed_destruction_ring.h
+    deferred_write_journal.h
+    deferred_consumer.h
+    semaphore_acquire.h
     dirty_flags.cpp
     dirty_flags.h
     dma_pusher.cpp
@@ -99,7 +115,14 @@ add_library(video_core STATIC
     macro_memo.h
     macro_turing.h
     fence_manager.h
+    fence_wait_trace.h
     gpu.cpp
+    gpu_write_trace.cpp
+    gpu_write_trace.h
+    gpu_write_footprint_profile.cpp
+    gpu_write_footprint_profile.h
+    gpu_write_trace_dump.cpp
+    gpu_write_trace_dump.h
     gpu.h
     gpu_timestamp.h
     gpu_split.cpp
@@ -247,6 +270,8 @@ add_library(video_core STATIC
     vulkan_common/vulkan_debug_callback.h
     vulkan_common/vulkan_device.cpp
     vulkan_common/vulkan_device.h
+    vulkan_common/vulkan_gpu_markers.h
+    vulkan_common/vulkan_hang_trace.h
     vulkan_common/vulkan_instance.cpp
     vulkan_common/vulkan_instance.h
     vulkan_common/vulkan_library.cpp
@@ -257,6 +282,7 @@ add_library(video_core STATIC
     vulkan_common/vulkan_surface.h
     vulkan_common/vulkan_wrapper.cpp
     vulkan_common/vulkan_wrapper.h
+    vulkan_common/gpu_operation_trace.h
     vulkan_common/nsight_aftermath_tracker.cpp
     vulkan_common/aftermath_dump.h
     vulkan_common/nsight_aftermath_tracker.h

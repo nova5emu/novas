@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/assert.h"
+#include "core/core.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/k_worker_task.h"
@@ -16,6 +17,9 @@ namespace Kernel {
 KWorkerTask::KWorkerTask(KernelCore& kernel) : KSynchronizationObject{kernel} {}
 
 void KWorkerTask::DoWorkerTask(KernelCore& kernel) {
+    const auto deferred_transition = kernel.System().BeginDeferredTransition(
+        this->DynamicCast<KThread*>() ? Common::GpuTransitionProfile::SuspensionSite::ThreadFinalize :
+                                       Common::GpuTransitionProfile::SuspensionSite::ProcessFinalize);
     if (auto* const thread = this->DynamicCast<KThread*>(); thread != nullptr) {
         return thread->DoWorkerTaskImpl(kernel);
     } else {

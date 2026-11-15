@@ -56,6 +56,7 @@ struct ChannelState {
         Engines::Nv01Timer nv01_timer;
         DmaPusher dma_pusher;
     };
+    std::shared_ptr<MemoryManager> memory_manager_owner;
     std::optional<Payload> payload;
     MemoryManager* memory_manager = nullptr;
 
